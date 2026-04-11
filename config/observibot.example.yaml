@@ -1,0 +1,63 @@
+# Observibot example configuration
+#
+# Copy this file to config/observibot.yaml and edit the values for your stack.
+# Secrets should be provided through environment variables, referenced as
+# ${VAR_NAME}. A .env file in the working directory is loaded automatically.
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-20250514
+  api_key: ${ANTHROPIC_API_KEY}
+  max_tokens_per_cycle: 4000
+  temperature: 0.2
+
+connectors:
+  - name: my-db
+    type: supabase
+    connection_string: ${SUPABASE_DB_URL}
+    schemas: [public]
+    exclude_tables: []
+
+  - name: my-infra
+    type: railway
+    api_token: ${RAILWAY_API_TOKEN}
+    project_id: ${RAILWAY_PROJECT_ID}
+
+monitor:
+  collection_interval_seconds: 300
+  analysis_interval_seconds: 1800
+  discovery_interval_seconds: 3600
+  mad_threshold: 3.0
+  min_absolute_diff: 10.0
+  sustained_intervals_warning: 2
+  sustained_intervals_critical: 3
+  baseline_window_hours: 24
+  min_samples_for_baseline: 12
+
+alerting:
+  channels:
+    # ntfy.sh — free push notifications to your phone.
+    # Install the ntfy app, subscribe to a unique topic, and set NTFY_TOPIC.
+    - type: ntfy
+      severity_filter: [critical, warning]
+      options:
+        url: https://ntfy.sh/${NTFY_TOPIC}
+
+  rate_limit:
+    max_alerts_per_hour: 10
+    cooldown_seconds: 300
+  aggregation_window_seconds: 30
+  aggregation_min_incidents: 3
+
+store:
+  type: sqlite
+  path: ./data/observibot.db
+  retention:
+    metrics_days: 30
+    events_days: 90
+    insights_days: 90
+    max_snapshots: 10
+
+logging:
+  level: INFO
+  format: json

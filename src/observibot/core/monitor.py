@@ -1,0 +1,495 @@
+"""Monitor loop — APScheduler-based daemon orchestrating discovery, metrics,
+analysis, retention, and alerting.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import signal
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from observibot.agent.analyzer import Analyzer
+from observibot.agent.llm_provider import LLMHardError
+from observibot.alerting.base import AlertManager
+from observibot.connectors.base import BaseConnector, Capability
+from observibot.core.anomaly import Anomaly, build_detector_from_config
+from observibot.core.config import ObservibotConfig
+from observibot.core.discovery import DiscoveryEngine, diff_models
+from observibot.core.models import Insight, SystemModel
+from observibot.core.store import Store
+
+log = logging.getLogger(__name__)
+
+
+class LockfileError(RuntimeError):
+    """Raised when another Observibot process already holds the lockfile."""
+
+
+@dataclass
+class CircuitBreakerState:
+    """Current state of the LLM circuit breaker."""
+
+    soft_failures: int = 0
+    hard_failures: int = 0
+    opened_at: datetime | None = None
+    cooldown: timedelta = timedelta(minutes=10)
+
+
+class CircuitBreaker:
+    """Two-mode circuit breaker for the LLM analyzer.
+
+    Soft failures (bad JSON, transient timeouts) follow the original 3-strike
+    / 10-minute policy. Hard failures (401 auth, quota) escalate the cooldown
+    geometrically (5 → 15 → 60 min) because there is no point retrying.
+    """
+
+    SOFT_THRESHOLD = 3
+    SOFT_COOLDOWN = timedelta(minutes=10)
+    HARD_COOLDOWNS = (
+        timedelta(minutes=5),
+        timedelta(minutes=15),
+        timedelta(hours=1),
+    )
+
+    def __init__(self) -> None:
+        self.state = CircuitBreakerState()
+
+    def record_success(self) -> None:
+        self.state = CircuitBreakerState()
+
+    def record_soft_failure(self) -> None:
+        self.state.soft_failures += 1
+        if self.state.soft_failures >= self.SOFT_THRESHOLD and self.state.opened_at is None:
+            self.state.opened_at = datetime.now(UTC)
+            self.state.cooldown = self.SOFT_COOLDOWN
+            log.warning(
+                "Circuit breaker opened (soft) after %s failures",
+                self.state.soft_failures,
+            )
+
+    def record_hard_failure(self) -> None:
+        idx = min(self.state.hard_failures, len(self.HARD_COOLDOWNS) - 1)
+        self.state.hard_failures += 1
+        self.state.opened_at = datetime.now(UTC)
+        self.state.cooldown = self.HARD_COOLDOWNS[idx]
+        log.warning(
+            "Circuit breaker opened (hard) with cooldown=%s after %s hard failures",
+            self.state.cooldown,
+            self.state.hard_failures,
+        )
+
+    def is_open(self) -> bool:
+        if self.state.opened_at is None:
+            return False
+        if datetime.now(UTC) - self.state.opened_at >= self.state.cooldown:
+            log.info("Circuit breaker cooldown elapsed; closing")
+            self.state = CircuitBreakerState()
+            return False
+        return True
+
+
+# ---------- lockfile helpers ----------
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if a process with ``pid`` currently exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but belongs to someone else; treat as alive.
+        return True
+    return True
+
+
+def acquire_lockfile(path: Path) -> None:
+    """Create a PID lockfile, raising :class:`LockfileError` if already held.
+
+    Stale lockfiles (PID no longer alive) are silently cleaned up.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            existing_pid = int(path.read_text().strip() or "0")
+        except ValueError:
+            existing_pid = 0
+        if existing_pid and _is_pid_alive(existing_pid):
+            raise LockfileError(
+                f"Another Observibot instance is already running (PID {existing_pid}). "
+                f"Stop it first or remove {path} if stale."
+            )
+        log.info("Removing stale lockfile %s (PID %s)", path, existing_pid)
+        path.unlink(missing_ok=True)
+    path.write_text(str(os.getpid()))
+
+
+def release_lockfile(path: Path) -> None:
+    """Remove the lockfile if it belongs to the current process."""
+    if not path.exists():
+        return
+    try:
+        pid = int(path.read_text().strip() or "0")
+    except ValueError:
+        pid = 0
+    if pid == 0 or pid == os.getpid():
+        path.unlink(missing_ok=True)
+
+
+class MonitorLoop:
+    """Coordinator for scheduled discovery, collection, analysis, and retention."""
+
+    def __init__(
+        self,
+        config: ObservibotConfig,
+        connectors: list[BaseConnector],
+        store: Store,
+        analyzer: Analyzer,
+        alert_manager: AlertManager,
+        lockfile_path: Path | None = None,
+        health_host: str | None = "0.0.0.0",
+        health_port: int = 8080,
+    ) -> None:
+        self.config = config
+        self.connectors = connectors
+        self.store = store
+        self.analyzer = analyzer
+        self.alert_manager = alert_manager
+        self.discovery_engine = DiscoveryEngine(connectors)
+        self.detector = build_detector_from_config(config.monitor)
+        self.scheduler: AsyncIOScheduler | None = None
+        self.circuit_breaker = CircuitBreaker()
+        self._stop_event = asyncio.Event()
+        self._collection_lock = asyncio.Lock()
+        self._analysis_lock = asyncio.Lock()
+        self._discovery_lock = asyncio.Lock()
+        self._cached_model: SystemModel | None = None
+        self._pending_anomalies: list[Anomaly] = []
+        self._lockfile_path = lockfile_path
+        self._lock_held = False
+        self._health_host = health_host
+        self._health_port = health_port
+        self._health_task: asyncio.Task[None] | None = None
+
+    # ---------- capability helpers ----------
+
+    def _connectors_with(self, capability: Capability) -> list[BaseConnector]:
+        return [
+            c for c in self.connectors
+            if c.get_capabilities().supports(capability)
+        ]
+
+    # ---------- lifecycle ----------
+
+    async def start(self) -> None:
+        """Connect all connectors, run one initial discovery/collection pass,
+        then start the scheduler for future intervals.
+        """
+        log.info("Monitor loop starting")
+        if self._lockfile_path is not None:
+            acquire_lockfile(self._lockfile_path)
+            self._lock_held = True
+
+        # Connect every connector exactly once.
+        for connector in self.connectors:
+            try:
+                await connector.connect()
+            except Exception as exc:
+                log.warning(
+                    "Connector %s failed to connect: %s", connector.name, exc
+                )
+
+        # Start the health endpoint as a background task so container
+        # orchestrators can probe liveness while the monitor runs.
+        if self._health_host is not None:
+            try:
+                from observibot.health import serve_health
+
+                self._health_task = asyncio.create_task(
+                    serve_health(host=self._health_host, port=self._health_port),
+                    name="observibot-health",
+                )
+            except Exception as exc:
+                log.warning("Health endpoint failed to start: %s", exc)
+
+        self._cached_model = await self.store.get_latest_system_snapshot()
+
+        # Initial blocking work happens BEFORE the scheduler starts so users
+        # see the startup banner and get a first snapshot before the background
+        # loop takes over.
+        try:
+            await self.run_discovery_cycle()
+        except Exception as exc:
+            log.warning("Initial discovery failed: %s", exc)
+        try:
+            await self.run_collection_cycle()
+        except Exception as exc:
+            log.warning("Initial collection failed: %s", exc)
+
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(
+            self._safe_collect,
+            "interval",
+            seconds=self.config.monitor.collection_interval_seconds,
+            id="collect",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        scheduler.add_job(
+            self._safe_analyze,
+            "interval",
+            seconds=self.config.monitor.analysis_interval_seconds,
+            id="analyze",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        scheduler.add_job(
+            self._safe_discover,
+            "interval",
+            seconds=self.config.monitor.discovery_interval_seconds,
+            id="discover",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        scheduler.add_job(
+            self._safe_retention,
+            "interval",
+            hours=24,
+            id="retention",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=300,
+        )
+        scheduler.start()
+        self.scheduler = scheduler
+
+    async def stop(self) -> None:
+        log.info("Monitor loop stopping")
+        if self.scheduler is not None:
+            with contextlib.suppress(Exception):
+                self.scheduler.shutdown(wait=False)
+            self.scheduler = None
+        if self._health_task is not None and not self._health_task.done():
+            self._health_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._health_task
+            self._health_task = None
+        for connector in self.connectors:
+            with contextlib.suppress(Exception):
+                await connector.close()
+        await self.alert_manager.close()
+        if self._lock_held and self._lockfile_path is not None:
+            release_lockfile(self._lockfile_path)
+            self._lock_held = False
+        self._stop_event.set()
+
+    async def run_forever(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):  # pragma: no cover
+                loop.add_signal_handler(sig, self._stop_event.set)
+        try:
+            await self.start()
+            await self._stop_event.wait()
+        finally:
+            await self.stop()
+
+    # ---------- jobs (scheduler-safe wrappers) ----------
+
+    async def _safe_collect(self) -> None:
+        async with self._collection_lock:
+            try:
+                await self.run_collection_cycle()
+            except Exception as exc:
+                log.exception("Collection cycle failed: %s", exc)
+
+    async def _safe_analyze(self) -> None:
+        async with self._analysis_lock:
+            try:
+                await self.run_analysis_cycle()
+            except Exception as exc:
+                log.exception("Analysis cycle failed: %s", exc)
+
+    async def _safe_discover(self) -> None:
+        async with self._discovery_lock:
+            try:
+                await self.run_discovery_cycle()
+            except Exception as exc:
+                log.exception("Discovery cycle failed: %s", exc)
+
+    async def _safe_retention(self) -> None:
+        try:
+            result = await self.store.apply_retention(
+                metrics_days=self.config.store.metrics_retention_days,
+                events_days=self.config.store.events_retention_days,
+                insights_days=self.config.store.insights_retention_days,
+                max_snapshots=self.config.store.max_snapshots,
+            )
+            log.info("Retention cleanup: %s", result)
+        except Exception as exc:
+            log.exception("Retention job failed: %s", exc)
+
+    # ---------- cycles ----------
+
+    async def run_discovery_cycle(self) -> SystemModel:
+        log.info("Running discovery cycle")
+        new_model = await self.discovery_engine.run()
+        old_model = self._cached_model
+        diff = diff_models(old_model, new_model)
+        await self.store.save_system_snapshot(new_model)
+        self._cached_model = new_model
+        if diff.has_changes and old_model is not None:
+            insight = Insight(
+                title="System architecture changed",
+                severity="info",
+                summary=(
+                    f"Detected schema/service changes: "
+                    f"+{len(diff.added_tables)} tables, "
+                    f"-{len(diff.removed_tables)} tables, "
+                    f"~{len(diff.changed_tables)} altered tables, "
+                    f"+{len(diff.added_services)} services, "
+                    f"-{len(diff.removed_services)} services."
+                ),
+                details=diff.to_human_readable(),
+                related_tables=diff.added_tables + diff.removed_tables,
+                source="drift",
+                confidence=0.9,
+            )
+            insight.fingerprint = insight.compute_fingerprint()
+            stored = await self.store.save_insight(insight)
+            if stored:
+                await self.alert_manager.dispatch(insight)
+        return new_model
+
+    async def run_collection_cycle(self) -> int:
+        log.info("Running collection cycle")
+        all_metrics = []
+        cutoff = datetime.now(UTC) - timedelta(
+            seconds=self.config.monitor.collection_interval_seconds * 2
+        )
+
+        metric_connectors = self._connectors_with(Capability.METRICS)
+        change_connectors = self._connectors_with(Capability.CHANGES)
+
+        for connector in metric_connectors:
+            try:
+                metrics = await connector.collect_metrics()
+                all_metrics.extend(metrics)
+            except Exception as exc:
+                log.warning(
+                    "Connector %s metric collection failed: %s",
+                    connector.name, exc,
+                )
+
+        for connector in change_connectors:
+            try:
+                changes = await connector.get_recent_changes(cutoff)
+                for change in changes:
+                    await self.store.save_change_event(change)
+            except Exception as exc:
+                log.debug(
+                    "Connector %s change polling failed: %s",
+                    connector.name, exc,
+                )
+
+        if all_metrics:
+            await self.store.save_metrics(all_metrics)
+
+        baseline_window = timedelta(hours=self.config.monitor.baseline_window_hours)
+        history = await self.store.get_metrics(
+            since=datetime.now(UTC) - baseline_window
+        )
+        anomalies = self.detector.evaluate(history=history, latest=all_metrics)
+        if anomalies:
+            log.info("Detected %s sustained anomalies", len(anomalies))
+            self._pending_anomalies.extend(anomalies)
+            await self._safe_analyze()
+
+        log.info(
+            "Collection cycle completed: %d metrics from %d connectors. "
+            "Next cycle in %ds.",
+            len(all_metrics),
+            len(metric_connectors),
+            self.config.monitor.collection_interval_seconds,
+        )
+        return len(all_metrics)
+
+    async def run_analysis_cycle(self) -> list[Insight]:
+        if self.circuit_breaker.is_open():
+            log.info("Circuit breaker open; skipping analysis")
+            return []
+        anomalies = self._pending_anomalies
+        self._pending_anomalies = []
+        if not anomalies:
+            return []
+        recent_changes = await self.store.get_recent_change_events(
+            since=datetime.now(UTC) - timedelta(hours=2)
+        )
+        business_context = await self.store.get_all_business_context()
+        try:
+            insights = await self.analyzer.analyze_anomalies(
+                anomalies=anomalies,
+                system_model=self._cached_model,
+                recent_changes=recent_changes,
+                business_context=business_context,
+            )
+            self.circuit_breaker.record_success()
+        except LLMHardError as exc:
+            log.warning("LLM hard failure: %s", exc)
+            self.circuit_breaker.record_hard_failure()
+            return []
+        except Exception as exc:
+            log.warning("Analyzer soft failure: %s", exc)
+            self.circuit_breaker.record_soft_failure()
+            return []
+
+        for insight in insights:
+            await self.alert_manager.dispatch(insight)
+        return insights
+
+    async def trigger_analysis(self, anomalies: list[Anomaly]) -> list[Insight]:
+        """Force an analysis pass with the supplied anomalies."""
+        self._pending_anomalies.extend(anomalies)
+        return await self.run_analysis_cycle()
+
+
+def build_monitor_loop(
+    config: ObservibotConfig,
+    connectors: list[BaseConnector],
+    store: Store,
+    analyzer: Analyzer,
+    alert_manager: AlertManager,
+    lockfile_path: Path | None = None,
+    health_host: str | None = "0.0.0.0",
+    health_port: int = 8080,
+) -> MonitorLoop:
+    """Convenience factory used by the CLI."""
+    return MonitorLoop(
+        config=config,
+        connectors=connectors,
+        store=store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+        lockfile_path=lockfile_path,
+        health_host=health_host,
+        health_port=health_port,
+    )
+
+
+__all__ = [
+    "CircuitBreaker",
+    "LockfileError",
+    "MonitorLoop",
+    "acquire_lockfile",
+    "build_monitor_loop",
+    "release_lockfile",
+]

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+config/observibot.yaml
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.coverage
+htmlcov/
+data/observibot.lock
+logs/
+*.log
+.DS_Store
+.vscode/
+.idea/
+.pytest_cache/
+.ruff_cache/
+
+# Internal AI build prompts and cross-LLM review notes — kept locally for
+# reference but not part of the public OSS surface.
+CC_PROMPT.md
+CC_FOLLOWUP_PROMPT.md
+CC_PHASE2_PROMPT.md
+REVIEW_PROMPT.md
+PHASE23_REVIEW_PROMPT.md
+docs/PHASE23_DECISIONS.md
+docs/REVIEW_SYNTHESIS.md
+docs/REVIEW_SYNTHESIS_PART2.md
