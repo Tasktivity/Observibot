@@ -30,7 +30,7 @@ dependencies = [
     "alembic>=1.13",
     "sqlglot>=25.0",
     "python-jose[cryptography]>=3.3",
-    "passlib[bcrypt]>=1.7",
+    "bcrypt>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -61,6 +61,8 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
 # load_dotenv() must run before observibot.* imports touch os.environ, so the
 # import order is intentionally non-standard — silence E402 here only.
 "src/observibot/cli.py" = ["B008", "E402"]
+"src/observibot/api/routes/*.py" = ["B008"]
+"src/observibot/api/deps.py" = ["B008"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
