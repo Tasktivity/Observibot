@@ -32,7 +32,7 @@ Observibot is built on four principles:
 │  │    Feed      │  │              │  │  (3-domain agentic)│     │
 │  └──────┬───────┘  └──────┬───────┘  └────────┬───────────┘     │
 │         └─────────────────┼───────────────────┘                 │
-│                           ▼                                    │
+│                           ▼                                     │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │              FastAPI REST API (18 endpoints)            │    │
 │  │  Auth │ Metrics │ Insights │ Widgets │ Chat │ System    │    │
