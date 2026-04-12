@@ -1,10 +1,15 @@
 """FastAPI application factory."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from observibot import __version__
 from observibot.api.routes import auth, chat, discovery, insights, metrics, system, widgets
+
+FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:
@@ -24,5 +29,8 @@ def create_app() -> FastAPI:
     app.include_router(insights.router)
     app.include_router(widgets.router)
     app.include_router(chat.router)
+
+    if FRONTEND_DIST.is_dir():
+        app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
 
     return app
