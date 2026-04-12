@@ -218,6 +218,36 @@ class MockProvider(LLMProvider):
                     }
                 ]
             }
+        if "tool_calls" in text or "query_observability" in text:
+            return {
+                "tool_calls": [
+                    {
+                        "name": "query_observability",
+                        "parameters": {
+                            "sql": "SELECT metric_name, value, collected_at "
+                                   "FROM metric_snapshots "
+                                   "ORDER BY collected_at DESC LIMIT 20",
+                        },
+                    }
+                ],
+                "reasoning": "Querying observability metrics",
+            }
+        if "tool results:" in text or "interpret the results" in text:
+            return {
+                "narrative": (
+                    "Your system is collecting metrics normally. "
+                    "The most recent data shows healthy metric values "
+                    "across all monitored tables."
+                ),
+                "widget_config": {
+                    "widget_type": "table",
+                    "title": "Recent Metrics",
+                    "columns": ["metric_name", "value", "collected_at"],
+                },
+                "domains": ["observability"],
+                "freshness": "from latest data",
+                "warnings": [],
+            }
         if "allowed tables" in text and "user question:" in text:
             return {
                 "sql": "SELECT metric_name, value, collected_at "

@@ -17,6 +17,7 @@ TOKEN_EXPIRE_HOURS = 24
 
 _store_instance: Store | None = None
 _analyzer_instance: object | None = None
+_app_db_instance: object | None = None
 
 
 def _get_secret_key() -> str:
@@ -41,6 +42,17 @@ def set_analyzer(analyzer: object) -> None:
 def get_analyzer():
     """Return the shared Analyzer, or None if not configured."""
     return _analyzer_instance
+
+
+def set_app_db(app_db: object) -> None:
+    """Set the shared AppDatabasePool instance."""
+    global _app_db_instance
+    _app_db_instance = app_db
+
+
+def get_app_db():
+    """Return the shared AppDatabasePool, or None if disabled."""
+    return _app_db_instance
 
 
 async def get_store() -> Store:

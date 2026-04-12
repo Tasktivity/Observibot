@@ -40,16 +40,26 @@ async def root() -> dict[str, str]:
 
 
 async def serve_health(host: str = "0.0.0.0", port: int = 8080) -> None:
-    """Run the FastAPI health app under uvicorn as an asyncio coroutine.
+    """Run the full FastAPI app (API + web UI + health) under uvicorn.
 
+    Falls back to the minimal health_app if the full API can't be loaded.
     Imported lazily so unit tests don't pay the uvicorn import cost. The
     coroutine returns when the server stops; the caller is responsible for
     cancellation on shutdown.
     """
     import uvicorn
 
+    try:
+        from observibot.api.app import create_app
+
+        app = create_app()
+        log.info("Serving full web UI + API on http://%s:%s", host, port)
+    except Exception as exc:
+        log.warning("Could not load full API (%s), falling back to health-only", exc)
+        app = health_app
+
     config = uvicorn.Config(
-        health_app,
+        app,
         host=host,
         port=port,
         log_level="warning",

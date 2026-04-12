@@ -71,6 +71,8 @@ export interface ChatResponse {
   vega_lite_spec: Record<string, unknown> | null;
   sql_query: string | null;
   execution_ms: number | null;
+  domains_hit: string[];
+  warnings: string[];
 }
 
 export const api = {

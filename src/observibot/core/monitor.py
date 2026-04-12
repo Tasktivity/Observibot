@@ -205,10 +205,13 @@ class MonitorLoop:
                     "Connector %s failed to connect: %s", connector.name, exc
                 )
 
-        # Start the health endpoint as a background task so container
-        # orchestrators can probe liveness while the monitor runs.
+        # Start the web UI + API + health endpoint as a background task.
         if self._health_host is not None:
             try:
+                from observibot.api.deps import set_analyzer, set_store
+                set_store(self.store)
+                set_analyzer(self.analyzer)
+
                 from observibot.health import serve_health
 
                 self._health_task = asyncio.create_task(

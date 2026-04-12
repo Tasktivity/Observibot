@@ -96,6 +96,8 @@ class ChatResponse(BaseModel):
     vega_lite_spec: dict | None = None
     sql_query: str | None = None
     execution_ms: float | None = None
+    domains_hit: list[str] = []
+    warnings: list[str] = []
 
 
 class SystemStatusResponse(BaseModel):

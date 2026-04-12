@@ -1,4 +1,4 @@
-"""Tests for the chat endpoint and text-to-SQL pipeline."""
+"""Tests for the agentic chat pipeline."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -19,9 +19,11 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 async def chat_client(tmp_path: Path):
+    """Client WITHOUT LLM — uses deterministic fallback."""
     db_path = tmp_path / "chat_test.db"
     async with Store(db_path) as store:
         set_store(store)
+        set_analyzer(None)
         for i in range(5):
             await store.save_metric(MetricSnapshot(
                 connector_name="test",
@@ -40,70 +42,9 @@ async def chat_client(tmp_path: Path):
             yield client, store
 
 
-async def test_chat_returns_results(chat_client):
-    client, _ = chat_client
-    resp = await client.post(
-        "/api/chat/query",
-        json={"question": "Show me recent metrics"},
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["sql_query"] is not None
-    assert "metric_snapshots" in data["sql_query"]
-    assert data["widget_plan"] is not None
-
-
-async def test_chat_returns_widget_plan(chat_client):
-    client, _ = chat_client
-    resp = await client.post(
-        "/api/chat/query",
-        json={"question": "Show latest metrics"},
-    )
-    data = resp.json()
-    plan = data["widget_plan"]
-    assert plan["widget_type"] in ("time_series", "table", "kpi_number", "categorical_bar")
-    assert "data" in plan
-
-
-async def test_chat_cache_hit(chat_client):
-    client, _ = chat_client
-    resp1 = await client.post(
-        "/api/chat/query",
-        json={"question": "Show recent metrics"},
-    )
-    resp2 = await client.post(
-        "/api/chat/query",
-        json={"question": "Show recent metrics"},
-    )
-    assert resp1.status_code == 200
-    assert resp2.status_code == 200
-    assert "cached" in resp2.json()["answer"]
-
-
-async def test_chat_insights_query(chat_client):
-    client, _ = chat_client
-    resp = await client.post(
-        "/api/chat/query",
-        json={"question": "Show me the latest insights"},
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "insights" in data["sql_query"]
-
-
-async def test_chat_cost_query(chat_client):
-    client, _ = chat_client
-    resp = await client.post(
-        "/api/chat/query",
-        json={"question": "Show LLM usage and cost"},
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "llm_usage" in data["sql_query"]
-
-
 @pytest.fixture
 async def chat_client_with_llm(tmp_path: Path):
+    """Client WITH mock LLM — uses agentic pipeline."""
     db_path = tmp_path / "chat_llm_test.db"
     async with Store(db_path) as store:
         set_store(store)
@@ -129,38 +70,112 @@ async def chat_client_with_llm(tmp_path: Path):
         set_analyzer(None)
 
 
-async def test_llm_generates_sql(chat_client_with_llm):
-    client, _ = chat_client_with_llm
+async def test_fallback_returns_narrative(chat_client):
+    """Without LLM, fallback returns narrative not 'Found N results.'"""
+    client, _ = chat_client
     resp = await client.post(
         "/api/chat/query",
-        json={"question": "Show me CPU metrics over time"},
+        json={"question": "Show me recent metrics"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "Found" not in data["answer"] or "monitoring records" in data["answer"]
+    assert "observability" in data["domains_hit"]
+
+
+async def test_fallback_warns_about_no_llm(chat_client):
+    client, _ = chat_client
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show me recent metrics"},
+    )
+    data = resp.json()
+    assert any("LLM" in w for w in data.get("warnings", []))
+
+
+async def test_fallback_insights_query(chat_client):
+    client, _ = chat_client
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show me the latest insights"},
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["sql_query"] is not None
-    assert "metric_snapshots" in data["sql_query"]
+    assert "insights" in data["sql_query"]
+
+
+async def test_fallback_cost_query(chat_client):
+    client, _ = chat_client
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show LLM usage and cost"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "llm_usage" in data["sql_query"]
+
+
+async def test_agentic_pipeline_with_llm(chat_client_with_llm):
+    """With LLM, uses agentic tool-calling pipeline."""
+    client, _ = chat_client_with_llm
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "What do my metrics look like?"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["answer"]
+    assert "Found" not in data["answer"] or "records" not in data["answer"]
+    assert data["domains_hit"]
+
+
+async def test_agentic_returns_widget_plan(chat_client_with_llm):
+    client, _ = chat_client_with_llm
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show metrics over time"},
+    )
+    data = resp.json()
     assert data["widget_plan"] is not None
+    plan = data["widget_plan"]
+    assert "widget_type" in plan
 
 
-async def test_llm_sql_goes_through_sandbox(chat_client_with_llm):
+async def test_agentic_returns_sql(chat_client_with_llm):
+    client, _ = chat_client_with_llm
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Recent metrics"},
+    )
+    data = resp.json()
+    assert data["sql_query"] is not None
+    assert "metric_snapshots" in data["sql_query"]
+
+
+async def test_agentic_domains_populated(chat_client_with_llm):
     client, _ = chat_client_with_llm
     resp = await client.post(
         "/api/chat/query",
         json={"question": "Show recent metrics"},
     )
     data = resp.json()
-    assert "LIMIT" in data["sql_query"].upper()
+    assert len(data["domains_hit"]) > 0
 
 
-async def test_llm_fallback_on_invalid_sql(tmp_path: Path):
-    """If LLM generates invalid SQL, falls back to deterministic."""
-    db_path = tmp_path / "chat_fallback.db"
+async def test_agentic_bad_llm_falls_back(tmp_path: Path):
+    """If LLM throws, falls back to deterministic."""
+    from observibot.agent.llm_provider import LLMSoftError
+
+    class FailingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise LLMSoftError("test failure")
+
+    db_path = tmp_path / "chat_fail.db"
     async with Store(db_path) as store:
         set_store(store)
-        bad_provider = MockProvider(
-            model="mock", canned={"sql": "DROP TABLE users", "widget_type": "table"}
-        )
-        analyzer = Analyzer(provider=bad_provider, store=store)
+        provider = FailingProvider(model="mock")
+        analyzer = Analyzer(provider=provider, store=store)
         set_analyzer(analyzer)
         app = create_app()
         transport = ASGITransport(app=app)
@@ -171,18 +186,21 @@ async def test_llm_fallback_on_invalid_sql(tmp_path: Path):
             )
             resp = await client.post(
                 "/api/chat/query",
-                json={"question": "Show recent metrics"},
+                json={"question": "Show metrics"},
             )
             assert resp.status_code == 200
             data = resp.json()
-            assert "metric_snapshots" in data["sql_query"]
+            assert data["answer"]
+            assert "observability" in data["domains_hit"]
         set_analyzer(None)
 
 
-async def test_explain_check_skipped_for_sqlite(chat_client):
-    """EXPLAIN cost gating is skipped on SQLite (always passes)."""
-    from observibot.api.routes.chat import _explain_check
-    _, store = chat_client
-    is_ok, cost = await _explain_check(store, "SELECT 1")
-    assert is_ok is True
-    assert cost == 0.0
+async def test_empty_results_narrative(chat_client):
+    """Empty results get human-readable message, not 'Found 0 results.'"""
+    client, _ = chat_client
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show me baselines"},
+    )
+    data = resp.json()
+    assert "Found 0" not in data["answer"]

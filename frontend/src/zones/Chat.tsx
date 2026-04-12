@@ -10,8 +10,17 @@ interface Message {
 }
 
 interface ChatProps {
-  onPin?: (data: { widget_type: string; title: string; config?: unknown; data_source?: unknown }) => void;
+  onPin?: (data: {
+    widget_type: string; title: string;
+    config?: unknown; data_source?: unknown;
+  }) => void;
 }
+
+const DOMAIN_COLORS: Record<string, string> = {
+  observability: 'bg-blue-500/20 text-blue-300',
+  application: 'bg-green-500/20 text-green-300',
+  infrastructure: 'bg-purple-500/20 text-purple-300',
+};
 
 export function Chat({ onPin }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -62,7 +71,10 @@ export function Chat({ onPin }: ChatProps) {
       <div className="flex-1 overflow-y-auto space-y-3 mb-3">
         {messages.length === 0 && (
           <p className="text-slate-500 text-sm">
-            Ask questions about your infrastructure. Try: &quot;Show recent metrics&quot;
+            Ask questions about your system. Examples:
+            <br />&bull; &quot;What alerts fired today?&quot;
+            <br />&bull; &quot;Show me metric trends&quot;
+            <br />&bull; &quot;When was the last deploy?&quot;
           </p>
         )}
         {messages.map((msg, i) => (
@@ -74,7 +86,28 @@ export function Chat({ onPin }: ChatProps) {
                 : 'bg-slate-800 text-slate-200 mr-8'
             }`}
           >
-            {msg.content}
+            <p className="leading-relaxed">{msg.content}</p>
+
+            {msg.response?.domains_hit && msg.response.domains_hit.length > 0 && (
+              <div className="flex gap-1.5 mt-2">
+                {msg.response.domains_hit.map((d) => (
+                  <span
+                    key={d}
+                    className={`px-2 py-0.5 rounded text-xs font-medium ${
+                      DOMAIN_COLORS[d] ?? 'bg-slate-600 text-slate-300'
+                    }`}
+                  >
+                    {d}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {msg.response?.warnings && msg.response.warnings.length > 0 && (
+              <div className="mt-2 px-2 py-1 bg-amber-500/10 border border-amber-500/20 rounded text-xs text-amber-300">
+                {msg.response.warnings.join(' ')}
+              </div>
+            )}
 
             {msg.response?.vega_lite_spec && (
               <ChatVisualization spec={msg.response.vega_lite_spec} />
@@ -98,7 +131,9 @@ export function Chat({ onPin }: ChatProps) {
 
             {msg.response?.sql_query && (
               <details className="mt-2">
-                <summary className="text-xs text-slate-400 cursor-pointer">Show SQL</summary>
+                <summary className="text-xs text-slate-400 cursor-pointer">
+                  Show SQL
+                </summary>
                 <pre className="mt-1 text-xs bg-slate-900 p-2 rounded overflow-x-auto">
                   {msg.response.sql_query}
                 </pre>

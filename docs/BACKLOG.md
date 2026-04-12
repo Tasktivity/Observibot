@@ -4,12 +4,13 @@ Items are tagged: [P0] Must do, [P1] Should do, [P2] Nice to have
 
 ## Phase 3 Deferred
 
-### [P1] Production DB Querying from Chat
-Chat currently queries Observibot's own store only. Future: add
-opt-in production DB querying with separate read-only connection
-pool, schema RAG for large schemas, and EXPLAIN cost gating.
-Requires explicit user opt-in via config, read replica routing,
-and tenant isolation for multi-tenant apps.
+### [P1] Production DB Querying — Enable and Wire
+AppDatabasePool (core/app_db.py) and query_application tool
+(chat_agent.py) are built but not yet wired into the config
+loader or CLI startup. Need: config flag parsing for
+chat.enable_app_queries, DSN from connector config, pool
+initialization in monitor.py startup, and deps.set_app_db()
+call. The tool, sandbox, and schema catalog are ready.
 
 ### [P1] LLM Query Optimization Feedback Loop
 When EXPLAIN rejects a query as too expensive, feed the cost back

@@ -68,6 +68,26 @@ async def discovery_feed(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@router.get("/summary")
+async def discovery_summary(
+    user: dict = Depends(get_current_user),
+    store: Store = Depends(get_store),
+) -> dict:
+    """Return a summary of the monitored system for bootstrap display."""
+    model = await store.get_latest_system_snapshot()
+    ctx = await store.get_all_business_context()
+    tables = len(model.tables) if model else 0
+    relationships = len(model.relationships) if model else 0
+    services = len(model.services) if model else 0
+    return {
+        "tables": tables,
+        "relationships": relationships,
+        "services": services,
+        "app_description": ctx.get("summary", ""),
+        "app_type": ctx.get("app_type", ""),
+    }
+
+
 @router.get("/model")
 async def discovery_model(
     user: dict = Depends(get_current_user),
