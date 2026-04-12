@@ -1,5 +1,6 @@
 import ReactECharts from 'echarts-for-react';
 import type { WidgetProps } from './WidgetRegistry';
+import { humanizeColumn } from '../utils/format';
 
 export function BarChartWidget({ config, data }: WidgetProps) {
   const xField = (config?.x as string) ?? 'name';
@@ -7,7 +8,7 @@ export function BarChartWidget({ config, data }: WidgetProps) {
   const orientation = (config?.orientation as string) ?? 'vertical';
 
   const items = (data ?? []) as Record<string, unknown>[];
-  const categories = items.map((d) => String(d[xField] ?? ''));
+  const categories = items.map((d) => humanizeColumn(String(d[xField] ?? '')));
   const values = items.map((d) => Number(d[yField] ?? 0));
 
   const isHorizontal = orientation === 'horizontal';

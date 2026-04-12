@@ -1,79 +1,105 @@
 # Observibot — Backlog & Deferred Items
 
-Items are tagged: [P0] Must do, [P1] Should do, [P2] Nice to have
+Items are tagged: [P0] Must fix now, [P1] Should do next, [P2] Nice to have
 
-## Phase 3 Deferred
+## P0 — Active Bugs (Must Fix Before Expanding Scope)
 
-### [P1] Production DB Querying — Enable and Wire
-AppDatabasePool (core/app_db.py) and query_application tool
-(chat_agent.py) are built but not yet wired into the config
-loader or CLI startup. Need: config flag parsing for
-chat.enable_app_queries, DSN from connector config, pool
-initialization in monitor.py startup, and deps.set_app_db()
-call. The tool, sandbox, and schema catalog are ready.
+### User Count Returns 0 from Production DB
+`query_application` tool generates correct SQL (`SELECT COUNT(*) FROM public.users`)
+and routes to Domain 2 (green "application" badge appears), but returns 0 instead
+of the actual count (46 users). Suspected cause: table name collision between
+Observibot's internal auth `users` table in the SQLAlchemy store and the production
+`public.users` table. The SQL may be executing against the wrong database engine.
+**Investigation needed:** verify which engine `_exec_application` uses, ensure it
+uses `AppDatabasePool.execute_sandboxed()` and NOT `store.engine`.
 
-### [P1] LLM Query Optimization Feedback Loop
-When EXPLAIN rejects a query as too expensive, feed the cost back
-to the LLM and ask it to rewrite with filters/indexes. Currently
-we just reject and show an error message.
+### Layout Overflow — Zones Not Independently Scrollable
+When Discovery Feed has many insights (40+), the entire page becomes a tall scrollable
+document, pushing Dashboard and Chat zones off-screen. Fix applied to `App.tsx`
+(added `h-full` to zone wrappers) but frontend needs rebuild.
+**CSS fix:** Each zone column must have `overflow-y-auto` within a height-constrained
+container so each zone scrolls independently.
 
-### [P1] SSE for Discovery Feed
-Discovery Feed currently polls /api/insights every 5 seconds.
-EventSource doesn't reliably carry httpOnly cookies across all
-browsers. Deferred in favor of polling which is simpler and
-equally effective for the current update cadence (5s). SSE can
-be revisited with a token-in-URL scheme or dedicated SSE auth.
+### JavaScript Exceptions — "Unexpected end of JSON input"
+API endpoints occasionally return non-JSON responses (possibly empty bodies or
+truncated responses), causing `SyntaxError` in the frontend JSON parser. No error
+shown to user — silent failures. Need error boundary + graceful fallback.
 
-### [P2] SSE for Chat Streaming
-Chat responses arrive as a single POST response. Future: stream
-LLM tokens via SSE for progressive rendering (narrative appears
-word-by-word, then visualization renders at the end).
+## P0 — Critical UX Issues
 
-### [P2] gridstack.js Drag-and-Drop
-Dashboard uses CSS grid. gridstack.js is installed but not yet
-wired into the Dashboard component for drag-and-drop reordering
-and resizing. The layout batch update API endpoint is ready.
-Deferred because integrating gridstack with React 19 portals
-requires careful lifecycle management.
+### Insight Deduplication in Discovery Feed
+Near-identical insights generated every 5 minutes ("Abnormal User Activity Spike
+Following Worker Deployment" appears 10+ times with minor wording variations).
+The insight fingerprinting/dedup system needs tuning — either increase fingerprint
+similarity threshold or aggregate consecutive similar insights.
 
-### [P2] Schema RAG for Large Monitored Apps
-For 500+ table schemas, the full DDL won't fit in LLM context.
-Need semantic search over table descriptions to inject only the
-5-10 most relevant tables into each prompt.
+### Number Formatting Throughout
+- Ratios display as raw decimals (0.9995 not 99.95%)
+- Timestamps display as ISO strings not relative ("2m ago")
+- Column headers are snake_case database names not human-readable
+- `frontend/src/utils/format.ts` exists but may not be applied everywhere
 
-### [P2] Token Revocation / Blocklist
-JWTs remain valid until expiry even after user deletion. Add a
-minimal token blocklist (in-memory or DB-backed with TTL).
+## P1 — Should Do Next
 
-### [P2] Multi-Tenant Data Isolation
-If monitoring a multi-tenant SaaS, LLM-generated queries could
-cross tenant boundaries. AST parser should enforce WHERE tenant_id
-clauses when tenant_id is configured.
+### Vega-Lite Chart Issues
+- Version mismatch: spec uses v5, vega-embed is v6.4.2 (warnings)
+- "Infinite extent" errors on infrastructure status charts (bar chart for categorical status data doesn't render)
+- Status data should use a status widget, not a bar chart
 
-### [P2] Timezone Handling in Charts
-LLM-generated Vega-Lite specs should use user's local timezone,
-not UTC. Requires passing timezone from frontend to backend.
+### Pinned Widget Data Flow
+Pin-to-dashboard creates a widget card with title but body may render empty.
+Per architecture decisions: widgets should store BOTH a query_binding (for refresh)
+and a data_snapshot (for immediate render). Currently only stores partial config.
 
-### [P2] Widget Schema Versioning
-Add explicit schema_version to widget definitions so saved
-dashboards don't break on upgrade. Already has column in DB,
-needs enforcement logic.
+### Business KPI Promotion
+Core health questions (user count, sync failure rate, extraction latency) should be
+collected as first-class metrics into Observibot's own store, so they answer from
+Domain 1 (fast, cached) instead of requiring Domain 2 (live production query).
+See AGENTIC_DECISIONS.md Decision 8.
 
-### [P2] Observability of Observibot Itself
-Expose /metrics endpoint (Prometheus format) for the daemon and
-web services. Users should see when Observibot is falling behind
-or experiencing LLM failures.
+### Metric Registry
+Build a registry for observability metrics: display name, unit, thresholds, healthy
+ranges, aggregation behavior, synonyms. This fixes formatting and enables the LLM
+to provide context ("99.95% — excellent, anything above 99% is healthy").
 
-### [P2] Cross-Widget Communication
-Global time filter that all dashboard widgets respond to. Requires
-event bus or context provider that coordinates filter state across
-independently rendered widget components.
+## P2 — Deferred
 
-### [P2] Interactive Onboarding Interview
-Current semantic modeler auto-accepts LLM suggestions. Future:
-interactive walkthrough where the user confirms/corrects the LLM's
-understanding of their application architecture.
+### gridstack.js Drag-and-Drop
+Dashboard uses CSS grid. gridstack.js installed but not wired. Deferred because
+accurate live data is more valuable than draggable blank widgets.
 
-### [P2] Additional Connectors
-Neon, Fly.io, Render, Vercel, PlanetScale. Keep in-tree until
-community emerges.
+### SSE for Discovery Feed
+Polling works. EventSource + httpOnly cookies unreliable. Keep polling for v1.
+
+### SSE for Chat Streaming
+Chat responses arrive as single POST. Future: stream LLM tokens via SSE.
+
+### Schema RAG for Large Schemas
+For 500+ tables, need semantic search over table descriptions.
+
+### Token Revocation / Blocklist
+JWTs valid until expiry even after user deletion.
+
+### Multi-Tenant Data Isolation
+RLS or tenant-scoped views for multi-tenant production databases.
+
+### Timezone Handling in Charts
+LLM specs should use user's local timezone, not UTC.
+
+### Widget Schema Versioning
+schema_version column exists, needs enforcement logic.
+
+### Observability of Observibot Itself
+/metrics endpoint (Prometheus format) for daemon and web services.
+
+### Cross-Widget Communication
+Global time filter coordinating across independent widget components.
+
+### Interactive Onboarding Interview
+Semantic modeler auto-accepts; future: interactive walkthrough.
+
+### LLM Query Optimization Feedback Loop
+Feed EXPLAIN cost back to LLM for query rewriting when rejected.
+
+### Additional Connectors
+Neon, Fly.io, Render, Vercel, PlanetScale. In-tree until community emerges.

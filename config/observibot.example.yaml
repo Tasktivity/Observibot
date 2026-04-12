@@ -58,6 +58,12 @@ store:
     insights_days: 90
     max_snapshots: 10
 
+chat:
+  enable_app_queries: false
+  app_db_max_connections: 3
+  statement_timeout_ms: 3000
+  max_result_rows: 500
+
 logging:
   level: INFO
   format: json

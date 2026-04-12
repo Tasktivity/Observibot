@@ -417,12 +417,10 @@ class Insight:
         return self.title
 
     def compute_fingerprint(self) -> str:
-        """Compute a stable fingerprint for de-duplication."""
+        """Stable fingerprint for de-dup — excludes LLM-generated text."""
         payload = json.dumps(
             {
                 "severity": self.severity,
-                "title": self.title,
-                "summary": self.summary,
                 "source": self.source,
                 "tables": sorted(self.related_tables),
                 "metrics": sorted(self.related_metrics),

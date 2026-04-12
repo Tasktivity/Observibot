@@ -103,6 +103,17 @@ class LoggingConfig:
 
 
 @dataclass
+class ChatConfig:
+    """Chat / Q&A settings."""
+
+    enable_app_queries: bool = False
+    app_db_max_connections: int = 3
+    statement_timeout_ms: int = 3000
+    max_result_rows: int = 500
+    explain_cost_threshold: float = 100_000
+
+
+@dataclass
 class ObservibotConfig:
     """Top-level config object."""
 
@@ -112,6 +123,7 @@ class ObservibotConfig:
     alerting: AlertingConfig = field(default_factory=AlertingConfig)
     store: StoreConfig = field(default_factory=StoreConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    chat: ChatConfig = field(default_factory=ChatConfig)
     source_path: Path | None = None
 
 
@@ -325,6 +337,17 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         format=log_raw.get("format", "text"),
     )
 
+    chat_raw = data.get("chat") or {}
+    chat = ChatConfig(
+        enable_app_queries=bool(chat_raw.get("enable_app_queries", False)),
+        app_db_max_connections=int(chat_raw.get("app_db_max_connections", 3)),
+        statement_timeout_ms=int(chat_raw.get("statement_timeout_ms", 3000)),
+        max_result_rows=int(chat_raw.get("max_result_rows", 500)),
+        explain_cost_threshold=float(
+            chat_raw.get("explain_cost_threshold", 100_000)
+        ),
+    )
+
     return ObservibotConfig(
         llm=llm,
         connectors=connectors,
@@ -332,6 +355,7 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         alerting=alerting,
         store=store,
         logging=logging_cfg,
+        chat=chat,
     )
 
 

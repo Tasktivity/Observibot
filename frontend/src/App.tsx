@@ -38,13 +38,13 @@ function AppContent() {
 
   return (
     <Layout>
-      <div className="col-span-3 overflow-hidden">
+      <div className="col-span-3 overflow-hidden h-full min-h-0">
         <DiscoveryFeed onPin={handlePinInsight} />
       </div>
-      <div className="col-span-6 overflow-hidden">
+      <div className="col-span-6 overflow-hidden h-full min-h-0">
         <Dashboard ref={dashboardRef} />
       </div>
-      <div className="col-span-3 overflow-hidden">
+      <div className="col-span-3 overflow-hidden h-full min-h-0">
         <Chat onPin={handlePinChat} />
       </div>
     </Layout>

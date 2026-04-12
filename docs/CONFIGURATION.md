@@ -186,6 +186,45 @@ recent `system_snapshots` rows and drops the rest.
 
 ---
 
+## `chat`
+
+```yaml
+chat:
+  enable_app_queries: false
+  app_db_max_connections: 3
+  statement_timeout_ms: 3000
+  max_result_rows: 500
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enable_app_queries` | bool | `false` | When `true`, the agentic chat can run read-only SQL against the monitored application database (the same DB configured in `connectors`). Disabled by default — enable only after verifying the database role has the required read access (see below). |
+| `app_db_max_connections` | int | `3` | Maximum connections in the chat query pool. Kept small to avoid competing with the application's own traffic. |
+| `statement_timeout_ms` | int | `3000` | Per-query timeout. Queries exceeding this are cancelled server-side. |
+| `max_result_rows` | int | `500` | Maximum rows returned from a single chat query. |
+
+### Database access requirements for chat queries
+
+When `enable_app_queries` is `true`, Observibot opens a **separate read-only
+connection pool** to the application database. The database role used for this
+connection must be able to `SELECT` from the tables it needs to query.
+
+On databases that enforce row-level access policies (e.g., PostgreSQL RLS,
+Supabase RLS, or platform-specific access controls), a `SELECT` grant alone is
+not sufficient — the role must also have a matching read policy on each table.
+Without one, queries return zero rows instead of raising an error, which
+produces silently wrong answers.
+
+**Before enabling `enable_app_queries`, verify that the database role can
+actually read rows** by running a simple `SELECT COUNT(*) FROM <table>` as
+that role. If it returns 0 on a table you know has data, your platform's
+access policies are likely blocking the role.
+
+See [`architecture/CONNECTORS.md`](architecture/CONNECTORS.md) for
+platform-specific setup.
+
+---
+
 ## `logging`
 
 ```yaml

@@ -12,6 +12,7 @@ import sqlalchemy as sa
 from observibot.agent.infra_query import execute_infra_query
 from observibot.agent.llm_provider import LLMProvider
 from observibot.agent.schema_catalog import (
+    _is_sensitive_column,
     build_app_schema_description,
     build_observability_schema_description,
     get_app_table_names,
@@ -293,6 +294,10 @@ async def _exec_application(
         )
     try:
         rows = await app_db.execute_sandboxed(validated)
+        for row in rows:
+            for key in list(row.keys()):
+                if _is_sensitive_column(key):
+                    row[key] = "[REDACTED]"
         return ToolResult(
             domain="application", sql=validated,
             rows=rows, success=True,

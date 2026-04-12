@@ -10,7 +10,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
     throw new ApiError(res.status, body.detail ?? 'Request failed');
   }
-  return res.json() as Promise<T>;
+  const text = await res.text();
+  if (!text) {
+    return {} as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, 'Invalid JSON response from server');
+  }
 }
 
 export class ApiError extends Error {

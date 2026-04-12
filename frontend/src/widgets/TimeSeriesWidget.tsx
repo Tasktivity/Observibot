@@ -1,5 +1,6 @@
 import ReactECharts from 'echarts-for-react';
 import type { WidgetProps } from './WidgetRegistry';
+import { formatTimestamp } from '../utils/format';
 
 export function TimeSeriesWidget({ config, data }: WidgetProps) {
   const xField = (config?.x as string) ?? 'collected_at';
@@ -15,7 +16,7 @@ export function TimeSeriesWidget({ config, data }: WidgetProps) {
       data: items.map((d) => {
         const v = d[xField];
         if (typeof v === 'string' && v.includes('T')) {
-          return new Date(v).toLocaleTimeString();
+          return formatTimestamp(v);
         }
         return String(v ?? '');
       }),

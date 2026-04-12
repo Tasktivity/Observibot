@@ -95,6 +95,34 @@ def test_insight_fingerprint_stable() -> None:
     assert a.fingerprint == b.fingerprint
 
 
+def test_insight_fingerprint_ignores_llm_text() -> None:
+    """Same structural fields but different LLM-generated text → same fingerprint."""
+    a = Insight(
+        title="Abnormal spike detected",
+        summary="User activity spiked after deploy",
+        severity="warning",
+        source="anomaly",
+        related_tables=["users"],
+        related_metrics=["user_count"],
+    )
+    b = Insight(
+        title="Unusual user activity increase",
+        summary="Significant uptick in user signups post-deployment",
+        severity="warning",
+        source="anomaly",
+        related_tables=["users"],
+        related_metrics=["user_count"],
+    )
+    assert a.fingerprint == b.fingerprint
+
+
+def test_insight_fingerprint_differs_on_structural_change() -> None:
+    """Different severity or tables → different fingerprint."""
+    a = Insight(severity="warning", source="anomaly", related_tables=["users"])
+    b = Insight(severity="critical", source="anomaly", related_tables=["users"])
+    assert a.fingerprint != b.fingerprint
+
+
 def test_insight_roundtrip() -> None:
     a = Insight(
         title="x",

@@ -107,7 +107,21 @@ Observibot will:
 Stop with `Ctrl-C`. The daemon handles `SIGTERM` cleanly so it's safe to run
 under systemd, Docker, or Railway.
 
-## 9. Optional: ntfy push notifications
+## 9. Optional: Enable agentic chat queries against your database
+
+The web dashboard includes an agentic chat that can answer questions about your
+application's data (e.g., "How many users are there?") by running read-only SQL
+against your production database. This is disabled by default.
+
+To enable it, set `chat.enable_app_queries: true` in your config. Before
+enabling, verify that the database role can actually read rows from your tables
+— some platforms enforce row-level access policies that silently return empty
+results even when schema-level `SELECT` is granted. See
+[`CONFIGURATION.md`](CONFIGURATION.md) for details and
+[`architecture/CONNECTORS.md`](architecture/CONNECTORS.md) for
+platform-specific setup.
+
+## 10. Optional: ntfy push notifications
 
 ntfy.sh is the cheapest way to get push notifications on your phone for free.
 

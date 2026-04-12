@@ -176,6 +176,7 @@ class MonitorLoop:
         self._health_host = health_host
         self._health_port = health_port
         self._health_task: asyncio.Task[None] | None = None
+        self._app_db: object | None = None
 
     # ---------- capability helpers ----------
 
@@ -205,12 +206,40 @@ class MonitorLoop:
                     "Connector %s failed to connect: %s", connector.name, exc
                 )
 
+        # Initialize app database pool for chat queries (opt-in)
+        if self.config.chat.enable_app_queries:
+            app_dsn = None
+            for cc in self.config.connectors:
+                if cc.type in ("supabase", "postgresql"):
+                    app_dsn = cc.options.get("connection_string")
+                    break
+            if app_dsn:
+                from observibot.core.app_db import AppDatabasePool
+                self._app_db = AppDatabasePool(
+                    dsn=app_dsn,
+                    max_size=self.config.chat.app_db_max_connections,
+                    statement_timeout_ms=self.config.chat.statement_timeout_ms,
+                )
+                try:
+                    await self._app_db.connect()
+                    log.info("App database pool connected for chat queries")
+                except Exception as exc:
+                    log.warning("Failed to connect app DB pool: %s", exc)
+                    self._app_db = None
+            else:
+                log.warning(
+                    "chat.enable_app_queries is true but no supabase/postgresql "
+                    "connector found — app queries will be unavailable"
+                )
+
         # Start the web UI + API + health endpoint as a background task.
         if self._health_host is not None:
             try:
-                from observibot.api.deps import set_analyzer, set_store
+                from observibot.api.deps import set_analyzer, set_app_db, set_store
                 set_store(self.store)
                 set_analyzer(self.analyzer)
+                if self._app_db is not None:
+                    set_app_db(self._app_db)
 
                 from observibot.health import serve_health
 
@@ -289,6 +318,10 @@ class MonitorLoop:
         for connector in self.connectors:
             with contextlib.suppress(Exception):
                 await connector.close()
+        if self._app_db is not None:
+            with contextlib.suppress(Exception):
+                await self._app_db.close()
+            self._app_db = None
         await self.alert_manager.close()
         if self._lock_held and self._lockfile_path is not None:
             release_lockfile(self._lockfile_path)

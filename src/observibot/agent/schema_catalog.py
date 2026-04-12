@@ -3,6 +3,17 @@ from __future__ import annotations
 
 from observibot.core.models import SystemModel, TableInfo
 
+SENSITIVE_COLUMN_PATTERNS = {
+    "api_key", "api_token", "secret", "password", "hash",
+    "token", "credential", "private_key", "embedding",
+    "openai_api_key", "service_role_key",
+}
+
+
+def _is_sensitive_column(col_name: str) -> bool:
+    name_lower = col_name.lower()
+    return any(pat in name_lower for pat in SENSITIVE_COLUMN_PATTERNS)
+
 
 def build_app_schema_description(model: SystemModel | None) -> str:
     """Build a compact schema description of the monitored app's tables."""
@@ -10,11 +21,12 @@ def build_app_schema_description(model: SystemModel | None) -> str:
         return "(no application schema discovered)"
     lines = []
     for table in sorted(model.tables, key=lambda t: t.fqn)[:50]:
+        safe_cols = [c for c in table.columns if not _is_sensitive_column(c.get("name", ""))]
         cols = ", ".join(
             f"{c['name']} ({c.get('type', '?')})"
-            for c in table.columns[:15]
+            for c in safe_cols[:15]
         )
-        if len(table.columns) > 15:
+        if len(safe_cols) > 15:
             cols += ", ..."
         row_hint = f" (~{table.row_count} rows)" if table.row_count else ""
         lines.append(f"  {table.fqn}{row_hint}: {cols}")

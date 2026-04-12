@@ -1,5 +1,25 @@
 # Observibot — Connector Architecture
 
+## Database Role Requirements
+
+Observibot connects to your database with a dedicated read-only role. This role
+needs two levels of access:
+
+1. **Schema-level grants** — `USAGE` on the schema and `SELECT` on tables.
+   This is the standard setup documented per-connector below.
+
+2. **Row-level read access** — If your database platform enforces row-level
+   access policies (PostgreSQL RLS, platform-managed policies, or similar),
+   the role must also have a read policy granting it access to rows.
+   Without one, queries return zero rows instead of an error. This is
+   especially important when `chat.enable_app_queries` is enabled — the
+   agentic chat runs live `SELECT` queries against the application database,
+   and silently empty results produce wrong answers.
+
+**Quick verification:** After setting up the role, connect as that role and run
+`SELECT COUNT(*) FROM <table>` on a table you know has data. If the count is
+0, your platform's access policies are blocking the role.
+
 ## BaseConnector Interface
 
 ```python
@@ -108,6 +128,22 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ```
 
 A helper script lives at `scripts/setup_supabase_role.sh` that automates this.
+
+**Row-level access policies:** If your database uses row-level security (RLS)
+or equivalent access controls, the `GRANT SELECT` above only grants schema-level
+access. Tables with active access policies will return zero rows to the
+Observibot role unless a matching read policy exists. This affects both metric
+collection (`row_count` will read as 0) and agentic chat queries. Add a read
+policy for every table the role needs to access:
+
+```sql
+-- Example: grant the monitoring role read access on a table with RLS
+CREATE POLICY observibot_read ON public.<table_name>
+    FOR SELECT TO observibot USING (true);
+```
+
+Repeat for each table that has access policies enabled, or automate with a
+query against `pg_tables WHERE rowsecurity = true`.
 
 **Foreign-key discovery fallback:** Managed Supabase often returns 0 rows from
 `information_schema.table_constraints` for non-owner roles. The connector

@@ -25,6 +25,30 @@ GRANT USAGE ON SCHEMA public TO observibot_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO observibot_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO observibot_reader;
 GRANT pg_monitor TO observibot_reader;
+
+-- Supabase enables RLS on all tables by default.  Without an explicit
+-- SELECT policy for observibot_reader, every query returns 0 rows.
+DO \$\$
+DECLARE
+  tbl RECORD;
+  pol_name TEXT;
+BEGIN
+  FOR tbl IN
+    SELECT schemaname, tablename
+    FROM pg_tables
+    WHERE schemaname = 'public'
+      AND tablename IN (
+          SELECT relname FROM pg_class
+          WHERE relrowsecurity = true
+            AND relnamespace = 'public'::regnamespace)
+  LOOP
+    pol_name := 'observibot_read_' || tbl.tablename;
+    EXECUTE format(
+      'CREATE POLICY %I ON %I.%I FOR SELECT TO observibot_reader USING (true)',
+      pol_name, tbl.schemaname, tbl.tablename);
+  END LOOP;
+END
+\$\$;
 "
 
 echo ""
