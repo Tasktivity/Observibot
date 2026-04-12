@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+import sqlalchemy as sa
 
 from observibot.core.models import (
     ChangeEvent,
@@ -12,7 +14,7 @@ from observibot.core.models import (
     SystemModel,
     TableInfo,
 )
-from observibot.core.store import Store
+from observibot.core.store import Store, build_engine, metadata
 
 
 pytestmark = pytest.mark.asyncio
@@ -153,3 +155,62 @@ async def test_alert_history(tmp_store) -> None:
     )
     count = await tmp_store.count_alerts_since(datetime.now(timezone.utc) - timedelta(hours=1))
     assert count == 1
+
+
+def test_build_engine_sqlite_url() -> None:
+    engine = build_engine("sqlite+aiosqlite:///test.db")
+    assert "sqlite" in str(engine.url)
+    assert engine.url.drivername == "sqlite+aiosqlite"
+
+
+def test_build_engine_postgres_url() -> None:
+    engine = build_engine("postgres://user:pass@host/db")
+    assert engine.url.drivername == "postgresql+asyncpg"
+
+
+def test_build_engine_postgresql_url() -> None:
+    engine = build_engine("postgresql://user:pass@host/db")
+    assert engine.url.drivername == "postgresql+asyncpg"
+
+
+def test_build_engine_defaults_to_env_var() -> None:
+    with patch.dict("os.environ", {"DATABASE_URL": "sqlite+aiosqlite:///env.db"}):
+        engine = build_engine()
+        assert "env.db" in str(engine.url)
+
+
+def test_metadata_has_phase3_tables() -> None:
+    table_names = set(metadata.tables.keys())
+    assert "users" in table_names
+    assert "dashboard_widgets" in table_names
+    assert "query_cache" in table_names
+
+
+async def test_table_creation_via_metadata(tmp_path: Path) -> None:
+    db_path = tmp_path / "schema_test.db"
+    async with Store(db_path) as store:
+        async with store.engine.begin() as conn:
+            result = await conn.execute(
+                sa.text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            )
+            tables = {r[0] for r in result.fetchall()}
+    assert "system_snapshots" in tables
+    assert "metric_snapshots" in tables
+    assert "users" in tables
+    assert "dashboard_widgets" in tables
+    assert "query_cache" in tables
+
+
+async def test_store_engine_property(tmp_path: Path) -> None:
+    db_path = tmp_path / "engine_test.db"
+    async with Store(db_path) as store:
+        assert store.engine is not None
+        assert store.conn is not None
+
+
+async def test_store_not_connected_raises() -> None:
+    store = Store("unused.db")
+    with pytest.raises(RuntimeError, match="not connected"):
+        _ = store.conn
+    with pytest.raises(RuntimeError, match="not connected"):
+        _ = store.engine
