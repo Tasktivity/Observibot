@@ -192,6 +192,15 @@ def _labels_key(labels: dict[str, str]) -> str:
     return json.dumps(labels, sort_keys=True)
 
 
+def _dialect_insert(table: Table, engine: AsyncEngine):
+    """Return the dialect-specific insert function for upsert support."""
+    if "postgresql" in str(engine.url):
+        from sqlalchemy.dialects.postgresql import insert
+        return insert(table)
+    from sqlalchemy.dialects.sqlite import insert
+    return insert(table)
+
+
 def build_engine(url: str | None = None) -> AsyncEngine:
     """Create an async engine from a URL or the DATABASE_URL env var."""
     db_url = url or os.getenv("DATABASE_URL", "sqlite+aiosqlite:///data/observibot.db")
@@ -271,7 +280,7 @@ class Store:
         fp = model.fingerprint or model.compute_fingerprint()
         async with self.engine.begin() as conn:
             stmt = (
-                sa.dialects.sqlite.insert(system_snapshots)
+                _dialect_insert(system_snapshots, self.engine)
                 .values(
                     id=model.id,
                     fingerprint=fp,
@@ -323,7 +332,7 @@ class Store:
         async with self.engine.begin() as conn:
             for row in rows:
                 stmt = (
-                    sa.dialects.sqlite.insert(metric_snapshots)
+                    _dialect_insert(metric_snapshots, self.engine)
                     .values(**row)
                     .on_conflict_do_update(
                         index_elements=["id"],
@@ -381,7 +390,7 @@ class Store:
     async def save_change_event(self, event_obj: ChangeEvent) -> None:
         async with self.engine.begin() as conn:
             stmt = (
-                sa.dialects.sqlite.insert(change_events)
+                _dialect_insert(change_events, self.engine)
                 .values(
                     id=event_obj.id,
                     connector_name=event_obj.connector_name,
@@ -447,7 +456,7 @@ class Store:
             if result.fetchone() is not None:
                 return False
             stmt = (
-                sa.dialects.sqlite.insert(insights_table)
+                _dialect_insert(insights_table, self.engine)
                 .values(
                     id=insight.id,
                     severity=insight.severity,
@@ -558,7 +567,7 @@ class Store:
     async def set_business_context(self, key: str, value: Any) -> None:
         async with self.engine.begin() as conn:
             stmt = (
-                sa.dialects.sqlite.insert(business_context)
+                _dialect_insert(business_context, self.engine)
                 .values(key=key, value=json.dumps(value), updated_at=_utcnow_iso())
                 .on_conflict_do_update(
                     index_elements=["key"],
@@ -644,7 +653,7 @@ class Store:
         lk = _labels_key(labels)
         async with self.engine.begin() as conn:
             stmt = (
-                sa.dialects.sqlite.insert(metric_baselines)
+                _dialect_insert(metric_baselines, self.engine)
                 .values(
                     metric_name=metric_name,
                     connector_name=connector_name,

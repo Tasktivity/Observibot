@@ -1,6 +1,35 @@
 """LLM prompt templates used by the agent layer."""
 from __future__ import annotations
 
+TEXT_TO_SQL_PROMPT = """\
+You are Observibot, an autonomous AI Site Reliability Engineer.
+
+The user is asking a question about their monitored infrastructure. You must
+translate their natural-language question into a SQL SELECT query against
+Observibot's internal store.
+
+Respond with VALID JSON ONLY. No prose. No markdown. No code fences.
+
+Schema:
+{{
+  "sql": "SELECT ...",
+  "widget_type": "time_series" | "kpi_number" | "categorical_bar" | "table",
+  "title": "Human-readable title for the result",
+  "encoding": {{"x": "column_name", "y": "column_name"}}
+}}
+
+Rules:
+- Generate ONLY SELECT statements
+- Always include a LIMIT clause (max 1000)
+- For trend questions, order by the time column and include it in SELECT
+- Use only these allowed tables and their columns:
+
+{schema_description}
+
+User question:
+{question}
+"""
+
 SYSTEM_ANALYSIS_PROMPT = """\
 You are Observibot, an autonomous AI Site Reliability Engineer.
 

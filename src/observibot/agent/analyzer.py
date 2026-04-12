@@ -20,6 +20,7 @@ from observibot.agent.prompts import (
     ANOMALY_ANALYSIS_PROMPT,
     ON_DEMAND_QUERY_PROMPT,
     SYSTEM_ANALYSIS_PROMPT,
+    TEXT_TO_SQL_PROMPT,
 )
 from observibot.agent.schemas import (
     LLMAnalysisResponse,
@@ -231,6 +232,35 @@ class Analyzer:
             )
             raise LLMSoftError(f"Query validation failed: {exc}") from exc
 
+    async def generate_sql(
+        self,
+        question: str,
+        table_allowlist: set[str],
+    ) -> tuple[str, dict | None]:
+        """Generate SQL + widget hints from a natural language question.
+
+        Returns (sql_query, widget_hints_dict_or_None).
+        """
+        schema_desc = _describe_store_schema(table_allowlist)
+        prompt = TEXT_TO_SQL_PROMPT.format(
+            schema_description=schema_desc,
+            question=question,
+        )
+        response = await self.provider.analyze(
+            system_prompt="You are Observibot. Output only JSON.",
+            user_prompt=prompt,
+        )
+        await self._record_usage(response, purpose="text_to_sql")
+        sql = response.data.get("sql", "")
+        if not sql:
+            raise LLMSoftError("LLM returned empty SQL")
+        widget_hints = {
+            "widget_type": response.data.get("widget_type", "table"),
+            "title": response.data.get("title", question[:50]),
+            "encoding": response.data.get("encoding", {}),
+        }
+        return sql, widget_hints
+
     async def _persist(self, insights: list[Insight]) -> None:
         if self.store is None:
             return
@@ -314,6 +344,22 @@ class Analyzer:
         if self.store is None:
             return True
         return await self.store.save_insight(insight)
+
+
+def _describe_store_schema(allowed_tables: set[str]) -> str:
+    """Build a compact schema description of Observibot's store tables."""
+    from observibot.core.store import metadata as store_metadata
+
+    lines = []
+    for name in sorted(allowed_tables):
+        table = store_metadata.tables.get(name)
+        if table is None:
+            continue
+        cols = ", ".join(
+            f"{c.name} ({c.type})" for c in table.columns
+        )
+        lines.append(f"- {name}: {cols}")
+    return "\n".join(lines) if lines else "(no tables)"
 
 
 def utcnow() -> datetime:

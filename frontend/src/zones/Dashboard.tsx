@@ -1,18 +1,24 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useImperativeHandle, forwardRef, useCallback } from 'react';
 import { api, type Widget } from '../api/client';
 import { WIDGET_REGISTRY } from '../widgets/WidgetRegistry';
 import { ViewAsDropdown } from '../components/ViewAsDropdown';
 
-export function Dashboard() {
+export interface DashboardHandle {
+  refresh: () => void;
+}
+
+export const Dashboard = forwardRef<DashboardHandle>(function Dashboard(_props, ref) {
   const [widgets, setWidgets] = useState<Widget[]>([]);
   const [viewOverrides, setViewOverrides] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
 
-  const loadWidgets = () => {
+  const loadWidgets = useCallback(() => {
     api.widgets.list().then(setWidgets).catch(() => {}).finally(() => setLoading(false));
-  };
+  }, []);
 
-  useEffect(() => { loadWidgets(); }, []);
+  useEffect(() => { loadWidgets(); }, [loadWidgets]);
+
+  useImperativeHandle(ref, () => ({ refresh: loadWidgets }), [loadWidgets]);
 
   const removeWidget = async (id: string) => {
     await api.widgets.remove(id);
@@ -81,4 +87,4 @@ export function Dashboard() {
       </div>
     </div>
   );
-}
+});

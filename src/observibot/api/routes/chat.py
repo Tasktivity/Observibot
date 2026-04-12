@@ -1,4 +1,4 @@
-"""Chat routes — text-to-SQL with visualization."""
+"""Chat routes — text-to-SQL with LLM generation and sandbox validation."""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
 
-from observibot.api.deps import get_current_user, get_store
+from observibot.api.deps import get_analyzer, get_current_user, get_store
 from observibot.api.schemas import ChatRequest, ChatResponse
 from observibot.core.sql_sandbox import QueryValidationError, validate_query
 from observibot.core.store import Store, query_cache
@@ -25,6 +25,7 @@ ALLOWED_TABLES = {
 }
 
 CACHE_TTL_SECONDS = 120
+EXPLAIN_COST_THRESHOLD = 100_000
 
 
 def _query_hash(sql: str) -> str:
@@ -33,6 +34,10 @@ def _query_hash(sql: str) -> str:
 
 def _utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _is_postgres(engine: sa.engine.Engine) -> bool:
+    return "postgresql" in str(engine.url)
 
 
 async def _check_cache(store: Store, sql_hash: str) -> dict | None:
@@ -62,11 +67,15 @@ async def _save_cache(
     result_json: list, row_count: int, execution_ms: float,
 ) -> None:
     now = _utcnow_iso()
-    expires = (datetime.now(UTC) + timedelta(seconds=CACHE_TTL_SECONDS)).isoformat()
+    expires = (
+        datetime.now(UTC) + timedelta(seconds=CACHE_TTL_SECONDS)
+    ).isoformat()
     async with store.engine.begin() as conn:
-        stmt = (
-            sa.dialects.sqlite.insert(query_cache)
-            .values(
+        await conn.execute(
+            query_cache.delete().where(query_cache.c.hash == sql_hash)
+        )
+        await conn.execute(
+            query_cache.insert().values(
                 hash=sql_hash,
                 sql_text=sql_text,
                 result_json=result_json,
@@ -75,18 +84,37 @@ async def _save_cache(
                 created_at=now,
                 expires_at=expires,
             )
-            .on_conflict_do_update(
-                index_elements=["hash"],
-                set_=dict(
-                    result_json=result_json,
-                    row_count=row_count,
-                    execution_ms=execution_ms,
-                    created_at=now,
-                    expires_at=expires,
-                ),
-            )
         )
-        await conn.execute(stmt)
+
+
+async def _explain_check(
+    store: Store, sql: str, threshold: float = EXPLAIN_COST_THRESHOLD,
+) -> tuple[bool, float]:
+    """Run EXPLAIN on a query and check cost. Only works on Postgres."""
+    if not _is_postgres(store.engine):
+        return True, 0.0
+    try:
+        async with store.engine.begin() as conn:
+            result = await conn.execute(
+                sa.text(f"EXPLAIN (FORMAT JSON) {sql}")
+            )
+            plan = result.scalar()
+            if isinstance(plan, list) and plan:
+                total_cost = plan[0].get("Plan", {}).get(
+                    "Total Cost", 0
+                )
+            elif isinstance(plan, str):
+                import json
+                parsed = json.loads(plan)
+                total_cost = parsed[0].get("Plan", {}).get(
+                    "Total Cost", 0
+                )
+            else:
+                return True, 0.0
+            return total_cost <= threshold, total_cost
+    except Exception as exc:
+        log.debug("EXPLAIN check failed (non-critical): %s", exc)
+        return True, 0.0
 
 
 def _infer_widget_plan(
@@ -100,20 +128,26 @@ def _infer_widget_plan(
             "title": question[:50],
             "encoding": {},
             "data": rows,
-            "config": {"value": value if isinstance(value, (int, float)) else 0},
+            "config": {
+                "value": value if isinstance(value, (int, float)) else 0,
+            },
         }
 
-    time_cols = ("collected_at", "occurred_at", "created_at", "recorded_at")
+    time_cols = (
+        "collected_at", "occurred_at", "created_at", "recorded_at",
+    )
     has_time = any(c for c in columns if c in time_cols)
     has_numeric = any(
-        isinstance(rows[0].get(c), (int, float)) for c in columns if rows
+        isinstance(rows[0].get(c), (int, float))
+        for c in columns if rows
     )
 
     if has_time and has_numeric:
         time_col = next(c for c in columns if c in time_cols)
         value_col = next(
             (c for c in columns
-             if isinstance(rows[0].get(c), (int, float)) and c != time_col),
+             if isinstance(rows[0].get(c), (int, float))
+             and c != time_col),
             columns[-1],
         )
         return {
@@ -125,11 +159,13 @@ def _infer_widget_plan(
 
     if len(columns) == 2 and has_numeric:
         cat_col = next(
-            (c for c in columns if not isinstance(rows[0].get(c), (int, float))),
+            (c for c in columns
+             if not isinstance(rows[0].get(c), (int, float))),
             columns[0],
         )
         val_col = next(
-            (c for c in columns if isinstance(rows[0].get(c), (int, float))),
+            (c for c in columns
+             if isinstance(rows[0].get(c), (int, float))),
             columns[1],
         )
         return {
@@ -165,7 +201,11 @@ def _widget_plan_to_vega_lite(plan: dict) -> dict | None:
             },
         }
 
-    if wtype == "categorical_bar" and encoding.get("x") and encoding.get("y"):
+    if (
+        wtype == "categorical_bar"
+        and encoding.get("x")
+        and encoding.get("y")
+    ):
         return {
             "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
             "data": {"values": data},
@@ -179,11 +219,8 @@ def _widget_plan_to_vega_lite(plan: dict) -> dict | None:
     return None
 
 
-def _build_sql_for_question(question: str) -> str | None:
-    """Map common natural language patterns to SQL.
-
-    This is a deterministic fallback when no LLM is available.
-    """
+def _build_sql_for_question(question: str) -> str:
+    """Deterministic fallback when no LLM is available."""
     q = question.lower().strip()
 
     if "metric" in q and ("recent" in q or "latest" in q or "last" in q):
@@ -213,8 +250,8 @@ def _build_sql_for_question(question: str) -> str | None:
         )
     if "baseline" in q:
         return (
-            "SELECT metric_name, connector_name, mean, stddev, sample_count "
-            "FROM metric_baselines LIMIT 20"
+            "SELECT metric_name, connector_name, mean, stddev, "
+            "sample_count FROM metric_baselines LIMIT 20"
         )
 
     return (
@@ -229,26 +266,63 @@ async def chat_query(
     user: dict = Depends(get_current_user),
     store: Store = Depends(get_store),
 ) -> ChatResponse:
-    """Process a natural language question and return results with visualization."""
-    raw_sql = _build_sql_for_question(req.question)
+    """Process a natural language question with LLM SQL generation."""
+    raw_sql: str | None = None
+    widget_hints: dict | None = None
+    used_llm = False
+
+    analyzer = get_analyzer()
+    if analyzer is not None:
+        try:
+            raw_sql, widget_hints = await analyzer.generate_sql(
+                question=req.question,
+                table_allowlist=ALLOWED_TABLES,
+            )
+            used_llm = True
+        except Exception as exc:
+            log.info("LLM SQL generation failed, using fallback: %s", exc)
+
     if raw_sql is None:
-        return ChatResponse(
-            answer="I couldn't understand that question. "
-            "Try asking about metrics, insights, or deployments.",
-        )
+        raw_sql = _build_sql_for_question(req.question)
 
     try:
         validated_sql = validate_query(raw_sql, ALLOWED_TABLES)
     except QueryValidationError as e:
-        return ChatResponse(answer=f"Query validation failed: {e}")
+        if used_llm:
+            raw_sql = _build_sql_for_question(req.question)
+            try:
+                validated_sql = validate_query(raw_sql, ALLOWED_TABLES)
+                widget_hints = None
+            except QueryValidationError as e2:
+                return ChatResponse(
+                    answer=f"Query validation failed: {e2}"
+                )
+        else:
+            return ChatResponse(
+                answer=f"Query validation failed: {e}"
+            )
+
+    is_ok, cost = await _explain_check(store, validated_sql)
+    if not is_ok:
+        return ChatResponse(
+            answer=(
+                f"That query is too expensive (cost: {cost:.0f}). "
+                "Try narrowing the time range or adding filters."
+            ),
+            sql_query=validated_sql,
+        )
 
     sql_hash = _query_hash(validated_sql)
-
     cached = await _check_cache(store, sql_hash)
     if cached:
-        rows = cached["result_json"] if isinstance(cached["result_json"], list) else []
+        rows = (
+            cached["result_json"]
+            if isinstance(cached["result_json"], list) else []
+        )
         columns = list(rows[0].keys()) if rows else []
-        plan = _infer_widget_plan(req.question, columns, rows)
+        plan = _build_plan(
+            req.question, columns, rows, widget_hints,
+        )
         vega = _widget_plan_to_vega_lite(plan)
         return ChatResponse(
             answer=f"Found {len(rows)} results (cached).",
@@ -261,12 +335,21 @@ async def chat_query(
     start = time.monotonic()
     try:
         async with store.engine.begin() as conn:
+            if _is_postgres(store.engine):
+                await conn.execute(
+                    sa.text("SET LOCAL statement_timeout = '2000'")
+                )
+                await conn.execute(
+                    sa.text("SET LOCAL lock_timeout = '250'")
+                )
             result = await conn.execute(sa.text(validated_sql))
             raw_rows = result.fetchall()
             columns = list(result.keys())
     except Exception as e:
         log.warning("Query execution failed: %s", e)
-        return ChatResponse(answer=f"Query failed: {e}", sql_query=validated_sql)
+        return ChatResponse(
+            answer=f"Query failed: {e}", sql_query=validated_sql,
+        )
 
     elapsed_ms = (time.monotonic() - start) * 1000
     rows = [dict(zip(columns, r, strict=False)) for r in raw_rows]
@@ -276,9 +359,11 @@ async def chat_query(
             if not isinstance(v, (str, int, float, bool, type(None))):
                 row[k] = str(v)
 
-    await _save_cache(store, sql_hash, validated_sql, rows, len(rows), elapsed_ms)
+    await _save_cache(
+        store, sql_hash, validated_sql, rows, len(rows), elapsed_ms,
+    )
 
-    plan = _infer_widget_plan(req.question, columns, rows)
+    plan = _build_plan(req.question, columns, rows, widget_hints)
     vega = _widget_plan_to_vega_lite(plan)
 
     return ChatResponse(
@@ -288,3 +373,18 @@ async def chat_query(
         sql_query=validated_sql,
         execution_ms=round(elapsed_ms, 1),
     )
+
+
+def _build_plan(
+    question: str, columns: list[str], rows: list[dict],
+    widget_hints: dict | None,
+) -> dict:
+    """Build widget plan from LLM hints or infer from data shape."""
+    if widget_hints and rows:
+        return {
+            "widget_type": widget_hints.get("widget_type", "table"),
+            "title": widget_hints.get("title", question[:50]),
+            "encoding": widget_hints.get("encoding", {}),
+            "data": rows,
+        }
+    return _infer_widget_plan(question, columns, rows)

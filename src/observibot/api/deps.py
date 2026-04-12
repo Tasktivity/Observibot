@@ -16,6 +16,7 @@ ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24
 
 _store_instance: Store | None = None
+_analyzer_instance: object | None = None
 
 
 def _get_secret_key() -> str:
@@ -29,6 +30,17 @@ def set_store(store: Store) -> None:
     """Set the shared Store instance for dependency injection."""
     global _store_instance
     _store_instance = store
+
+
+def set_analyzer(analyzer: object) -> None:
+    """Set the shared Analyzer instance."""
+    global _analyzer_instance
+    _analyzer_instance = analyzer
+
+
+def get_analyzer():
+    """Return the shared Analyzer, or None if not configured."""
+    return _analyzer_instance
 
 
 async def get_store() -> Store:

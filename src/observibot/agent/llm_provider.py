@@ -218,6 +218,15 @@ class MockProvider(LLMProvider):
                     }
                 ]
             }
+        if "allowed tables" in text and "user question:" in text:
+            return {
+                "sql": "SELECT metric_name, value, collected_at "
+                       "FROM metric_snapshots "
+                       "ORDER BY collected_at DESC LIMIT 20",
+                "widget_type": "time_series",
+                "title": "Recent metrics",
+                "encoding": {"x": "collected_at", "y": "value"},
+            }
         if "user question:" in text:
             return {
                 "answer": "Mock answer from MockProvider.",
