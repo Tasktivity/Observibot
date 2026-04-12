@@ -9,7 +9,9 @@ from fastapi.staticfiles import StaticFiles
 from observibot import __version__
 from observibot.api.routes import auth, chat, discovery, insights, metrics, system, widgets
 
-FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_DOCKER_DIST = Path("/app/frontend/dist")
+FRONTEND_DIST = _DOCKER_DIST if _DOCKER_DIST.is_dir() else _PROJECT_ROOT / "frontend" / "dist"
 
 
 def create_app() -> FastAPI:

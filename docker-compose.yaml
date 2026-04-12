@@ -1,8 +1,10 @@
 services:
+  # Lite profile: single container + SQLite (dev/evaluation)
   observibot:
     build: .
     image: observibot:dev
     container_name: observibot
+    profiles: ["lite", ""]
     env_file:
       - .env
     environment:
@@ -20,5 +22,62 @@ services:
       retries: 3
       start_period: 20s
 
+  # Production profile: separate services + Postgres
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["production"]
+    environment:
+      POSTGRES_DB: observibot
+      POSTGRES_USER: observibot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U observibot"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  observibot-web:
+    build: .
+    image: observibot:dev
+    container_name: observibot-web
+    profiles: ["production"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      OBSERVIBOT_CONFIG: /app/config/observibot.yaml
+      DATABASE_URL: postgresql://observibot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/observibot
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  observibot-daemon:
+    build: .
+    image: observibot:dev
+    container_name: observibot-daemon
+    profiles: ["production"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      OBSERVIBOT_CONFIG: /app/config/observibot.yaml
+      DATABASE_URL: postgresql://observibot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/observibot
+    command: ["observibot", "run"]
+    restart: unless-stopped
+
 volumes:
   observibot-data:
+  pg-data:

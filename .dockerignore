@@ -24,3 +24,5 @@ scripts/
 build/
 dist/
 *.egg-info/
+frontend/node_modules/
+frontend/dist/
