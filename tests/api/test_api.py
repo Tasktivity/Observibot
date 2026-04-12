@@ -224,15 +224,16 @@ async def test_batch_layout_update(app_client):
     assert resp.json()["updated"] == 1
 
 
-async def test_chat_query_placeholder(app_client):
+async def test_chat_query_returns_results(app_client):
     client, _ = app_client
     await _register_and_login(client)
     resp = await client.post(
         "/api/chat/query",
-        json={"question": "How many users?"},
+        json={"question": "Show recent metrics"},
     )
     assert resp.status_code == 200
-    assert "sub-task 7" in resp.json()["answer"]
+    data = resp.json()
+    assert data["sql_query"] is not None
 
 
 async def test_insight_acknowledge(app_client):
