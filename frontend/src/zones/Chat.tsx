@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, forwardRef, useImperativeHandle, useRef, useEffect } from 'react';
 import { api, type ChatResponse } from '../api/client';
 import { ChatVisualization } from '../components/ChatVisualization';
 import { WIDGET_REGISTRY } from '../widgets/WidgetRegistry';
@@ -16,23 +16,24 @@ interface ChatProps {
   }) => void;
 }
 
+export interface ChatHandle {
+  investigate: (question: string) => void;
+}
+
 const DOMAIN_COLORS: Record<string, string> = {
   observability: 'bg-blue-500/20 text-blue-300',
   application: 'bg-green-500/20 text-green-300',
   infrastructure: 'bg-purple-500/20 text-purple-300',
 };
 
-export function Chat({ onPin }: ChatProps) {
+export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, ref) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const pendingSubmitRef = useRef(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || loading) return;
-
-    const question = input.trim();
-    setInput('');
+  const submitQuestion = async (question: string) => {
+    if (!question.trim() || loading) return;
     setMessages((prev) => [...prev, { role: 'user', content: question }]);
     setLoading(true);
 
@@ -52,6 +53,30 @@ export function Chat({ onPin }: ChatProps) {
     }
   };
 
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || loading) return;
+    const question = input.trim();
+    setInput('');
+    await submitQuestion(question);
+  };
+
+  useImperativeHandle(ref, () => ({
+    investigate(question: string) {
+      setInput(question);
+      pendingSubmitRef.current = true;
+    },
+  }), []);
+
+  useEffect(() => {
+    if (pendingSubmitRef.current && input && !loading) {
+      pendingSubmitRef.current = false;
+      const question = input.trim();
+      setInput('');
+      submitQuestion(question);
+    }
+  }, [input, loading]);
+
   const handlePin = (resp: ChatResponse) => {
     if (!onPin || !resp.widget_plan) return;
     const plan = resp.widget_plan as Record<string, unknown>;
@@ -66,7 +91,7 @@ export function Chat({ onPin }: ChatProps) {
   return (
     <div className="flex flex-col h-full">
       <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-        Chat
+        System Intelligence Chat
       </h2>
       <div className="flex-1 overflow-y-auto space-y-3 mb-3">
         {messages.length === 0 && (
@@ -161,7 +186,7 @@ export function Chat({ onPin }: ChatProps) {
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask about your system..."
+          placeholder="Ask your system intelligence..."
           className="flex-1 px-4 py-2 rounded bg-slate-800 text-white border border-slate-700 focus:outline-none focus:border-sky-400 text-sm"
         />
         <button
@@ -174,4 +199,4 @@ export function Chat({ onPin }: ChatProps) {
       </form>
     </div>
   );
-}
+});

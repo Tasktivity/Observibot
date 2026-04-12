@@ -7,7 +7,7 @@
 llm:
   provider: anthropic
   model: claude-sonnet-4-20250514
-  api_key: ${ANTHROPIC_API_KEY}
+  api_key: ${OBSERVIBOT_ANTHROPIC_API_KEY}
   max_tokens_per_cycle: 4000
   temperature: 0.2
 

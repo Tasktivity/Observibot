@@ -5,15 +5,16 @@ import { ProtectedRoute } from './auth/ProtectedRoute';
 import { Layout } from './components/Layout';
 import { DiscoveryFeed } from './zones/DiscoveryFeed';
 import { Dashboard } from './zones/Dashboard';
-import { Chat } from './zones/Chat';
+import { Chat, type ChatHandle } from './zones/Chat';
 import { api, type Insight } from './api/client';
 
 const queryClient = new QueryClient();
 
 function AppContent() {
   const dashboardRef = useRef<{ refresh: () => void }>(null);
+  const chatRef = useRef<ChatHandle>(null);
 
-  const handlePinInsight = useCallback(async (insight: Insight) => {
+  const handlePromoteInsight = useCallback(async (insight: Insight) => {
     await api.widgets.create({
       widget_type: 'text_summary',
       title: insight.title,
@@ -36,16 +37,24 @@ function AppContent() {
     dashboardRef.current?.refresh();
   }, []);
 
+  const handleInvestigate = useCallback((insight: Insight) => {
+    const question = `Investigate this finding: ${insight.title}. ${insight.summary}`;
+    chatRef.current?.investigate(question);
+  }, []);
+
   return (
     <Layout>
       <div className="col-span-3 overflow-hidden h-full min-h-0">
-        <DiscoveryFeed onPin={handlePinInsight} />
+        <DiscoveryFeed
+          onPromote={handlePromoteInsight}
+          onInvestigate={handleInvestigate}
+        />
       </div>
       <div className="col-span-6 overflow-hidden h-full min-h-0">
         <Dashboard ref={dashboardRef} />
       </div>
       <div className="col-span-3 overflow-hidden h-full min-h-0">
-        <Chat onPin={handlePinChat} />
+        <Chat ref={chatRef} onPin={handlePinChat} />
       </div>
     </Layout>
   );

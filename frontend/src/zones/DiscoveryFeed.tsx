@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { api, type Insight } from '../api/client';
 import { InsightCard } from '../components/InsightCard';
 
 interface DiscoveryFeedProps {
-  onPin?: (insight: Insight) => void;
+  onPromote?: (insight: Insight) => void;
+  onInvestigate?: (insight: Insight) => void;
 }
 
 interface SystemSummary {
@@ -23,10 +24,12 @@ function BootstrapCard({ title, text }: { title: string; text: string }) {
   );
 }
 
-export function DiscoveryFeed({ onPin }: DiscoveryFeedProps) {
+export function DiscoveryFeed({ onPromote, onInvestigate }: DiscoveryFeedProps) {
   const [insights, setInsights] = useState<Insight[]>([]);
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<SystemSummary | null>(null);
+  const [acknowledgedIds, setAcknowledgedIds] = useState<Set<string>>(new Set());
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api.insights.list(50).then((data) => {
@@ -51,15 +54,42 @@ export function DiscoveryFeed({ onPin }: DiscoveryFeedProps) {
     return () => clearInterval(interval);
   }, []);
 
+  const handleAcknowledge = useCallback((insight: Insight) => {
+    api.insights.ack(insight.id).catch(() => {});
+    setAcknowledgedIds((prev) => new Set(prev).add(insight.id));
+  }, []);
+
+  const handlePinToFeed = useCallback((insight: Insight) => {
+    setPinnedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(insight.id)) {
+        next.delete(insight.id);
+      } else {
+        next.add(insight.id);
+      }
+      return next;
+    });
+  }, []);
+
+  const visibleInsights = insights
+    .filter((i) => !acknowledgedIds.has(i.id))
+    .sort((a, b) => {
+      const aPinned = pinnedIds.has(a.id);
+      const bPinned = pinnedIds.has(b.id);
+      if (aPinned && !bPinned) return -1;
+      if (!aPinned && bPinned) return 1;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+
   return (
     <div className="flex flex-col h-full">
       <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-        Discovery Feed
+        Dynamic Discovery Feed
       </h2>
       <div className="flex-1 overflow-y-auto space-y-3 pr-1">
         {loading && <p className="text-slate-500 text-sm">Loading insights...</p>}
 
-        {!loading && insights.length === 0 && summary && (
+        {!loading && visibleInsights.length === 0 && summary && (
           <div className="space-y-3">
             {(summary.tables > 0 || summary.services > 0) && (
               <BootstrapCard
@@ -80,14 +110,22 @@ export function DiscoveryFeed({ onPin }: DiscoveryFeedProps) {
           </div>
         )}
 
-        {!loading && insights.length === 0 && !summary && (
+        {!loading && visibleInsights.length === 0 && !summary && (
           <p className="text-slate-500 text-sm">
             No insights yet. The monitor will generate them as it collects data.
           </p>
         )}
 
-        {insights.map((insight) => (
-          <InsightCard key={insight.id} insight={insight} onPin={onPin} />
+        {visibleInsights.map((insight) => (
+          <InsightCard
+            key={insight.id}
+            insight={insight}
+            isPinned={pinnedIds.has(insight.id)}
+            onAcknowledge={handleAcknowledge}
+            onPinToFeed={handlePinToFeed}
+            onPromote={onPromote}
+            onInvestigate={onInvestigate}
+          />
         ))}
       </div>
     </div>
