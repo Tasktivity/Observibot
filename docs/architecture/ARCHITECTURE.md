@@ -25,64 +25,64 @@ Observibot is built on four principles:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     WEB DASHBOARD (:8080)                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │   Dynamic     │  │    Static    │  │ System Intelligence │    │
-│  │  Discovery    │  │  Dashboard   │  │       Chat          │    │
-│  │    Feed       │  │              │  │  (3-domain agentic) │    │
-│  └──────┬───────┘  └──────┬───────┘  └────────┬───────────┘    │
+│                     WEB DASHBOARD (:8080)                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐     │
+│  │   Dynamic    │  │    Static    │  │ System Intelligence│     │
+│  │  Discovery   │  │  Dashboard   │  │       Chat         │     │
+│  │    Feed      │  │              │  │  (3-domain agentic)│     │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬───────────┘     │
 │         └──────────────────┼──────────────────┘                 │
 │                            ▼                                    │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              FastAPI REST API (18 endpoints)             │   │
-│  │  Auth │ Metrics │ Insights │ Widgets │ Chat │ System     │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              FastAPI REST API (18 endpoints)            │    │
+│  │  Auth │ Metrics │ Insights │ Widgets │ Chat │ System    │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
 ├────────────────────────────┼────────────────────────────────────┤
-│                    OBSERVIBOT CORE                               │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
-│  │ Supabase  │  │ Railway   │  │ Generic   │  │ Future    │   │
-│  │ Connector │  │ Connector │  │ PG Conn.  │  │ Connectors│   │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘   │
+│                    OBSERVIBOT CORE                              │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
+│  │ Supabase  │  │ Railway   │  │ Generic   │  │ Future    │     │
+│  │ Connector │  │ Connector │  │ PG Conn.  │  │ Connectors│     │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘     │
 │        └──────────────┼──────────────┼──────────────┘           │
 │                       ▼                                         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   DISCOVERY ENGINE                       │   │
-│  │  Schema Crawler → Relationship Mapper → Topology Builder │   │
-│  │  Output: SystemModel (JSON graph)                        │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   DISCOVERY ENGINE                      │    │
+│  │  Schema Crawler → Relationship Mapper → Topology Builder│    │
+│  │  Output: SystemModel (JSON graph)                       │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   SEMANTIC MODELER                       │   │
-│  │  LLM interprets raw SystemModel into business context    │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   SEMANTIC MODELER                      │    │
+│  │  LLM interprets raw SystemModel into business context   │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    MONITOR LOOP                          │   │
-│  │  1. Collect metrics from all connectors (every 5m)       │   │
-│  │  2. Store in local time-series store                     │   │
-│  │  3. MAD-based anomaly detection                          │   │
-│  │  4. LLM analysis of anomalies + recent changes           │   │
-│  │  5. Route insights to alerting + Discovery Feed          │   │
-│  │  6. Periodic re-discovery for drift detection (hourly)   │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    MONITOR LOOP                         │    │
+│  │  1. Collect metrics from all connectors (every 5m)      │    │
+│  │  2. Store in local time-series store                    │    │
+│  │  3. MAD-based anomaly detection                         │    │
+│  │  4. LLM analysis of anomalies + recent changes          │    │
+│  │  5. Route insights to alerting + Discovery Feed         │    │
+│  │  6. Periodic re-discovery for drift detection (hourly)  │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              AGENTIC CHAT PIPELINE                       │   │
-│  │  Two-call LLM pipeline: plan → execute → interpret       │   │
-│  │  Tools: observability │ application (sandboxed) │ infra   │   │
-│  │  sqlglot SQL sandbox │ Sensitive column filtering         │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              AGENTIC CHAT PIPELINE                      │    │
+│  │  Two-call LLM pipeline: plan → execute → interpret      │    │
+│  │  Tools: observability │ application (sandboxed) │ infra │    │
+│  │  sqlglot SQL sandbox │ Sensitive column filtering       │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   ALERTING / OUTPUT                       │   │
-│  │  ntfy.sh push │ Slack webhook │ Generic webhook │ CLI     │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              DATA STORE (SQLite / PostgreSQL)            │   │
-│  │  system_snapshots │ metric_snapshots │ change_events     │   │
-│  │  insights │ alert_history │ business_context             │   │
-│  │  llm_usage │ metric_baselines │ users │ widgets          │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                   ALERTING / OUTPUT                     │    │
+│  │  ntfy.sh push │ Slack webhook │ Generic webhook │ CLI   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              DATA STORE (SQLite / PostgreSQL)           │    │
+│  │  system_snapshots │ metric_snapshots │ change_events    │    │
+│  │  insights │ alert_history │ business_context            │    │
+│  │  llm_usage │ metric_baselines │ users │ widgets         │    │
+│  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
