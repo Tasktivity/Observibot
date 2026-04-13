@@ -25,6 +25,7 @@ def get_connector(name: str, type: str, config: dict[str, Any]) -> BaseConnector
         UnknownConnectorError: If ``type`` is not registered.
     """
     # Imports are local to avoid pulling drivers at package import time.
+    from observibot.connectors.github import GitHubConnector
     from observibot.connectors.postgresql import PostgreSQLConnector
     from observibot.connectors.railway import RailwayConnector
     from observibot.connectors.supabase import SupabaseConnector
@@ -34,6 +35,7 @@ def get_connector(name: str, type: str, config: dict[str, Any]) -> BaseConnector
         "postgresql": PostgreSQLConnector,
         "postgres": PostgreSQLConnector,
         "railway": RailwayConnector,
+        "github": GitHubConnector,
     }
     cls = registry.get(type.lower())
     if cls is None:

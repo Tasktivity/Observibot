@@ -117,3 +117,20 @@ class CostResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     version: str
+
+
+class CodeIntelligenceStatusResponse(BaseModel):
+    status: str  # "current", "stale", "unavailable", "error"
+    last_indexed_commit: str | None = None
+    last_index_time: str | None = None
+    error_message: str | None = None
+
+
+class MonitorIntervalsResponse(BaseModel):
+    collection_interval_seconds: int
+    analysis_interval_seconds: int
+
+
+class MonitorIntervalsUpdate(BaseModel):
+    collection_interval_seconds: int | None = None
+    analysis_interval_seconds: int | None = None

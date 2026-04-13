@@ -11,7 +11,7 @@ import os
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from sqlalchemy import (
@@ -34,6 +34,9 @@ from observibot.core.models import (
     MetricSnapshot,
     SystemModel,
 )
+
+if TYPE_CHECKING:
+    from observibot.core.code_intelligence.models import SemanticFact
 
 metadata = MetaData()
 
@@ -173,6 +176,36 @@ query_cache = Table(
     Column("expires_at", String),
 )
 
+semantic_facts = Table(
+    "semantic_facts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("fact_type", String, nullable=False),
+    Column("concept", String, nullable=False, index=True),
+    Column("claim", Text, nullable=False),
+    Column("tables_json", Text, default="[]"),
+    Column("columns_json", Text, default="[]"),
+    Column("sql_condition", Text),
+    Column("evidence_path", String),
+    Column("evidence_lines", String),
+    Column("evidence_commit", String),
+    Column("source", String, nullable=False),
+    Column("confidence", Float, default=0.8),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+    Column("valid_from_commit", String),
+    Column("valid_to_commit", String),
+    Column("is_active", Boolean, default=True),
+)
+
+code_intelligence_meta = Table(
+    "code_intelligence_meta",
+    metadata,
+    Column("key", String, primary_key=True),
+    Column("value", Text, nullable=False),
+    Column("updated_at", String, nullable=False),
+)
+
 # Indexes (created alongside the tables)
 sa.Index("idx_snap_created", system_snapshots.c.created_at)
 sa.Index("idx_metrics_name_time", metric_snapshots.c.metric_name, metric_snapshots.c.collected_at)
@@ -253,6 +286,12 @@ class Store:
         self._conn = await self._engine.connect()
         async with self._engine.begin() as conn:
             await conn.run_sync(metadata.create_all)
+            if "sqlite" in str(self._engine.url):
+                await conn.execute(sa.text(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS semantic_facts_fts "
+                    "USING fts5(concept, claim, tables_json, columns_json, "
+                    "content=semantic_facts, content_rowid=rowid)"
+                ))
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -699,6 +738,270 @@ class Store:
             "stddev": float(row[2]),
             "last_updated": row[3],
         }
+
+    # ---------- semantic facts ----------
+
+    async def find_existing_fact_id(
+        self, concept: str, source: str, fact_type: str,
+    ) -> str | None:
+        """Find an active fact by concept+source+fact_type. Returns its id or None."""
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(semantic_facts.c.id)
+                .where(semantic_facts.c.concept == concept)
+                .where(semantic_facts.c.source == source)
+                .where(semantic_facts.c.fact_type == fact_type)
+                .where(semantic_facts.c.is_active == True)  # noqa: E712
+                .limit(1)
+            )
+            row = result.fetchone()
+        return row[0] if row else None
+
+    async def save_semantic_fact(self, fact: SemanticFact) -> None:
+        now = _utcnow_iso()
+        tables_j = json.dumps(fact.tables)
+        columns_j = json.dumps(fact.columns)
+        fact_type_val = (
+            fact.fact_type.value
+            if hasattr(fact.fact_type, "value") else fact.fact_type
+        )
+        source_val = fact.source.value if hasattr(fact.source, "value") else fact.source
+
+        # Upsert by concept+source+fact_type to prevent duplicates on re-seed
+        existing_id = await self.find_existing_fact_id(
+            fact.concept, source_val, fact_type_val,
+        )
+        fact_id = existing_id or fact.id
+
+        async with self.engine.begin() as conn:
+            stmt = (
+                _dialect_insert(semantic_facts, self.engine)
+                .values(
+                    id=fact_id,
+                    fact_type=fact_type_val,
+                    concept=fact.concept,
+                    claim=fact.claim,
+                    tables_json=tables_j,
+                    columns_json=columns_j,
+                    sql_condition=fact.sql_condition,
+                    evidence_path=fact.evidence_path,
+                    evidence_lines=fact.evidence_lines,
+                    evidence_commit=fact.evidence_commit,
+                    source=source_val,
+                    confidence=fact.confidence,
+                    created_at=fact.created_at.isoformat() if fact.created_at else now,
+                    updated_at=fact.updated_at.isoformat() if fact.updated_at else now,
+                    valid_from_commit=fact.valid_from_commit,
+                    valid_to_commit=fact.valid_to_commit,
+                    is_active=fact.is_active,
+                )
+                .on_conflict_do_update(
+                    index_elements=["id"],
+                    set_=dict(
+                        claim=fact.claim,
+                        tables_json=tables_j,
+                        columns_json=columns_j,
+                        sql_condition=fact.sql_condition,
+                        confidence=fact.confidence,
+                        updated_at=now,
+                        is_active=fact.is_active,
+                    ),
+                )
+            )
+            await conn.execute(stmt)
+            if "sqlite" in str(self.engine.url):
+                await conn.execute(sa.text(
+                    "INSERT OR REPLACE INTO semantic_facts_fts"
+                    "(rowid, concept, claim, tables_json, columns_json) "
+                    "SELECT rowid, concept, claim, tables_json, columns_json "
+                    "FROM semantic_facts WHERE id = :id"
+                ), {"id": fact_id})
+
+    async def get_semantic_facts(
+        self,
+        concept: str | None = None,
+        fact_type: str | None = None,
+        active_only: bool = True,
+    ) -> list[dict]:
+        stmt = sa.select(
+            semantic_facts.c.id,
+            semantic_facts.c.fact_type,
+            semantic_facts.c.concept,
+            semantic_facts.c.claim,
+            semantic_facts.c.tables_json,
+            semantic_facts.c.columns_json,
+            semantic_facts.c.sql_condition,
+            semantic_facts.c.source,
+            semantic_facts.c.confidence,
+            semantic_facts.c.is_active,
+        )
+        if active_only:
+            stmt = stmt.where(semantic_facts.c.is_active == True)  # noqa: E712
+        if concept:
+            stmt = stmt.where(semantic_facts.c.concept == concept)
+        if fact_type:
+            stmt = stmt.where(semantic_facts.c.fact_type == fact_type)
+        stmt = stmt.order_by(semantic_facts.c.confidence.desc())
+
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+            rows = result.fetchall()
+        return [
+            {
+                "id": r[0], "fact_type": r[1], "concept": r[2],
+                "claim": r[3], "tables": json.loads(r[4]) if r[4] else [],
+                "columns": json.loads(r[5]) if r[5] else [],
+                "sql_condition": r[6], "source": r[7],
+                "confidence": r[8], "is_active": r[9],
+            }
+            for r in rows
+        ]
+
+    async def search_semantic_facts(self, query: str, limit: int = 5) -> list[dict]:
+        """Search semantic facts using FTS5 (SQLite) or ILIKE fallback."""
+        from observibot.core.code_intelligence.retrieval import build_fts5_query
+
+        if "sqlite" in str(self.engine.url):
+            fts_query = build_fts5_query(query)
+            sql = sa.text(
+                "SELECT s.id, s.fact_type, s.concept, s.claim, "
+                "s.tables_json, s.columns_json, s.sql_condition, "
+                "s.source, s.confidence, s.is_active "
+                "FROM semantic_facts s "
+                "JOIN semantic_facts_fts f ON s.rowid = f.rowid "
+                "WHERE semantic_facts_fts MATCH :query "
+                "AND s.is_active = 1 "
+                "ORDER BY rank LIMIT :limit"
+            )
+            async with self.engine.begin() as conn:
+                result = await conn.execute(sql, {"query": fts_query, "limit": limit})
+                rows = result.fetchall()
+        else:
+            pattern = f"%{query}%"
+            stmt = (
+                sa.select(
+                    semantic_facts.c.id,
+                    semantic_facts.c.fact_type,
+                    semantic_facts.c.concept,
+                    semantic_facts.c.claim,
+                    semantic_facts.c.tables_json,
+                    semantic_facts.c.columns_json,
+                    semantic_facts.c.sql_condition,
+                    semantic_facts.c.source,
+                    semantic_facts.c.confidence,
+                    semantic_facts.c.is_active,
+                )
+                .where(semantic_facts.c.is_active == True)  # noqa: E712
+                .where(
+                    sa.or_(
+                        semantic_facts.c.concept.ilike(pattern),
+                        semantic_facts.c.claim.ilike(pattern),
+                    )
+                )
+                .order_by(semantic_facts.c.confidence.desc())
+                .limit(limit)
+            )
+            async with self.engine.begin() as conn:
+                result = await conn.execute(stmt)
+                rows = result.fetchall()
+
+        return [
+            {
+                "id": r[0], "fact_type": r[1], "concept": r[2],
+                "claim": r[3], "tables": json.loads(r[4]) if r[4] else [],
+                "columns": json.loads(r[5]) if r[5] else [],
+                "sql_condition": r[6], "source": r[7],
+                "confidence": r[8], "is_active": r[9],
+            }
+            for r in rows
+        ]
+
+    async def dedup_semantic_facts(self) -> int:
+        """Remove duplicate active facts, keeping one per concept+source+fact_type."""
+        async with self.engine.begin() as conn:
+            groups = await conn.execute(sa.text(
+                "SELECT concept, source, fact_type, COUNT(*) as cnt "
+                "FROM semantic_facts WHERE is_active = 1 "
+                "GROUP BY concept, source, fact_type HAVING cnt > 1"
+            ))
+            total_removed = 0
+            for row in groups.fetchall():
+                concept, source, fact_type = row[0], row[1], row[2]
+                # Keep the one with the latest updated_at
+                dupes = await conn.execute(sa.text(
+                    "SELECT id FROM semantic_facts "
+                    "WHERE concept = :concept AND source = :source "
+                    "AND fact_type = :fact_type AND is_active = 1 "
+                    "ORDER BY updated_at DESC"
+                ), {"concept": concept, "source": source, "fact_type": fact_type})
+                ids = [r[0] for r in dupes.fetchall()]
+                if len(ids) > 1:
+                    to_deactivate = ids[1:]  # keep first (latest), deactivate rest
+                    for did in to_deactivate:
+                        await conn.execute(
+                            semantic_facts.update()
+                            .where(semantic_facts.c.id == did)
+                            .values(is_active=False, updated_at=_utcnow_iso())
+                        )
+                    total_removed += len(to_deactivate)
+        return total_removed
+
+    async def deactivate_semantic_fact(self, fact_id: str) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                semantic_facts.update()
+                .where(semantic_facts.c.id == fact_id)
+                .values(is_active=False, updated_at=_utcnow_iso())
+            )
+
+    async def save_user_correction(
+        self, concept: str, claim: str,
+        tables: list[str], columns: list[str],
+        sql_condition: str | None = None,
+    ) -> None:
+        """Convenience method to create a CORRECTION fact with highest confidence."""
+        import uuid as _uuid
+
+        from observibot.core.code_intelligence.models import (
+            FactSource,
+            FactType,
+            SemanticFact,
+        )
+
+        fact = SemanticFact(
+            id=_uuid.uuid4().hex[:12],
+            fact_type=FactType.CORRECTION,
+            concept=concept,
+            claim=claim,
+            tables=tables,
+            columns=columns,
+            sql_condition=sql_condition,
+            source=FactSource.USER_CORRECTION,
+            confidence=1.0,
+            is_active=True,
+        )
+        await self.save_semantic_fact(fact)
+
+    async def set_code_intelligence_meta(self, key: str, value: str) -> None:
+        async with self.engine.begin() as conn:
+            stmt = (
+                _dialect_insert(code_intelligence_meta, self.engine)
+                .values(key=key, value=value, updated_at=_utcnow_iso())
+                .on_conflict_do_update(
+                    index_elements=["key"],
+                    set_=dict(value=value, updated_at=_utcnow_iso()),
+                )
+            )
+            await conn.execute(stmt)
+
+    async def get_code_intelligence_meta(self, key: str) -> str | None:
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(code_intelligence_meta.c.value)
+                .where(code_intelligence_meta.c.key == key)
+            )
+            row = result.fetchone()
+        return row[0] if row else None
 
     # ---------- retention ----------
 

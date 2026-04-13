@@ -83,6 +83,11 @@ export interface ChatResponse {
   warnings: string[];
 }
 
+export interface MonitorIntervals {
+  collection_interval_seconds: number;
+  analysis_interval_seconds: number;
+}
+
 export const api = {
   auth: {
     me: () => request<User>('/auth/me'),
@@ -141,6 +146,12 @@ export const api = {
     health: () => request<{ status: string; version: string }>('/system/health'),
     status: () => request<Record<string, unknown>>('/system/status'),
     cost: () => request<{ calls: number; total_tokens: number; cost_usd: number }>('/system/cost'),
+    intervals: () => request<MonitorIntervals>('/system/intervals'),
+    updateIntervals: (data: Partial<MonitorIntervals>) =>
+      request<MonitorIntervals>('/system/intervals', {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
   },
   discovery: {
     model: () => request<Record<string, unknown>>('/discovery/model'),

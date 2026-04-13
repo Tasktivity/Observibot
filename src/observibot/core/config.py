@@ -103,6 +103,19 @@ class LoggingConfig:
 
 
 @dataclass
+class GitHubConfig:
+    """GitHub source code connector config."""
+
+    enabled: bool = False
+    token: str = ""
+    repo: str = ""
+    branch: str = "main"
+    poll_interval_seconds: int = 900
+    local_clone_path: str = ""
+    cloud_extraction: bool = False
+
+
+@dataclass
 class ChatConfig:
     """Chat / Q&A settings."""
 
@@ -124,6 +137,7 @@ class ObservibotConfig:
     store: StoreConfig = field(default_factory=StoreConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
+    github: GitHubConfig = field(default_factory=GitHubConfig)
     source_path: Path | None = None
 
 
@@ -173,6 +187,36 @@ def find_env_var_references(text: str) -> list[tuple[str, str | None]]:
     return [
         (match.group(1), match.group(2)) for match in ENV_VAR_PATTERN.finditer(cleaned)
     ]
+
+
+def patch_config_file(config_path: Path, updates: dict[str, dict[str, Any]]) -> None:
+    """Update specific scalar values in a YAML config without rewriting the file.
+
+    ``updates`` is a mapping of ``{section: {key: value}}``, e.g.
+    ``{"monitor": {"collection_interval_seconds": 600}}``.
+
+    Uses line-by-line replacement so comments, env-var references, and
+    overall structure are preserved.
+    """
+    text = config_path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    current_section: str | None = None
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        # Detect top-level section headers (no leading whitespace, ends with ':')
+        if not line[0:1].isspace() and not stripped.startswith("#") and ":" in stripped:
+            current_section = stripped.split(":")[0].strip()
+            continue
+        if current_section in updates:
+            section_updates = updates[current_section]
+            for key, value in section_updates.items():
+                pattern = re.compile(rf"^(\s+{re.escape(key)}\s*:\s*)(\S.*)$")
+                m = pattern.match(line)
+                if m:
+                    lines[i] = f"{m.group(1)}{value}\n"
+
+    config_path.write_text("".join(lines), encoding="utf-8")
 
 
 def _find_default_config() -> Path | None:
@@ -348,6 +392,17 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         ),
     )
 
+    gh_raw = data.get("github") or {}
+    github = GitHubConfig(
+        enabled=bool(gh_raw.get("enabled", False)),
+        token=str(gh_raw.get("token", "")),
+        repo=str(gh_raw.get("repo", "")),
+        branch=str(gh_raw.get("branch", "main")),
+        poll_interval_seconds=int(gh_raw.get("poll_interval_seconds", 900)),
+        local_clone_path=str(gh_raw.get("local_clone_path", "")),
+        cloud_extraction=bool(gh_raw.get("cloud_extraction", False)),
+    )
+
     return ObservibotConfig(
         llm=llm,
         connectors=connectors,
@@ -356,6 +411,7 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         store=store,
         logging=logging_cfg,
         chat=chat,
+        github=github,
     )
 
 

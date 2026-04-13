@@ -22,10 +22,13 @@ def build_app_schema_description(model: SystemModel | None) -> str:
     lines = []
     for table in sorted(model.tables, key=lambda t: t.fqn)[:50]:
         safe_cols = [c for c in table.columns if not _is_sensitive_column(c.get("name", ""))]
-        cols = ", ".join(
-            f"{c['name']} ({c.get('type', '?')})"
-            for c in safe_cols[:15]
-        )
+        def _col_desc(c: dict) -> str:
+            base = f"{c['name']} ({c.get('type', '?')})"
+            if c.get("comment"):
+                base += f' — "{c["comment"]}"'
+            return base
+
+        cols = ", ".join(_col_desc(c) for c in safe_cols[:15])
         if len(safe_cols) > 15:
             cols += ", ..."
         row_hint = f" (~{table.row_count} rows)" if table.row_count else ""

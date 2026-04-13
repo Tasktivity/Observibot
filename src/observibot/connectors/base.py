@@ -28,6 +28,8 @@ class Capability(Flag):
     CHANGES = auto()
     HEALTH = auto()
     RESOURCE_METRICS = auto()  # CPU/memory/network
+    CODE_ACCESS = auto()       # source code file retrieval
+    CODE_CHANGES = auto()      # commit/PR change detection
 
 
 @dataclass(frozen=True)

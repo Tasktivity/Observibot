@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,7 @@ from observibot.agent.schema_catalog import (
     get_app_table_names,
 )
 from observibot.core.app_db import AppDatabasePool
+from observibot.core.code_intelligence.service import CodeKnowledgeService
 from observibot.core.models import SystemModel
 from observibot.core.sql_sandbox import QueryValidationError, validate_query
 from observibot.core.store import Store
@@ -29,6 +31,13 @@ OBSERVABILITY_TABLES = {
     "insights", "alert_history", "business_context",
     "llm_usage", "metric_baselines",
 }
+
+CORRECTION_PATTERNS = [
+    re.compile(r"actually,?\s+(\w[\w\s]*?)\s+means?\s+(.+)", re.IGNORECASE),
+    re.compile(r"(\w[\w\s]*?)\s+should be defined as\s+(.+)", re.IGNORECASE),
+    re.compile(r"no,?\s+(\w[\w\s]*?)\s+(?:is|means?)\s+(.+)", re.IGNORECASE),
+    re.compile(r"correct(?:ion)?:?\s+(\w[\w\s]*?)\s+(?:=|means?|is)\s+(.+)", re.IGNORECASE),
+]
 
 PLANNING_PROMPT = """\
 You are Observibot, an AI SRE assistant. The user asked a question about their
@@ -45,6 +54,8 @@ system. You have access to these tools:
    history, or service details from the infrastructure platform.
    Actions: service_status, deployment_history, service_details.
    Params: service_name (optional), since_hours (optional, default 48).
+
+{business_context_section}
 
 Decide which tool(s) to call. Output VALID JSON ONLY:
 {{
@@ -146,9 +157,28 @@ async def run_chat_agent(
             "that this feature needs to be enabled in config."
         )
 
+    business_context_section = ""
+    freshness_warning: str | None = None
+    try:
+        knowledge_service = CodeKnowledgeService(store)
+        if await knowledge_service.should_inject_context(question):
+            freshness = await knowledge_service.get_freshness_status()
+            if freshness["status"] == "unavailable":
+                pass
+            else:
+                facts = await knowledge_service.get_context_for_question(question)
+                if facts:
+                    business_context_section = (
+                        await knowledge_service.format_context_for_prompt(facts)
+                    )
+                freshness_warning = await knowledge_service.get_freshness_warning()
+    except Exception as exc:
+        log.debug("Business context injection skipped: %s", exc)
+
     planning_prompt = PLANNING_PROMPT.format(
         obs_schema=obs_schema,
         app_tool_section=app_section,
+        business_context_section=business_context_section,
         question=question,
     )
 
@@ -194,6 +224,8 @@ async def run_chat_agent(
     widget_config = synth_response.data.get("widget_config")
     domains = synth_response.data.get("domains", [])
     warnings = synth_response.data.get("warnings", [])
+    if freshness_warning:
+        warnings.append(freshness_warning)
 
     all_data: list[dict] = []
     for tr in tool_results:
@@ -202,6 +234,11 @@ async def run_chat_agent(
 
     widget_plan = _build_widget_plan(widget_config, all_data)
     vega = _build_vega_spec(widget_plan) if widget_plan else None
+
+    try:
+        await _detect_and_store_correction(question, store)
+    except Exception as exc:
+        log.debug("Correction detection skipped: %s", exc)
 
     return ChatResult(
         answer=narrative,
@@ -411,6 +448,23 @@ def _build_vega_spec(plan: dict | None) -> dict | None:
             },
         }
     return None
+
+
+async def _detect_and_store_correction(question: str, store: Store) -> None:
+    """Detect user corrections in the question and store them."""
+    for pattern in CORRECTION_PATTERNS:
+        m = pattern.search(question)
+        if m:
+            concept = m.group(1).strip().lower()
+            claim = m.group(2).strip().rstrip(".")
+            await store.save_user_correction(
+                concept=concept,
+                claim=claim,
+                tables=[],
+                columns=[],
+            )
+            log.info("Stored user correction: '%s' = '%s'", concept, claim)
+            return
 
 
 def _elapsed(start: float) -> float:

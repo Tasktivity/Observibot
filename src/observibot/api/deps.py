@@ -18,6 +18,7 @@ TOKEN_EXPIRE_HOURS = 24
 _store_instance: Store | None = None
 _analyzer_instance: object | None = None
 _app_db_instance: object | None = None
+_monitor_loop_instance: object | None = None
 
 
 def _get_secret_key() -> str:
@@ -53,6 +54,17 @@ def set_app_db(app_db: object) -> None:
 def get_app_db():
     """Return the shared AppDatabasePool, or None if disabled."""
     return _app_db_instance
+
+
+def set_monitor_loop(monitor_loop: object) -> None:
+    """Set the shared MonitorLoop instance."""
+    global _monitor_loop_instance
+    _monitor_loop_instance = monitor_loop
+
+
+def get_monitor_loop():
+    """Return the shared MonitorLoop, or None if not running."""
+    return _monitor_loop_instance
 
 
 async def get_store() -> Store:

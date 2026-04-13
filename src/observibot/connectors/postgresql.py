@@ -220,6 +220,11 @@ class PostgreSQLConnector(BaseConnector):
         except Exception as exc:  # pragma: no cover
             log.debug("Row count lookup failed: %s", exc)
 
+        try:
+            await self._enrich_with_comments(conn, tables)
+        except Exception as exc:
+            log.debug("Column comment extraction failed: %s", exc)
+
         return list(tables.values())
 
     async def _discover_relationships(self, conn: Any) -> list[Relationship]:
@@ -283,6 +288,41 @@ class PostgreSQLConnector(BaseConnector):
             )
             for r in rows
         ]
+
+    async def _enrich_with_comments(
+        self, conn: Any, tables: dict[tuple[str, str], TableInfo],
+    ) -> None:
+        schema_list = self._get_schema_list()
+        rows = await conn.fetch(
+            """
+            SELECT
+                c.table_schema, c.table_name, c.column_name,
+                pgd.description AS column_comment
+            FROM information_schema.columns c
+            LEFT JOIN pg_catalog.pg_description pgd
+                ON pgd.objsubid = c.ordinal_position
+                AND pgd.objoid = (
+                    SELECT oid FROM pg_catalog.pg_class
+                    WHERE relname = c.table_name
+                    AND relnamespace = (
+                        SELECT oid FROM pg_catalog.pg_namespace
+                        WHERE nspname = c.table_schema
+                    )
+                )
+            WHERE c.table_schema = ANY($1::text[])
+                AND pgd.description IS NOT NULL
+            """,
+            schema_list,
+        )
+        for r in rows:
+            key = (r["table_schema"], r["table_name"])
+            tbl = tables.get(key)
+            if tbl is None:
+                continue
+            for col in tbl.columns:
+                if col.get("name") == r["column_name"]:
+                    col["comment"] = r["column_comment"]
+                    break
 
     async def _enrich_with_indexes(self, conn: Any, tables: list[TableInfo]) -> None:
         clause, params = self._schema_filter_clause("schemaname")

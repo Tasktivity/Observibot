@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -344,6 +345,176 @@ class Analyzer:
         if self.store is None:
             return True
         return await self.store.save_insight(insight)
+
+
+CORRELATION_PROMPT = """\
+You are analyzing the relationship between a recent code/deploy change and a
+performance anomaly that occurred shortly after.
+
+Change event:
+  Type: {change_type}
+  Time: {change_time}
+  Summary: {change_summary}
+  Details: {change_details}
+
+Anomaly:
+  Metric: {anomaly_metric}
+  Severity: {anomaly_severity}
+  Value: {anomaly_value} (baseline median: {anomaly_median})
+  Direction: {anomaly_direction}
+  Time proximity: {time_delta_minutes:.0f} minutes after the change
+
+System context:
+{system_summary}
+
+Analyze whether this change is likely related to this anomaly. Consider:
+1. Could this type of change affect the observed metric?
+2. Is the timing consistent with a causal relationship?
+3. What mechanism could link them?
+
+Respond with JSON:
+{{
+  "likely_related": true|false,
+  "confidence": 0.0-1.0,
+  "mechanism": "explanation of potential causal link",
+  "recommendation": "what to investigate or do"
+}}
+"""
+
+
+@dataclass
+class ChangePerformanceCorrelation:
+    """A potential correlation between a change event and a metric anomaly."""
+    change_event: ChangeEvent
+    anomaly: Any
+    time_delta_seconds: float
+    severity_score: float
+
+    @property
+    def time_delta_minutes(self) -> float:
+        return self.time_delta_seconds / 60.0
+
+
+class CorrelationDetector:
+    """Cheap deterministic correlation detection with optional LLM escalation."""
+
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        store: Store | None = None,
+        proximity_window_minutes: float = 30.0,
+        escalation_threshold: float = 5.0,
+    ) -> None:
+        self.provider = provider
+        self.store = store
+        self.proximity_window_minutes = proximity_window_minutes
+        self.escalation_threshold = escalation_threshold
+
+    def detect_correlations(
+        self,
+        anomalies: list[Anomaly],
+        recent_changes: list[ChangeEvent],
+    ) -> list[ChangePerformanceCorrelation]:
+        """Cheap deterministic pass: find anomalies near recent changes."""
+        correlations: list[ChangePerformanceCorrelation] = []
+
+        for anomaly in anomalies:
+            for change in recent_changes:
+                delta = (anomaly.detected_at - change.occurred_at).total_seconds()
+                if 0 < delta <= self.proximity_window_minutes * 60:
+                    severity_score = self._compute_severity_score(anomaly, delta)
+                    correlations.append(ChangePerformanceCorrelation(
+                        change_event=change,
+                        anomaly=anomaly,
+                        time_delta_seconds=delta,
+                        severity_score=severity_score,
+                    ))
+
+        correlations.sort(key=lambda c: -c.severity_score)
+        return correlations
+
+    def _compute_severity_score(self, anomaly: Anomaly, delta_seconds: float) -> float:
+        """Score: higher = more likely meaningful correlation."""
+        severity_weight = {"critical": 3.0, "warning": 1.5}.get(anomaly.severity, 1.0)
+        proximity_weight = max(0.1, 1.0 - (delta_seconds / (self.proximity_window_minutes * 60)))
+        z_weight = min(abs(anomaly.modified_z) / 5.0, 2.0)
+        return severity_weight * proximity_weight * z_weight
+
+    async def analyze_correlation(
+        self,
+        correlation: ChangePerformanceCorrelation,
+        system_model: SystemModel | None = None,
+    ) -> Insight | None:
+        """LLM escalation: only for high-confidence correlations."""
+        if correlation.severity_score < self.escalation_threshold:
+            return self._deterministic_insight(correlation)
+
+        if self.provider is None:
+            return self._deterministic_insight(correlation)
+
+        anomaly = correlation.anomaly
+        change = correlation.change_event
+
+        prompt = CORRELATION_PROMPT.format(
+            change_type=change.event_type,
+            change_time=change.occurred_at.isoformat(),
+            change_summary=change.summary,
+            change_details=json.dumps(change.details, default=str)[:500],
+            anomaly_metric=anomaly.metric_name,
+            anomaly_severity=anomaly.severity,
+            anomaly_value=f"{anomaly.value:.4g}",
+            anomaly_median=f"{anomaly.median:.4g}",
+            anomaly_direction=anomaly.direction,
+            time_delta_minutes=correlation.time_delta_minutes,
+            system_summary=summarize_system(system_model),
+        )
+
+        try:
+            response = await self.provider.analyze(
+                system_prompt="You analyze code-to-performance relationships. Output JSON.",
+                user_prompt=prompt,
+            )
+            data = response.data
+            if not data.get("likely_related", False):
+                return None
+
+            return Insight(
+                title=(
+                    f"Potential correlation: {anomaly.metric_name} anomaly "
+                    f"after {change.event_type}"
+                ),
+                severity="warning",
+                summary=data.get("mechanism", ""),
+                details=data.get("recommendation", ""),
+                related_metrics=[anomaly.metric_name],
+                confidence=float(data.get("confidence", 0.5)),
+                source="code_correlation",
+            )
+        except (LLMError, Exception) as exc:
+            log.debug("LLM correlation analysis failed: %s", exc)
+            return self._deterministic_insight(correlation)
+
+    def _deterministic_insight(
+        self, correlation: ChangePerformanceCorrelation,
+    ) -> Insight:
+        anomaly = correlation.anomaly
+        change = correlation.change_event
+        return Insight(
+            title=(
+                f"Metric shift in {anomaly.metric_name} "
+                f"~{correlation.time_delta_minutes:.0f}min after {change.event_type}"
+            ),
+            severity="info",
+            summary=(
+                f"{anomaly.metric_name} ({anomaly.severity}) detected "
+                f"{correlation.time_delta_minutes:.0f} minutes after "
+                f"'{change.summary}'. Temporal proximity suggests possible correlation."
+            ),
+            details=f"Change: {change.summary}\nDelta: {correlation.time_delta_minutes:.0f}min",
+            related_metrics=[anomaly.metric_name],
+            confidence=0.3,
+            source="code_correlation",
+        )
 
 
 def _describe_store_schema(allowed_tables: set[str]) -> str:

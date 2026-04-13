@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import signal
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,6 +81,23 @@ def _instantiate_connectors(cfg: ObservibotConfig) -> list[BaseConnector]:
             connectors.append(get_connector(c.name, c.type, c.options))
         except (UnknownConnectorError, ValueError) as exc:
             console.print(f"[yellow]Skipping connector {c.name}:[/yellow] {exc}")
+    if cfg.github.enabled and cfg.github.token:
+        try:
+            from observibot.connectors.github import GitHubConnector
+            gh = GitHubConnector(
+                name="github",
+                config={
+                    "token": cfg.github.token,
+                    "repo": cfg.github.repo,
+                    "branch": cfg.github.branch,
+                    "poll_interval_seconds": cfg.github.poll_interval_seconds,
+                    "local_clone_path": cfg.github.local_clone_path,
+                    "cloud_extraction": cfg.github.cloud_extraction,
+                },
+            )
+            connectors.append(gh)
+        except Exception as exc:
+            console.print(f"[yellow]Skipping GitHub connector:[/yellow] {exc}")
     return connectors
 
 
@@ -441,6 +461,77 @@ def run(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         console.print("[yellow]Stopped.[/yellow]")
+
+
+def _resolve_lockfile(config: Path | None) -> Path:
+    """Return the lockfile path derived from the store config."""
+    cfg = _safe_load_config(config)
+    return Path(cfg.store.path).parent / "observibot.lock"
+
+
+def _stop_daemon(lockfile: Path, timeout: int = 10) -> bool:
+    """Send SIGTERM to the running daemon and wait for exit.
+
+    Returns True if the process was stopped (or wasn't running).
+    """
+    if not lockfile.exists():
+        console.print("[yellow]No running instance found (no lockfile).[/yellow]")
+        return True
+    try:
+        pid = int(lockfile.read_text().strip() or "0")
+    except ValueError:
+        pid = 0
+    if pid == 0:
+        lockfile.unlink(missing_ok=True)
+        console.print("[yellow]Stale lockfile removed.[/yellow]")
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        lockfile.unlink(missing_ok=True)
+        console.print(f"[yellow]PID {pid} not running; stale lockfile removed.[/yellow]")
+        return True
+    except PermissionError:
+        console.print(
+            f"[red]PID {pid} exists but is owned by another user. "
+            "Cannot send signal.[/red]"
+        )
+        return False
+
+    console.print(f"Sending SIGTERM to PID {pid}...")
+    os.kill(pid, signal.SIGTERM)
+
+    for _ in range(timeout * 10):
+        time.sleep(0.1)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            lockfile.unlink(missing_ok=True)
+            console.print("[green]Stopped.[/green]")
+            return True
+    console.print(
+        f"[red]PID {pid} did not exit within {timeout}s. "
+        "You may need to kill it manually.[/red]"
+    )
+    return False
+
+
+@app.command()
+def stop(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
+    """Gracefully stop a running Observibot daemon."""
+    lockfile = _resolve_lockfile(config)
+    if not _stop_daemon(lockfile):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def restart(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
+    """Restart the Observibot daemon (stop then run)."""
+    lockfile = _resolve_lockfile(config)
+    if lockfile.exists() and not _stop_daemon(lockfile):
+        raise typer.Exit(code=1)
+    # Delegate to the run command
+    run(config=config)
 
 
 @app.command()

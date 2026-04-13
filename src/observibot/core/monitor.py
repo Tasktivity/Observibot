@@ -8,6 +8,7 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,7 @@ from observibot.agent.llm_provider import LLMHardError
 from observibot.alerting.base import AlertManager
 from observibot.connectors.base import BaseConnector, Capability
 from observibot.core.anomaly import Anomaly, build_detector_from_config
+from observibot.core.code_intelligence.schema_analyzer import analyze_schema_for_facts
 from observibot.core.config import ObservibotConfig
 from observibot.core.discovery import DiscoveryEngine, diff_models
 from observibot.core.models import Insight, SystemModel
@@ -178,6 +180,28 @@ class MonitorLoop:
         self._health_task: asyncio.Task[None] | None = None
         self._app_db: object | None = None
 
+    # ---------- runtime config ----------
+
+    def reschedule(self, job_id: str, seconds: int) -> None:
+        """Reschedule an APScheduler job, update in-memory config, and persist to YAML."""
+        if self.scheduler is None:
+            raise RuntimeError("Scheduler not started")
+        self.scheduler.reschedule_job(job_id, trigger="interval", seconds=seconds)
+        key: str | None = None
+        if job_id == "collect":
+            self.config.monitor.collection_interval_seconds = seconds
+            key = "collection_interval_seconds"
+        elif job_id == "analyze":
+            self.config.monitor.analysis_interval_seconds = seconds
+            key = "analysis_interval_seconds"
+        if key and self.config.source_path:
+            try:
+                from observibot.core.config import patch_config_file
+                patch_config_file(self.config.source_path, {"monitor": {key: seconds}})
+                log.info("Persisted %s=%d to %s", key, seconds, self.config.source_path)
+            except Exception as exc:
+                log.warning("Failed to persist config change: %s", exc)
+
     # ---------- capability helpers ----------
 
     def _connectors_with(self, capability: Capability) -> list[BaseConnector]:
@@ -235,9 +259,15 @@ class MonitorLoop:
         # Start the web UI + API + health endpoint as a background task.
         if self._health_host is not None:
             try:
-                from observibot.api.deps import set_analyzer, set_app_db, set_store
+                from observibot.api.deps import (
+                    set_analyzer,
+                    set_app_db,
+                    set_monitor_loop,
+                    set_store,
+                )
                 set_store(self.store)
                 set_analyzer(self.analyzer)
+                set_monitor_loop(self)
                 if self._app_db is not None:
                     set_app_db(self._app_db)
 
@@ -376,6 +406,85 @@ class MonitorLoop:
 
     # ---------- cycles ----------
 
+    async def _run_source_extraction(self, system_model: SystemModel) -> None:
+        """Run source code extraction if GitHub + local clone is configured."""
+        gh = self.config.github
+        if not (gh.enabled and gh.cloud_extraction and gh.local_clone_path):
+            return
+
+        clone_path = Path(gh.local_clone_path)
+        if not clone_path.is_dir():
+            log.debug("Local clone path %s not found, skipping extraction", clone_path)
+            return
+
+        try:
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(clone_path), capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except Exception as exc:
+            log.debug("Cannot read git HEAD at %s: %s", clone_path, exc)
+            return
+
+        last_sha = await self.store.get_code_intelligence_meta("last_indexed_commit")
+
+        from observibot.core.code_intelligence.extractor import SemanticExtractor
+        from observibot.core.code_intelligence.tree_sitter_index import TreeSitterIndex
+
+        idx = TreeSitterIndex()
+        extractor = SemanticExtractor(
+            code_index=idx,
+            llm_provider=self.analyzer.provider,
+            store=self.store,
+            cloud_extraction_allowed=gh.cloud_extraction,
+        )
+
+        if last_sha is None or last_sha != head_sha:
+            # Save commit SHA before extraction so partial results are tracked
+            await self.store.set_code_intelligence_meta(
+                "last_indexed_commit", head_sha,
+            )
+
+            if last_sha and last_sha != head_sha:
+                # Incremental: get changed files
+                try:
+                    diff_result = subprocess.run(
+                        ["git", "diff", "--name-only", last_sha, head_sha],
+                        cwd=str(clone_path), capture_output=True, text=True, timeout=10,
+                    )
+                    changed = [
+                        str(clone_path / f)
+                        for f in diff_result.stdout.strip().splitlines()
+                        if f.strip()
+                    ]
+                except Exception:
+                    changed = []
+
+                if changed:
+                    log.info(
+                        "Running incremental extraction on %d changed files", len(changed),
+                    )
+                    facts = await extractor.run_incremental_extraction(
+                        str(clone_path), changed, system_model=system_model,
+                    )
+                else:
+                    log.info("Running full extraction (could not diff commits)")
+                    facts = await extractor.run_full_extraction(
+                        str(clone_path), system_model=system_model,
+                    )
+            else:
+                log.info("Running full source code extraction")
+                facts = await extractor.run_full_extraction(
+                    str(clone_path), system_model=system_model,
+                )
+
+            await self.store.set_code_intelligence_meta(
+                "last_extraction_at", datetime.now(UTC).isoformat(),
+            )
+            log.info("Extracted %d semantic facts from source code", len(facts))
+        else:
+            log.debug("Source code unchanged (HEAD=%s), skipping extraction", head_sha[:8])
+
     async def run_discovery_cycle(self) -> SystemModel:
         log.info("Running discovery cycle")
         new_model = await self.discovery_engine.run()
@@ -383,6 +492,18 @@ class MonitorLoop:
         diff = diff_models(old_model, new_model)
         await self.store.save_system_snapshot(new_model)
         self._cached_model = new_model
+        try:
+            await analyze_schema_for_facts(new_model, self.store)
+        except Exception as exc:
+            log.debug("Schema fact seeding skipped: %s", exc)
+        try:
+            await asyncio.wait_for(
+                self._run_source_extraction(new_model), timeout=120,
+            )
+        except TimeoutError:
+            log.warning("Source code extraction timed out after 120s")
+        except Exception as exc:
+            log.warning("Source code extraction failed: %s", exc)
         if diff.has_changes and old_model is not None:
             insight = Insight(
                 title="System architecture changed",
