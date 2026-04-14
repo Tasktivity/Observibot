@@ -6,7 +6,6 @@ import pytest
 
 from observibot.agent.llm_provider import (
     BudgetExceededError,
-    LLMError,
     LLMHardError,
     LLMSoftError,
     MockProvider,
@@ -108,6 +107,95 @@ def test_classify_hard_vs_soft_errors() -> None:
     assert isinstance(hard, LLMHardError)
     assert isinstance(soft, LLMSoftError)
     assert isinstance(quota, LLMHardError)
+
+
+def test_classify_prompt_too_long_is_hard() -> None:
+    """HTTP 400 'prompt is too long' must never retry — same payload = same 400."""
+    exc = RuntimeError("Error code: 400 - prompt is too long: 204464 tokens > 200000 maximum")
+    result = _classify_provider_error(exc, "Anthropic")
+    assert isinstance(result, LLMHardError), "prompt-too-long must be hard"
+
+
+def test_classify_context_length_exceeded_is_hard() -> None:
+    exc = RuntimeError("Error 400: context_length_exceeded")
+    result = _classify_provider_error(exc, "OpenAI")
+    assert isinstance(result, LLMHardError)
+
+
+def test_classify_invalid_request_error_is_hard() -> None:
+    exc = RuntimeError("BadRequestError: invalid_request_error: missing required field")
+    result = _classify_provider_error(exc, "Anthropic")
+    assert isinstance(result, LLMHardError)
+
+
+def test_classify_400_with_token_is_hard() -> None:
+    exc = RuntimeError("Error code: 400 — too many tokens in request")
+    result = _classify_provider_error(exc, "OpenAI")
+    assert isinstance(result, LLMHardError)
+
+
+def test_classify_rate_limit_is_soft() -> None:
+    """HTTP 429 should be retried — rate limits self-heal."""
+    exc = RuntimeError("Error code: 429 — rate_limit_exceeded")
+    result = _classify_provider_error(exc, "Anthropic")
+    assert isinstance(result, LLMSoftError), "rate limits must be retried"
+
+
+def test_classify_server_error_is_soft() -> None:
+    """HTTP 500 should be retried — transient server errors self-heal."""
+    exc = RuntimeError("Error code: 500 — internal_server_error")
+    result = _classify_provider_error(exc, "Anthropic")
+    assert isinstance(result, LLMSoftError)
+
+
+def test_classify_timeout_is_soft() -> None:
+    exc = TimeoutError("Connection timed out after 30s")
+    result = _classify_provider_error(exc, "OpenAI")
+    assert isinstance(result, LLMSoftError)
+
+
+class _PromptTooLongProvider(MockProvider):
+    """Provider that raises a permanent prompt-too-long error on every call."""
+
+    call_attempts = 0
+
+    async def _call(self, system_prompt: str, user_prompt: str):
+        type(self).call_attempts += 1
+        raise LLMHardError(
+            "Anthropic hard error: 400 — prompt is too long: 204464 tokens"
+        )
+
+
+@pytest.mark.asyncio
+async def test_prompt_too_long_not_retried() -> None:
+    """Hard failure from prompt overflow must abort immediately — no retry storm."""
+    _PromptTooLongProvider.call_attempts = 0
+    p = _PromptTooLongProvider()
+    with pytest.raises(LLMHardError) as exc_info:
+        await p.analyze("s", "u")
+    assert "prompt is too long" in str(exc_info.value).lower()
+    # Only one attempt — not three.
+    assert _PromptTooLongProvider.call_attempts == 1
+
+
+class _SoftFailProvider(MockProvider):
+    """Provider that raises a transient soft error on every call."""
+
+    call_attempts = 0
+
+    async def _call(self, system_prompt: str, user_prompt: str):
+        type(self).call_attempts += 1
+        raise LLMSoftError("Anthropic soft error: 500 internal server error")
+
+
+@pytest.mark.asyncio
+async def test_soft_error_is_retried_three_times() -> None:
+    """Transient server errors get the full 3-attempt retry."""
+    _SoftFailProvider.call_attempts = 0
+    p = _SoftFailProvider()
+    with pytest.raises(LLMSoftError):
+        await p.analyze("s", "u")
+    assert _SoftFailProvider.call_attempts == 3
 
 
 class _BadProvider(MockProvider):

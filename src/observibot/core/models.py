@@ -400,6 +400,7 @@ class Insight:
     source: str = "llm"  # llm, anomaly, drift, rule, incident
     fingerprint: str = ""  # for de-dup
     created_at: datetime = field(default_factory=_utcnow)
+    recurrence_context: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.fingerprint:

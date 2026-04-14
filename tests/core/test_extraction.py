@@ -12,7 +12,6 @@ from observibot.core.code_intelligence.tree_sitter_index import TreeSitterIndex
 from observibot.core.models import SystemModel, TableInfo
 from observibot.core.store import Store
 
-
 SAMPLE_CODE = '''\
 class UserService:
     def get_onboarded_users(self):
@@ -47,7 +46,10 @@ def _mock_provider(facts_response: dict | None = None) -> MagicMock:
                 {
                     "fact_type": "mapping",
                     "concept": "onboarded",
-                    "claim": "User has completed onboarding when completed_onboarding_at IS NOT NULL",
+                    "claim": (
+                        "User has completed onboarding when"
+                        " completed_onboarding_at IS NOT NULL"
+                    ),
                     "tables": ["users"],
                     "columns": ["users.completed_onboarding_at"],
                     "sql_condition": "completed_onboarding_at IS NOT NULL",
@@ -79,7 +81,7 @@ class TestSemanticExtractor:
             code_index=idx, llm_provider=provider,
             store=ext_store, cloud_extraction_allowed=False,
         )
-        facts = await extractor.run_full_extraction(
+        facts, _ = await extractor.run_full_extraction(
             str(sample_repo), system_model=_sample_model(),
         )
         assert len(facts) >= 1
@@ -105,7 +107,7 @@ class TestSemanticExtractor:
             code_index=idx, llm_provider=provider,
             store=ext_store, cloud_extraction_allowed=False,
         )
-        facts = await extractor.run_full_extraction(
+        facts, _ = await extractor.run_full_extraction(
             str(sample_repo), system_model=_sample_model(),
         )
         if facts:
@@ -121,7 +123,7 @@ class TestSemanticExtractor:
             code_index=idx, llm_provider=provider,
             store=ext_store, cloud_extraction_allowed=False,
         )
-        facts = await extractor.run_full_extraction(str(sample_repo))
+        facts, _ = await extractor.run_full_extraction(str(sample_repo))
         assert facts == []
 
     async def test_cloud_extraction_allowed_with_opt_in(
@@ -134,7 +136,7 @@ class TestSemanticExtractor:
             code_index=idx, llm_provider=provider,
             store=ext_store, cloud_extraction_allowed=True,
         )
-        facts = await extractor.run_full_extraction(str(sample_repo))
+        facts, _ = await extractor.run_full_extraction(str(sample_repo))
         assert len(facts) >= 1
 
     async def test_incremental_extraction(
@@ -163,7 +165,7 @@ class TestSemanticExtractor:
             code_index=idx, llm_provider=provider,
             store=ext_store, cloud_extraction_allowed=False,
         )
-        facts = await extractor.run_full_extraction(str(sample_repo))
+        facts, _ = await extractor.run_full_extraction(str(sample_repo))
         assert facts == []
 
     async def test_facts_persisted_to_store(
@@ -177,7 +179,7 @@ class TestSemanticExtractor:
         )
         await extractor.run_full_extraction(
             str(sample_repo), system_model=_sample_model(),
-        )
+        )  # returns (facts, next_index) tuple
         stored = await ext_store.get_semantic_facts()
         assert len(stored) >= 1
 
@@ -218,11 +220,18 @@ class UserService:
         assert warnings == []
 
     def test_detects_jwt(self):
-        content = 'token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"'
+        content = (
+            'token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+            '.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"'
+        )
         assert has_secrets(content) is True
 
     def test_redaction_preserves_structure(self):
-        content = 'config = {\n    "key": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",\n    "name": "test"\n}'
+        content = (
+            'config = {\n    "key": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",'
+            '\n    "name": "test"\n}'
+        )
         redacted, _ = scan_and_redact(content)
         assert '"name": "test"' in redacted
         assert "ghp_" not in redacted

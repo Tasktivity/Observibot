@@ -7,7 +7,6 @@ import pytest
 
 from observibot.core.code_intelligence.tree_sitter_index import TreeSitterIndex
 
-
 SAMPLE_PYTHON = '''\
 """Sample module for testing."""
 
@@ -156,7 +155,7 @@ class TestTreeSitterIndex:
         (tmp_path / "real.py").write_text("def foo(): pass")
 
         idx = TreeSitterIndex()
-        count = await idx.index_directory(str(tmp_path))
+        await idx.index_directory(str(tmp_path))
         symbols = await idx.get_symbols()
         file_paths = {s.file_path for s in symbols}
         assert not any("__pycache__" in p for p in file_paths)

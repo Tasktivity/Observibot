@@ -174,6 +174,14 @@ are still discovered without superuser access.
 | `dead_tuples_ratio` per table | `n_dead_tup / (n_live_tup + 1)` | Vacuum health |
 | `cache_hit_ratio` | `pg_stat_database` | Memory pressure |
 
+> **Phase 4.5 Upgrade (Planned):** Supabase exposes a Prometheus-compatible
+> Metrics API at `https://{ref}.supabase.co/customer/v1/privileged/metrics`
+> with ~200 metrics covering CPU, memory, disk IO, WAL, replication, auth
+> service (GoTrue), and connection pooler (Supavisor). The connector will
+> scrape this endpoint using a shared Prometheus text parser, adding
+> `RESOURCE_METRICS` capability and dramatically expanding the anomaly
+> detection surface. See `docs/PHASE45_DECISIONS.md`.
+
 **Change detection:** Schema diff against previous discovery, `supabase_migrations.schema_migrations` if accessible, RLS policy diffs.
 
 ---
@@ -193,6 +201,12 @@ are still discovered without superuser access.
 public GraphQL API does not expose CPU/memory/network metrics. The monitor
 loop checks capabilities and skips `collect_metrics()` for Railway, so this
 degrades cleanly.
+
+> **Phase 4.5 Upgrade (Planned):** Railway's GraphQL API and dashboard do
+> expose CPU, memory, disk, and network metrics per service. The connector
+> will be upgraded to query these via GraphQL (primary) and optionally scrape
+> a user-deployed Prometheus exporter (secondary). This will add `METRICS`
+> and `RESOURCE_METRICS` capabilities. See `docs/PHASE45_DECISIONS.md`.
 
 **Discovery:** Project topology, services, environments, recent deployments via GraphQL.
 
@@ -233,6 +247,9 @@ e.g. it never calls `collect_metrics()` on a Railway connector.
 | Supabase | DISCOVERY, METRICS, CHANGES, HEALTH | Yes (`pg_monitor`) | No |
 | PostgreSQL | DISCOVERY, METRICS, CHANGES, HEALTH | Yes (`pg_monitor`) | No |
 | Railway | DISCOVERY, CHANGES, HEALTH | No | Yes |
+
+> **Phase 4.5:** Supabase adds RESOURCE_METRICS (via Metrics API).
+> Railway adds METRICS + RESOURCE_METRICS (via GraphQL + optional Prometheus).
 
 ---
 

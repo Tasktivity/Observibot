@@ -35,6 +35,13 @@ export interface User {
   is_admin: boolean;
 }
 
+export interface RecurrenceContext {
+  count: number;
+  first_seen: string;
+  last_seen: string;
+  common_hours: number[];
+}
+
 export interface Insight {
   id: string;
   severity: string;
@@ -48,6 +55,21 @@ export interface Insight {
   source: string;
   is_hypothesis: boolean;
   created_at: string;
+  recurrence_context?: RecurrenceContext | null;
+}
+
+export interface ObservationEvent {
+  id: string;
+  event_type: string;
+  occurred_at: string;
+  severity: string | null;
+  source: string;
+  agent: string;
+  subject: string;
+  summary: string | null;
+  ref_table: string;
+  ref_id: string;
+  run_id: string | null;
 }
 
 export interface Metric {
@@ -81,6 +103,16 @@ export interface ChatResponse {
   execution_ms: number | null;
   domains_hit: string[];
   warnings: string[];
+  session_id: string;
+}
+
+export interface InsightFeedback {
+  id: number;
+  insight_id: string;
+  user_id: string | null;
+  outcome: string;
+  note: string | null;
+  created_at: string;
 }
 
 export interface MonitorIntervals {
@@ -109,6 +141,11 @@ export const api = {
       request<{ id: string; acknowledged: boolean }>(`/insights/${id}/ack`, {
         method: 'PATCH',
       }),
+    feedback: (id: string, outcome: string, note?: string) =>
+      request<InsightFeedback>(`/insights/${id}/feedback`, {
+        method: 'POST',
+        body: JSON.stringify({ outcome, ...(note ? { note } : {}) }),
+      }),
   },
   metrics: {
     recent: (limit = 100) => request<Metric[]>(`/metrics/recent?limit=${limit}`),
@@ -136,10 +173,10 @@ export const api = {
       }),
   },
   chat: {
-    query: (question: string) =>
+    query: (question: string, sessionId?: string) =>
       request<ChatResponse>('/chat/query', {
         method: 'POST',
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, ...(sessionId ? { session_id: sessionId } : {}) }),
       }),
   },
   system: {
@@ -152,6 +189,22 @@ export const api = {
         method: 'PATCH',
         body: JSON.stringify(data),
       }),
+  },
+  events: {
+    list: (params?: { event_type?: string; subject?: string; limit?: number }) => {
+      const q = new URLSearchParams();
+      if (params?.event_type) q.set('event_type', params.event_type);
+      if (params?.subject) q.set('subject', params.subject);
+      if (params?.limit) q.set('limit', String(params.limit));
+      const qs = q.toString();
+      return request<ObservationEvent[]>(`/events${qs ? `?${qs}` : ''}`);
+    },
+    forSubject: (subject: string, limit = 20) =>
+      request<ObservationEvent[]>(`/events/subject/${encodeURIComponent(subject)}?limit=${limit}`),
+    recurrence: (subject: string, eventType = 'anomaly', days = 30) =>
+      request<RecurrenceContext>(`/events/subject/${encodeURIComponent(subject)}/recurrence?event_type=${eventType}&days=${days}`),
+    search: (q: string, limit = 10) =>
+      request<ObservationEvent[]>(`/events/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   },
   discovery: {
     model: () => request<Record<string, unknown>>('/discovery/model'),

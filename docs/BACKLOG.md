@@ -61,6 +61,41 @@ Improvements that deepen the agent's understanding:
    means completed_onboarding_at is not null," store the correction in
    `business_context` and inject into future planning prompts.
 
+## ~~P0 — Phase 4.5 Prerequisites~~ ✅ COMPLETE (April 13, 2026)
+
+All 6 prerequisites implemented. 339 tests passing (43 new, zero regressions).
+
+### ~~Monitor Runs Table~~ ✅
+### ~~Insight Outcome/Feedback Tracking~~ ✅
+### ~~Chat Session ID Support~~ ✅
+### ~~Shared Prometheus Text Parser~~ ✅
+### ~~Supabase Metrics API Scraping~~ ✅
+### ~~Railway Resource Metrics~~ ✅
+
+## P1 — Phase 4.5 Memory Implementation
+
+### ~~Events Envelope (Tier 1)~~ ✅
+Unified episodic timeline. 387 tests passing.
+
+### Session Memory (Tier 3)
+Structured state + compressed turns for multi-turn chat resolution.
+
+### Deterministic Experiential Retrieval
+Seasonal MAD baselines (hour-of-week bucketing). Deterministic lookbacks
+during anomaly analysis. Recurrence annotations on Discovery Feed.
+
+### Synthesis Agent (Tier 2 — Advisory Mode)
+Deterministic pre-clustering + LLM labeling → SynthesizedKnowledge records.
+Advisory-only: patterns displayed but no behavior changes.
+
+### Policy Layer + Alert Suppression
+Separate suppression_policies table. Bayesian posterior updates. Strict
+guardrails for auto-suppression.
+
+### Correction Detection Upgrade
+Teaching-intent detection via planning call structured output. Retire
+hardcoded regex patterns.
+
 ## Deferred — Slotted to Future Phases
 
 ### Vega-Lite Chart Issues (Phase 5)

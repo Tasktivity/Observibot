@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -206,6 +207,52 @@ code_intelligence_meta = Table(
     Column("updated_at", String, nullable=False),
 )
 
+# Phase 4.5 prerequisite tables
+
+monitor_runs = Table(
+    "monitor_runs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("started_at", String, nullable=False),
+    Column("finished_at", String),
+    Column("system_snapshot_id", String),
+    Column("anomaly_count", Integer, default=0),
+    Column("insight_count", Integer, default=0),
+    Column("metric_count", Integer, default=0),
+    Column("llm_used", Boolean, default=False),
+    Column("llm_call_id", String),
+    Column("status", String, default="running"),
+    Column("error_message", Text),
+)
+
+insight_feedback = Table(
+    "insight_feedback",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("insight_id", String, nullable=False),
+    Column("user_id", String),
+    Column("outcome", String, nullable=False),
+    Column("note", Text),
+    Column("created_at", String, nullable=False),
+)
+
+# Phase 4.5 Step 1: Events envelope
+events_table = Table(
+    "events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("event_type", String, nullable=False),
+    Column("occurred_at", String, nullable=False),
+    Column("severity", String),
+    Column("source", String, nullable=False),
+    Column("agent", String, nullable=False, server_default="sre"),
+    Column("subject", String, nullable=False),
+    Column("summary", Text),
+    Column("ref_table", String, nullable=False),
+    Column("ref_id", String, nullable=False),
+    Column("run_id", String),
+)
+
 # Indexes (created alongside the tables)
 sa.Index("idx_snap_created", system_snapshots.c.created_at)
 sa.Index("idx_metrics_name_time", metric_snapshots.c.metric_name, metric_snapshots.c.collected_at)
@@ -213,6 +260,14 @@ sa.Index("idx_metrics_time", metric_snapshots.c.collected_at)
 sa.Index("idx_events_time", change_events.c.occurred_at)
 sa.Index("idx_insights_fp", insights_table.c.fingerprint)
 sa.Index("idx_insights_time", insights_table.c.created_at)
+sa.Index("idx_monitor_runs_time", monitor_runs.c.started_at)
+sa.Index("idx_feedback_insight", insight_feedback.c.insight_id)
+sa.Index("idx_feedback_time", insight_feedback.c.created_at)
+sa.Index("idx_events_type_time", events_table.c.event_type, events_table.c.occurred_at.desc())
+sa.Index("idx_events_subject_time", events_table.c.subject, events_table.c.occurred_at.desc())
+sa.Index("idx_events_agent_time", events_table.c.agent, events_table.c.occurred_at.desc())
+sa.Index("idx_events_run", events_table.c.run_id)
+sa.Index("idx_events_ref", events_table.c.ref_table, events_table.c.ref_id)
 
 
 def _utcnow_iso() -> str:
@@ -291,6 +346,10 @@ class Store:
                     "CREATE VIRTUAL TABLE IF NOT EXISTS semantic_facts_fts "
                     "USING fts5(concept, claim, tables_json, columns_json, "
                     "content=semantic_facts, content_rowid=rowid)"
+                ))
+                await conn.execute(sa.text(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts "
+                    "USING fts5(summary, content=events, content_rowid=rowid)"
                 ))
 
     async def close(self) -> None:
@@ -739,6 +798,424 @@ class Store:
             "last_updated": row[3],
         }
 
+    # ---------- monitor runs ----------
+
+    async def create_monitor_run(self, run_id: str, started_at: datetime) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                monitor_runs.insert().values(
+                    id=run_id,
+                    started_at=started_at.isoformat(),
+                    status="running",
+                    anomaly_count=0,
+                    insight_count=0,
+                    metric_count=0,
+                    llm_used=False,
+                )
+            )
+
+    async def complete_monitor_run(
+        self,
+        run_id: str,
+        finished_at: datetime,
+        stats: dict[str, Any],
+    ) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                monitor_runs.update()
+                .where(monitor_runs.c.id == run_id)
+                .values(
+                    finished_at=finished_at.isoformat(),
+                    status="completed",
+                    metric_count=stats.get("metric_count", 0),
+                    anomaly_count=stats.get("anomaly_count", 0),
+                    insight_count=stats.get("insight_count", 0),
+                    llm_used=stats.get("llm_used", False),
+                    system_snapshot_id=stats.get("system_snapshot_id"),
+                    llm_call_id=stats.get("llm_call_id"),
+                )
+            )
+
+    async def fail_monitor_run(self, run_id: str, error_message: str) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                monitor_runs.update()
+                .where(monitor_runs.c.id == run_id)
+                .values(
+                    finished_at=datetime.now(UTC).isoformat(),
+                    status="failed",
+                    error_message=error_message,
+                )
+            )
+
+    async def get_monitor_run(self, run_id: str) -> dict[str, Any] | None:
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(
+                    monitor_runs.c.id,
+                    monitor_runs.c.started_at,
+                    monitor_runs.c.finished_at,
+                    monitor_runs.c.status,
+                    monitor_runs.c.metric_count,
+                    monitor_runs.c.anomaly_count,
+                    monitor_runs.c.insight_count,
+                    monitor_runs.c.llm_used,
+                    monitor_runs.c.error_message,
+                ).where(monitor_runs.c.id == run_id)
+            )
+            row = result.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "started_at": row[1],
+            "finished_at": row[2],
+            "status": row[3],
+            "metric_count": row[4],
+            "anomaly_count": row[5],
+            "insight_count": row[6],
+            "llm_used": row[7],
+            "error_message": row[8],
+        }
+
+    async def mark_stale_runs(self) -> int:
+        """Mark any 'running' monitor runs as 'stale' (crash recovery)."""
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                monitor_runs.update()
+                .where(monitor_runs.c.status == "running")
+                .values(
+                    status="stale",
+                    finished_at=datetime.now(UTC).isoformat(),
+                    error_message="Process restarted before cycle completed",
+                )
+            )
+        return result.rowcount or 0
+
+    # ---------- insight feedback ----------
+
+    async def get_insight_by_id(self, insight_id: str) -> dict[str, Any] | None:
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(insights_table.c.id, insights_table.c.title)
+                .where(insights_table.c.id == insight_id)
+            )
+            row = result.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "title": row[1]}
+
+    async def record_insight_feedback(
+        self,
+        insight_id: str,
+        user_id: str | None,
+        outcome: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        now = _utcnow_iso()
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                insight_feedback.insert().values(
+                    insight_id=insight_id,
+                    user_id=user_id,
+                    outcome=outcome,
+                    note=note,
+                    created_at=now,
+                )
+            )
+            feedback_id = result.inserted_primary_key[0]
+        return {
+            "id": feedback_id,
+            "insight_id": insight_id,
+            "user_id": user_id,
+            "outcome": outcome,
+            "note": note,
+            "created_at": now,
+        }
+
+    async def get_insight_feedback(self, insight_id: str) -> list[dict]:
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(
+                    insight_feedback.c.id,
+                    insight_feedback.c.insight_id,
+                    insight_feedback.c.user_id,
+                    insight_feedback.c.outcome,
+                    insight_feedback.c.note,
+                    insight_feedback.c.created_at,
+                )
+                .where(insight_feedback.c.insight_id == insight_id)
+                .order_by(insight_feedback.c.created_at.asc())
+            )
+            rows = result.fetchall()
+        return [
+            {
+                "id": r[0], "insight_id": r[1], "user_id": r[2],
+                "outcome": r[3], "note": r[4], "created_at": r[5],
+            }
+            for r in rows
+        ]
+
+    async def get_feedback_summary(
+        self, since: datetime | None = None,
+    ) -> list[dict]:
+        stmt = (
+            sa.select(
+                insight_feedback.c.outcome,
+                sa.func.count().label("count"),
+            )
+            .group_by(insight_feedback.c.outcome)
+        )
+        if since is not None:
+            stmt = stmt.where(
+                insight_feedback.c.created_at >= since.isoformat()
+            )
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+            rows = result.fetchall()
+        return [{"outcome": r[0], "count": r[1]} for r in rows]
+
+    # ---------- events envelope ----------
+
+    async def emit_event(
+        self,
+        event_type: str,
+        source: str,
+        subject: str,
+        ref_table: str,
+        ref_id: str,
+        severity: str | None = None,
+        summary: str | None = None,
+        agent: str = "sre",
+        run_id: str | None = None,
+    ) -> str:
+        """Record an event in the envelope. Returns the event ID."""
+        event_id = uuid.uuid4().hex[:12]
+        now = _utcnow_iso()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                events_table.insert().values(
+                    id=event_id,
+                    event_type=event_type,
+                    occurred_at=now,
+                    severity=severity,
+                    source=source,
+                    agent=agent,
+                    subject=subject,
+                    summary=summary,
+                    ref_table=ref_table,
+                    ref_id=ref_id,
+                    run_id=run_id,
+                )
+            )
+            if summary and "sqlite" in str(self.engine.url):
+                await conn.execute(sa.text(
+                    "INSERT OR REPLACE INTO events_fts"
+                    "(rowid, summary) "
+                    "SELECT rowid, summary "
+                    "FROM events WHERE id = :id"
+                ), {"id": event_id})
+        return event_id
+
+    async def get_events(
+        self,
+        event_type: str | None = None,
+        subject: str | None = None,
+        agent: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Query events with optional filters. Returns newest first."""
+        stmt = sa.select(
+            events_table.c.id,
+            events_table.c.event_type,
+            events_table.c.occurred_at,
+            events_table.c.severity,
+            events_table.c.source,
+            events_table.c.agent,
+            events_table.c.subject,
+            events_table.c.summary,
+            events_table.c.ref_table,
+            events_table.c.ref_id,
+            events_table.c.run_id,
+        )
+        if event_type:
+            stmt = stmt.where(events_table.c.event_type == event_type)
+        if subject:
+            stmt = stmt.where(events_table.c.subject == subject)
+        if agent:
+            stmt = stmt.where(events_table.c.agent == agent)
+        if since is not None:
+            stmt = stmt.where(events_table.c.occurred_at >= since.isoformat())
+        if until is not None:
+            stmt = stmt.where(events_table.c.occurred_at <= until.isoformat())
+        stmt = stmt.order_by(events_table.c.occurred_at.desc()).limit(limit)
+
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+            rows = result.fetchall()
+        return [
+            {
+                "id": r[0], "event_type": r[1], "occurred_at": r[2],
+                "severity": r[3], "source": r[4], "agent": r[5],
+                "subject": r[6], "summary": r[7], "ref_table": r[8],
+                "ref_id": r[9], "run_id": r[10],
+            }
+            for r in rows
+        ]
+
+    async def get_events_for_subject(
+        self, subject: str, limit: int = 20,
+    ) -> list[dict]:
+        """Get recent events for a specific metric/table/service."""
+        return await self.get_events(subject=subject, limit=limit)
+
+    async def get_events_near_time(
+        self,
+        timestamp: datetime,
+        window_minutes: int = 30,
+        subject: str | None = None,
+    ) -> list[dict]:
+        """Get events within a time window (+-window_minutes)."""
+        delta = timedelta(minutes=window_minutes)
+        return await self.get_events(
+            subject=subject,
+            since=timestamp - delta,
+            until=timestamp + delta,
+            limit=200,
+        )
+
+    async def search_events(self, query: str, limit: int = 10) -> list[dict]:
+        """Full-text search over event summaries."""
+        if "sqlite" in str(self.engine.url):
+            # FTS5 search
+            fts_query = " OR ".join(
+                f'"{w}"' for w in query.split() if w.strip()
+            )
+            if not fts_query:
+                return []
+            sql = sa.text(
+                "SELECT e.id, e.event_type, e.occurred_at, e.severity, "
+                "e.source, e.agent, e.subject, e.summary, "
+                "e.ref_table, e.ref_id, e.run_id "
+                "FROM events e "
+                "JOIN events_fts f ON e.rowid = f.rowid "
+                "WHERE events_fts MATCH :query "
+                "ORDER BY rank LIMIT :limit"
+            )
+            async with self.engine.begin() as conn:
+                result = await conn.execute(sql, {"query": fts_query, "limit": limit})
+                rows = result.fetchall()
+        else:
+            # PostgreSQL: tsvector search
+            pattern = f"%{query}%"
+            stmt = (
+                sa.select(
+                    events_table.c.id,
+                    events_table.c.event_type,
+                    events_table.c.occurred_at,
+                    events_table.c.severity,
+                    events_table.c.source,
+                    events_table.c.agent,
+                    events_table.c.subject,
+                    events_table.c.summary,
+                    events_table.c.ref_table,
+                    events_table.c.ref_id,
+                    events_table.c.run_id,
+                )
+                .where(events_table.c.summary.ilike(pattern))
+                .order_by(events_table.c.occurred_at.desc())
+                .limit(limit)
+            )
+            async with self.engine.begin() as conn:
+                result = await conn.execute(stmt)
+                rows = result.fetchall()
+
+        return [
+            {
+                "id": r[0], "event_type": r[1], "occurred_at": r[2],
+                "severity": r[3], "source": r[4], "agent": r[5],
+                "subject": r[6], "summary": r[7], "ref_table": r[8],
+                "ref_id": r[9], "run_id": r[10],
+            }
+            for r in rows
+        ]
+
+    async def count_events_for_subject(
+        self,
+        subject: str,
+        event_type: str | None = None,
+        since: datetime | None = None,
+    ) -> int:
+        """Count events for a subject."""
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(events_table)
+            .where(events_table.c.subject == subject)
+        )
+        if event_type:
+            stmt = stmt.where(events_table.c.event_type == event_type)
+        if since is not None:
+            stmt = stmt.where(events_table.c.occurred_at >= since.isoformat())
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+            row = result.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_event_recurrence_summary(
+        self,
+        subject: str,
+        event_type: str = "anomaly",
+        days: int = 30,
+    ) -> dict | None:
+        """Get recurrence stats: count, first/last seen, common hours."""
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        stmt = sa.select(
+            events_table.c.occurred_at,
+        ).where(
+            events_table.c.subject == subject,
+        ).where(
+            events_table.c.event_type == event_type,
+        ).where(
+            events_table.c.occurred_at >= cutoff,
+        ).order_by(events_table.c.occurred_at.asc())
+
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+            rows = result.fetchall()
+
+        if not rows:
+            return None
+
+        timestamps = [r[0] for r in rows]
+        first_seen = timestamps[0]
+        last_seen = timestamps[-1]
+
+        # Compute common hours
+        hours: list[int] = []
+        for ts in timestamps:
+            try:
+                dt = datetime.fromisoformat(ts)
+                hours.append(dt.hour)
+            except (ValueError, TypeError):
+                pass
+
+        hour_counts: dict[int, int] = {}
+        for h in hours:
+            hour_counts[h] = hour_counts.get(h, 0) + 1
+        max_count = max(hour_counts.values()) if hour_counts else 0
+        common_hours = sorted(
+            h for h, c in hour_counts.items() if c == max_count
+        ) if max_count > 0 else []
+
+        return {
+            "count": len(timestamps),
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "common_hours": common_hours,
+        }
+
     # ---------- semantic facts ----------
 
     async def find_existing_fact_id(
@@ -1052,5 +1529,30 @@ class Store:
                     )
                 )
             results["snapshots"] = len(excess)
+
+            # Retention for Phase 4.5 tables
+            r = await conn.execute(
+                monitor_runs.delete().where(
+                    monitor_runs.c.started_at
+                    < (now - timedelta(days=events_days)).isoformat()
+                )
+            )
+            results["monitor_runs"] = r.rowcount or 0
+
+            r = await conn.execute(
+                insight_feedback.delete().where(
+                    insight_feedback.c.created_at
+                    < (now - timedelta(days=insights_days)).isoformat()
+                )
+            )
+            results["insight_feedback"] = r.rowcount or 0
+
+            r = await conn.execute(
+                events_table.delete().where(
+                    events_table.c.occurred_at
+                    < (now - timedelta(days=events_days)).isoformat()
+                )
+            )
+            results["observation_events"] = r.rowcount or 0
 
         return results

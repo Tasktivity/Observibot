@@ -68,29 +68,44 @@ class SemanticExtractor:
 
     async def run_full_extraction(
         self, repo_path: str, system_model: SystemModel | None = None,
-    ) -> list[SemanticFact]:
-        """Full extraction pipeline: index -> identify -> extract -> validate -> store."""
+        start_index: int = 0, batch_size: int = 0,
+    ) -> tuple[list[SemanticFact], int]:
+        """Full extraction pipeline: index -> identify -> extract -> validate -> store.
+
+        When ``batch_size`` > 0, only processes files from ``start_index`` to
+        ``start_index + batch_size``. Returns (facts, next_start_index) where
+        next_start_index is -1 if all files have been processed.
+        """
         if not self.cloud_extraction_allowed and not self._is_local_provider():
             log.warning(
                 "Source code extraction disabled (cloud_extraction=false and "
                 "no local LLM configured). Enable cloud_extraction or configure Ollama."
             )
-            return []
+            return [], -1
 
         file_count = await self.code_index.index_directory(repo_path)
         if file_count == 0:
             log.info("No files indexed in %s", repo_path)
-            return []
+            return [], -1
 
         high_signal = await self.code_index.get_high_signal_files()
         if not high_signal:
             all_symbols = await self.code_index.get_symbols()
             high_signal = list({s.file_path for s in all_symbols})[:20]
 
+        total_files = len(high_signal)
+        if batch_size > 0:
+            end_index = min(start_index + batch_size, total_files)
+            batch = high_signal[start_index:end_index]
+            next_index = end_index if end_index < total_files else -1
+        else:
+            batch = high_signal[:30]
+            next_index = -1
+
         table_names = self._get_table_names(system_model)
         all_facts: list[SemanticFact] = []
 
-        for file_path in high_signal[:30]:
+        for file_path in batch:
             chunks = await self.code_index.get_chunks_for_file(file_path)
             for chunk in chunks:
                 try:
@@ -104,10 +119,11 @@ class SemanticExtractor:
                     log.debug("Extraction failed for %s: %s", file_path, exc)
 
         log.info(
-            "Extracted %d semantic facts from %d high-signal files",
-            len(all_facts), len(high_signal),
+            "Extracted %d semantic facts from %d files (batch %d-%d of %d)",
+            len(all_facts), len(batch), start_index,
+            start_index + len(batch), total_files,
         )
-        return all_facts
+        return all_facts, next_index
 
     async def run_incremental_extraction(
         self, repo_path: str, changed_files: list[str],

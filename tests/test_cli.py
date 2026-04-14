@@ -114,7 +114,7 @@ def test_cli_analyze_no_metrics(tmp_path: Path) -> None:
     db_path = tmp_path / "store.db"
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
-        "llm: {provider: mock}\nconnectors: []\nstore:\n  path: %s\n" % db_path
+        f"llm: {{provider: mock}}\nconnectors: []\nstore:\n  path: {db_path}\n"
     )
 
     async def _seed() -> None:

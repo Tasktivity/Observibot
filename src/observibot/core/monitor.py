@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import subprocess
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -180,6 +181,23 @@ class MonitorLoop:
         self._health_task: asyncio.Task[None] | None = None
         self._app_db: object | None = None
 
+    # ---------- event emission ----------
+
+    async def _emit(
+        self, event_type: str, subject: str, ref_table: str, ref_id: str,
+        *, severity: str | None = None, summary: str | None = None,
+        source: str = "monitor_loop", run_id: str | None = None,
+    ) -> None:
+        """Fire-and-forget event emission. Never blocks the caller."""
+        try:
+            await self.store.emit_event(
+                event_type=event_type, source=source, subject=subject,
+                ref_table=ref_table, ref_id=ref_id, severity=severity,
+                summary=summary, agent="sre", run_id=run_id,
+            )
+        except Exception as exc:
+            log.debug("Event emission failed: %s", exc)
+
     # ---------- runtime config ----------
 
     def reschedule(self, job_id: str, seconds: int) -> None:
@@ -280,6 +298,14 @@ class MonitorLoop:
             except Exception as exc:
                 log.warning("Health endpoint failed to start: %s", exc)
 
+        # Clean up stale monitor runs from prior crashes
+        try:
+            stale_count = await self.store.mark_stale_runs()
+            if stale_count:
+                log.info("Cleaned up %d stale monitor run records", stale_count)
+        except Exception as exc:
+            log.debug("Stale run cleanup failed: %s", exc)
+
         self._cached_model = await self.store.get_latest_system_snapshot()
 
         # Initial blocking work happens BEFORE the scheduler starts so users
@@ -378,12 +404,13 @@ class MonitorLoop:
             except Exception as exc:
                 log.exception("Collection cycle failed: %s", exc)
 
-    async def _safe_analyze(self) -> None:
+    async def _safe_analyze(self) -> list[Insight]:
         async with self._analysis_lock:
             try:
-                await self.run_analysis_cycle()
+                return await self.run_analysis_cycle()
             except Exception as exc:
                 log.exception("Analysis cycle failed: %s", exc)
+                return []
 
     async def _safe_discover(self) -> None:
         async with self._discovery_lock:
@@ -439,18 +466,33 @@ class MonitorLoop:
             cloud_extraction_allowed=gh.cloud_extraction,
         )
 
-        if last_sha is None or last_sha != head_sha:
-            # Save commit SHA before extraction so partial results are tracked
+        if last_sha and last_sha == head_sha:
+            # Same commit — check if there's a pending batch to continue
+            batch_idx_str = await self.store.get_code_intelligence_meta(
+                "last_extracted_file_index",
+            )
+            if batch_idx_str is None or batch_idx_str == "-1":
+                log.debug(
+                    "Source code unchanged (HEAD=%s), extraction complete",
+                    head_sha[:8],
+                )
+                return
+            # Continue batched extraction from where we left off
+            start_index = int(batch_idx_str)
+        else:
+            # New commit — save SHA and start fresh
             await self.store.set_code_intelligence_meta(
                 "last_indexed_commit", head_sha,
             )
+            start_index = 0
 
             if last_sha and last_sha != head_sha:
-                # Incremental: get changed files
+                # Try incremental extraction for changed files
                 try:
                     diff_result = subprocess.run(
                         ["git", "diff", "--name-only", last_sha, head_sha],
-                        cwd=str(clone_path), capture_output=True, text=True, timeout=10,
+                        cwd=str(clone_path), capture_output=True, text=True,
+                        timeout=10,
                     )
                     changed = [
                         str(clone_path / f)
@@ -462,28 +504,61 @@ class MonitorLoop:
 
                 if changed:
                     log.info(
-                        "Running incremental extraction on %d changed files", len(changed),
+                        "Running incremental extraction on %d changed files",
+                        len(changed),
                     )
                     facts = await extractor.run_incremental_extraction(
                         str(clone_path), changed, system_model=system_model,
                     )
-                else:
-                    log.info("Running full extraction (could not diff commits)")
-                    facts = await extractor.run_full_extraction(
-                        str(clone_path), system_model=system_model,
+                    await self.store.set_code_intelligence_meta(
+                        "last_extracted_file_index", "-1",
                     )
-            else:
-                log.info("Running full source code extraction")
-                facts = await extractor.run_full_extraction(
-                    str(clone_path), system_model=system_model,
-                )
+                    await self.store.set_code_intelligence_meta(
+                        "last_extraction_at", datetime.now(UTC).isoformat(),
+                    )
+                    log.info(
+                        "Extracted %d semantic facts from source code",
+                        len(facts),
+                    )
+                    return
 
-            await self.store.set_code_intelligence_meta(
-                "last_extraction_at", datetime.now(UTC).isoformat(),
+        # Batched full extraction: process 3 files per discovery cycle
+        # (3 files × ~3 chunks × ~6s/LLM call ≈ 54s, within 120s timeout)
+        batch_size = 3
+        log.info(
+            "Running batched extraction (files %d+, batch=%d)",
+            start_index, batch_size,
+        )
+
+        # Index the repo once (fast) before the LLM-heavy extraction
+        await idx.index_directory(str(clone_path))
+        high_signal = await idx.get_high_signal_files()
+        total = len(high_signal)
+
+        # Pre-compute next_index so we can save it even if extraction times out
+        end_index = min(start_index + batch_size, total)
+        next_index = end_index if end_index < total else -1
+        await self.store.set_code_intelligence_meta(
+            "last_extracted_file_index", str(next_index),
+        )
+
+        facts, _ = await extractor.run_full_extraction(
+            str(clone_path), system_model=system_model,
+            start_index=start_index, batch_size=batch_size,
+        )
+
+        await self.store.set_code_intelligence_meta(
+            "last_extraction_at", datetime.now(UTC).isoformat(),
+        )
+        if next_index == -1:
+            log.info(
+                "Extraction complete: %d facts from final batch", len(facts),
             )
-            log.info("Extracted %d semantic facts from source code", len(facts))
         else:
-            log.debug("Source code unchanged (HEAD=%s), skipping extraction", head_sha[:8])
+            log.info(
+                "Extracted %d facts, next batch starts at index %d of %d",
+                len(facts), next_index, total,
+            )
 
     async def run_discovery_cycle(self) -> SystemModel:
         log.info("Running discovery cycle")
@@ -505,6 +580,15 @@ class MonitorLoop:
         except Exception as exc:
             log.warning("Source code extraction failed: %s", exc)
         if diff.has_changes and old_model is not None:
+            await self._emit(
+                "drift", "system_topology",
+                "system_snapshots", new_model.id,
+                severity="info", source="discovery",
+                summary=(
+                    f"Schema/topology change: +{len(diff.added_tables)} tables, "
+                    f"-{len(diff.removed_tables)} tables"
+                ),
+            )
             insight = Insight(
                 title="System architecture changed",
                 severity="info",
@@ -524,12 +608,29 @@ class MonitorLoop:
             insight.fingerprint = insight.compute_fingerprint()
             stored = await self.store.save_insight(insight)
             if stored:
+                await self._emit(
+                    "insight",
+                    insight.related_metrics[0]
+                    if insight.related_metrics else "system",
+                    "insights", insight.id,
+                    severity=insight.severity, summary=insight.title,
+                )
                 await self.alert_manager.dispatch(insight)
         return new_model
 
     async def run_collection_cycle(self) -> int:
         log.info("Running collection cycle")
+        run_id = uuid.uuid4().hex[:12]
+        started_at = datetime.now(UTC)
+        try:
+            await self.store.create_monitor_run(run_id, started_at)
+        except Exception as exc:
+            log.warning("Failed to create monitor run record: %s", exc)
+
         all_metrics = []
+        anomaly_count = 0
+        insight_count = 0
+        llm_used = False
         cutoff = datetime.now(UTC) - timedelta(
             seconds=self.config.monitor.collection_interval_seconds * 2
         )
@@ -537,48 +638,106 @@ class MonitorLoop:
         metric_connectors = self._connectors_with(Capability.METRICS)
         change_connectors = self._connectors_with(Capability.CHANGES)
 
-        for connector in metric_connectors:
+        try:
+            for connector in metric_connectors:
+                try:
+                    metrics = await connector.collect_metrics()
+                    all_metrics.extend(metrics)
+                except Exception as exc:
+                    log.warning(
+                        "Connector %s metric collection failed: %s",
+                        connector.name, exc,
+                    )
+
+            for connector in change_connectors:
+                try:
+                    changes = await connector.get_recent_changes(cutoff)
+                    for change in changes:
+                        await self.store.save_change_event(change)
+                        await self._emit(
+                            "deploy",
+                            change.details.get("service", connector.name)
+                            if isinstance(change.details, dict) else connector.name,
+                            "change_events", change.id,
+                            severity="info", summary=change.summary,
+                            run_id=run_id,
+                        )
+                except Exception as exc:
+                    log.debug(
+                        "Connector %s change polling failed: %s",
+                        connector.name, exc,
+                    )
+
+            if all_metrics:
+                await self.store.save_metrics(all_metrics)
+
+            baseline_window = timedelta(hours=self.config.monitor.baseline_window_hours)
+            history = await self.store.get_metrics(
+                since=datetime.now(UTC) - baseline_window
+            )
+            anomalies = self.detector.evaluate(history=history, latest=all_metrics)
+            anomaly_count = len(anomalies)
+            if anomalies:
+                log.info("Detected %s sustained anomalies", len(anomalies))
+                for anomaly in anomalies:
+                    await self._emit(
+                        "anomaly", anomaly.metric_name,
+                        "metric_snapshots", anomaly.metric_name,
+                        severity=anomaly.severity,
+                        summary=(
+                            f"{anomaly.metric_name} exceeded threshold: "
+                            f"{anomaly.value}"
+                        ),
+                        run_id=run_id,
+                    )
+                self._pending_anomalies.extend(anomalies)
+                llm_used = True  # Analysis attempted (input), not output
+                analysis_results = await self._safe_analyze()
+                insight_count = len(analysis_results)
+
+            log.info(
+                "Collection cycle completed: %d metrics from %d connectors. "
+                "Next cycle in %ds.",
+                len(all_metrics),
+                len(metric_connectors),
+                self.config.monitor.collection_interval_seconds,
+            )
+
+            await self._emit(
+                "metric_collection", "collection_cycle",
+                "monitor_runs", run_id,
+                summary=(
+                    f"Collected {len(all_metrics)} metrics "
+                    f"from {len(metric_connectors)} connectors"
+                ),
+                run_id=run_id,
+            )
+
             try:
-                metrics = await connector.collect_metrics()
-                all_metrics.extend(metrics)
-            except Exception as exc:
-                log.warning(
-                    "Connector %s metric collection failed: %s",
-                    connector.name, exc,
+                await self.store.complete_monitor_run(
+                    run_id,
+                    datetime.now(UTC),
+                    {
+                        "metric_count": len(all_metrics),
+                        "anomaly_count": anomaly_count,
+                        "insight_count": insight_count,
+                        "llm_used": llm_used,
+                        "system_snapshot_id": (
+                            self._cached_model.id if self._cached_model else None
+                        ),
+                    },
                 )
+            except Exception as exc:
+                log.debug("Failed to complete monitor run record: %s", exc)
 
-        for connector in change_connectors:
+            return len(all_metrics)
+
+        except Exception as exc:
             try:
-                changes = await connector.get_recent_changes(cutoff)
-                for change in changes:
-                    await self.store.save_change_event(change)
-            except Exception as exc:
-                log.debug(
-                    "Connector %s change polling failed: %s",
-                    connector.name, exc,
-                )
-
-        if all_metrics:
-            await self.store.save_metrics(all_metrics)
-
-        baseline_window = timedelta(hours=self.config.monitor.baseline_window_hours)
-        history = await self.store.get_metrics(
-            since=datetime.now(UTC) - baseline_window
-        )
-        anomalies = self.detector.evaluate(history=history, latest=all_metrics)
-        if anomalies:
-            log.info("Detected %s sustained anomalies", len(anomalies))
-            self._pending_anomalies.extend(anomalies)
-            await self._safe_analyze()
-
-        log.info(
-            "Collection cycle completed: %d metrics from %d connectors. "
-            "Next cycle in %ds.",
-            len(all_metrics),
-            len(metric_connectors),
-            self.config.monitor.collection_interval_seconds,
-        )
-        return len(all_metrics)
+                await self.store.fail_monitor_run(run_id, str(exc))
+            except Exception as store_exc:
+                log.debug("Failed to record monitor run failure: %s", store_exc)
+            raise
 
     async def run_analysis_cycle(self) -> list[Insight]:
         if self.circuit_breaker.is_open():
@@ -610,6 +769,24 @@ class MonitorLoop:
             return []
 
         for insight in insights:
+            # Annotate with recurrence context
+            try:
+                for metric in insight.related_metrics:
+                    recurrence = await self.store.get_event_recurrence_summary(
+                        subject=metric, event_type="anomaly", days=30,
+                    )
+                    if recurrence and recurrence["count"] > 1:
+                        insight.recurrence_context = recurrence
+                        break
+            except Exception as exc:
+                log.debug("Recurrence lookup failed: %s", exc)
+
+            await self._emit(
+                "insight",
+                insight.related_metrics[0] if insight.related_metrics else "system",
+                "insights", insight.id,
+                severity=insight.severity, summary=insight.title,
+            )
             await self.alert_manager.dispatch(insight)
         return insights
 

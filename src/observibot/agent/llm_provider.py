@@ -464,6 +464,26 @@ _HARD_ERROR_HINTS = (
     "billing",
     "account",
     "not found: model",
+    # Permanent 400 conditions — retrying the identical oversized/malformed
+    # payload will always return the same error.
+    "prompt is too long",
+    "context length",
+    "context_length_exceeded",
+    "too many tokens",
+    "maximum context",
+    "maximum tokens",
+    "max_tokens",
+    "invalid_request_error",
+)
+
+# HTTP 400 by itself is ambiguous (could be a transient validation quirk),
+# but when paired with any of these substrings, treat as hard.
+_STATUS_400_HARD_HINTS = (
+    "prompt",
+    "context",
+    "token",
+    "invalid_request",
+    "invalid request",
 )
 
 
@@ -472,10 +492,20 @@ def _classify_provider_error(exc: Exception, provider_name: str) -> LLMError:
 
     We can't reliably import provider-specific exception classes without
     tying ourselves to them, so we sniff the stringified error for known
-    auth/quota signals.
+    auth/quota/overflow signals.
+
+    Hard (no retry): auth, quota, prompt-too-long, invalid request, 401, 403.
+    Soft (retry):    transient errors, 429 rate limits, 5xx server errors,
+                     network/timeouts, malformed JSON.
+
+    HTTP 400 is classified as hard when paired with prompt/context/token
+    keywords — the same oversized payload will always return the same 400.
     """
     text = f"{type(exc).__name__}: {exc}".lower()
     if any(hint in text for hint in _HARD_ERROR_HINTS):
+        return LLMHardError(f"{provider_name} hard error: {exc}")
+    # HTTP 400 with prompt/context/token hints — permanent bad request.
+    if "400" in text and any(h in text for h in _STATUS_400_HARD_HINTS):
         return LLMHardError(f"{provider_name} hard error: {exc}")
     return LLMSoftError(f"{provider_name} soft error: {exc}")
 

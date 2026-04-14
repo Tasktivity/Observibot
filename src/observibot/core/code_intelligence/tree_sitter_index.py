@@ -216,6 +216,15 @@ class TreeSitterIndex(CodeIndex):
         except OSError:
             return []
 
+        # Skip likely minified/compiled files based on line length
+        lines = content.split("\n")
+        if lines:
+            avg_line_len = sum(len(ln) for ln in lines) / len(lines)
+            long_lines = sum(1 for ln in lines if len(ln) > 300)
+            if avg_line_len > 200 or (len(lines) > 5 and long_lines / len(lines) > 0.5):
+                log.debug("Skipped %s — likely minified (avg line: %.0f)", file_path, avg_line_len)
+                return []
+
         if _ts_available and language == "python":
             return self._ts_index_python(file_path, content)
 

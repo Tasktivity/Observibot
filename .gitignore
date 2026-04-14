@@ -40,6 +40,14 @@ REVIEW_PROMPT.md
 PHASE23_REVIEW_PROMPT.md
 docs/PHASE23_DECISIONS.md
 docs/AGENTIC_DECISIONS.md
+docs/PHASE45_DECISIONS.md
 docs/REVIEW_SYNTHESIS.md
 docs/REVIEW_SYNTHESIS_PART2.md
 CLAUDE.md
+AGENTS.md
+
+# Deployment-specific verification scripts — these run Observibot against
+# a live monitored system and produce deployment-specific output, so they
+# stay local and are not part of the generic OSS surface.
+scripts/live_verify_chat.py
+scripts/verify_db.py

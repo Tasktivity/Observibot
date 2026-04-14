@@ -163,6 +163,32 @@ users, widgets.
 
 ---
 
+## Planned: Experiential Memory (Phase 4.5)
+
+The agent currently has no memory across monitoring cycles — each 5-minute
+analysis is stateless. Phase 4.5 introduces three-tier experiential memory:
+
+- **Tier 1 (Observation Journal):** Append-only event log via a lightweight
+  `events` envelope table referencing existing tables. Records what happened,
+  when, and what the outcome was.
+- **Tier 2 (Synthesized Knowledge):** Higher-order patterns distilled from
+  accumulated observations via deterministic clustering + LLM interpretation.
+  Patterns have machine-readable signatures, Bayesian confidence scores, and
+  temporal metadata.
+- **Tier 3 (Working Memory):** Server-side session context for multi-turn chat.
+  Structured state + compressed turns, ~1k token budget.
+
+Key architectural principles:
+- Memory and policy are separate records (pattern ≠ suppression rule)
+- Deterministic pre-processing before any LLM synthesis
+- Seasonal MAD baselines (168 hour-of-week buckets) for time-aware anomaly detection
+- Advisory-only mode before any alert behavior changes
+- Bespoke on SQLite/Postgres — no external memory frameworks
+
+See `docs/PHASE45_DECISIONS.md` for full architecture decisions.
+
+---
+
 ## Technology Stack
 
 | Component | Technology | Rationale |

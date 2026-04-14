@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,7 +9,6 @@ import pytest
 from observibot.agent.analyzer import CorrelationDetector
 from observibot.core.anomaly import Anomaly
 from observibot.core.models import ChangeEvent
-from observibot.core.store import Store
 
 
 def _make_anomaly(

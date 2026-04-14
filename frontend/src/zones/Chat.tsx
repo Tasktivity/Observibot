@@ -30,7 +30,13 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, r
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [sessionId, setSessionId] = useState<string | undefined>(undefined);
   const pendingSubmitRef = useRef(false);
+
+  const startNewConversation = () => {
+    setSessionId(undefined);
+    setMessages([]);
+  };
 
   const submitQuestion = async (question: string) => {
     if (!question.trim() || loading) return;
@@ -38,11 +44,26 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, r
     setLoading(true);
 
     try {
-      const response = await api.chat.query(question);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: response.answer, response },
-      ]);
+      const response = await api.chat.query(question, sessionId);
+      if (response.session_id && sessionId && response.session_id !== sessionId) {
+        // Server created a new session — old one expired
+        setMessages([
+          { role: 'user', content: question },
+          {
+            role: 'assistant',
+            content: 'Session expired \u2014 starting fresh.\n\n' + response.answer,
+            response,
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: response.answer, response },
+        ]);
+      }
+      if (response.session_id) {
+        setSessionId(response.session_id);
+      }
     } catch {
       setMessages((prev) => [
         ...prev,
@@ -90,9 +111,26 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, r
 
   return (
     <div className="flex flex-col h-full">
-      <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-        System Intelligence Chat
-      </h2>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">
+          System Intelligence Chat
+        </h2>
+        <div className="flex items-center gap-2">
+          {sessionId && (
+            <span className="text-xs text-slate-500">
+              Session: {messages.filter((m) => m.role === 'user').length} turns
+            </span>
+          )}
+          {messages.length > 0 && (
+            <button
+              onClick={startNewConversation}
+              className="text-xs text-slate-400 hover:text-sky-400 transition"
+            >
+              New conversation
+            </button>
+          )}
+        </div>
+      </div>
       <div className="flex-1 overflow-y-auto space-y-3 mb-3">
         {messages.length === 0 && (
           <p className="text-slate-500 text-sm">

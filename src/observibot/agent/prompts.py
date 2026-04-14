@@ -118,4 +118,6 @@ Recent metrics:
 
 Recent insights:
 {insights_summary}
+
+{business_context}
 """

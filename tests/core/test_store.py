@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,10 +12,8 @@ from observibot.core.models import (
     Insight,
     MetricSnapshot,
     SystemModel,
-    TableInfo,
 )
 from observibot.core.store import Store, build_engine, metadata
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,7 +34,7 @@ async def test_save_and_fetch_system_snapshot(tmp_store, sample_system_model: Sy
 
 
 async def test_batch_metric_insert(tmp_store) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     metrics = [
         MetricSnapshot(
             connector_name="c",
@@ -53,7 +51,7 @@ async def test_batch_metric_insert(tmp_store) -> None:
 
 
 async def test_get_metrics_time_range(tmp_store) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await tmp_store.save_metrics(
         [
             MetricSnapshot(
@@ -121,7 +119,7 @@ async def test_baseline_upsert(tmp_store) -> None:
 
 
 async def test_retention_cleanup(tmp_store) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # Old metric
     await tmp_store.save_metric(
         MetricSnapshot(
@@ -153,8 +151,81 @@ async def test_alert_history(tmp_store) -> None:
     await tmp_store.record_alert(
         insight_id="x", channel="slack", severity="warning", status="ok", message="sent"
     )
-    count = await tmp_store.count_alerts_since(datetime.now(timezone.utc) - timedelta(hours=1))
+    count = await tmp_store.count_alerts_since(datetime.now(UTC) - timedelta(hours=1))
     assert count == 1
+
+
+async def test_retention_cleans_new_tables(tmp_path: Path) -> None:
+    """Fix 10: Retention must clean monitor_runs and insight_feedback."""
+    from datetime import timedelta
+
+    async with Store(tmp_path / "ret.db") as store:
+        old = datetime.now(UTC) - timedelta(days=200)
+        # Create old records
+        await store.create_monitor_run("old-run", old)
+        await store.complete_monitor_run("old-run", old, {"metric_count": 1})
+        await store.record_insight_feedback("ins-1", "u-1", "noise")
+
+        # Manually backdate the records
+        async with store.engine.begin() as conn:
+            from observibot.core.store import monitor_runs, insight_feedback
+            await conn.execute(
+                monitor_runs.update()
+                .where(monitor_runs.c.id == "old-run")
+                .values(started_at=old.isoformat())
+            )
+            await conn.execute(
+                insight_feedback.update()
+                .where(insight_feedback.c.insight_id == "ins-1")
+                .values(created_at=old.isoformat())
+            )
+
+        result = await store.apply_retention(
+            metrics_days=30, events_days=90, insights_days=90, max_snapshots=10,
+        )
+        assert result["monitor_runs"] == 1
+        assert result["insight_feedback"] == 1
+
+
+async def test_monitor_run_lifecycle(tmp_store) -> None:
+    """Fix 4: Monitor runs should track lifecycle correctly."""
+    from datetime import UTC, datetime
+
+    run_id = "test-run-001"
+    now = datetime.now(UTC)
+    await tmp_store.create_monitor_run(run_id, now)
+
+    run = await tmp_store.get_monitor_run(run_id)
+    assert run is not None
+    assert run["status"] == "running"
+
+    await tmp_store.complete_monitor_run(run_id, now, {
+        "metric_count": 42,
+        "anomaly_count": 3,
+        "insight_count": 2,
+        "llm_used": True,
+    })
+    run = await tmp_store.get_monitor_run(run_id)
+    assert run["status"] == "completed"
+    assert run["metric_count"] == 42
+    assert run["insight_count"] == 2
+    assert run["llm_used"] is True
+
+
+async def test_mark_stale_runs(tmp_store) -> None:
+    """Fix 4: Stale 'running' records cleaned up on startup."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    await tmp_store.create_monitor_run("stale-1", now)
+    await tmp_store.create_monitor_run("stale-2", now)
+
+    stale_count = await tmp_store.mark_stale_runs()
+    assert stale_count == 2
+
+    run = await tmp_store.get_monitor_run("stale-1")
+    assert run["status"] == "stale"
+    assert "Process restarted" in (run["error_message"] or "")
 
 
 def test_build_engine_sqlite_url() -> None:
@@ -188,12 +259,11 @@ def test_metadata_has_phase3_tables() -> None:
 
 async def test_table_creation_via_metadata(tmp_path: Path) -> None:
     db_path = tmp_path / "schema_test.db"
-    async with Store(db_path) as store:
-        async with store.engine.begin() as conn:
-            result = await conn.execute(
-                sa.text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            )
-            tables = {r[0] for r in result.fetchall()}
+    async with Store(db_path) as store, store.engine.begin() as conn:
+        result = await conn.execute(
+            sa.text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        )
+        tables = {r[0] for r in result.fetchall()}
     assert "system_snapshots" in tables
     assert "metric_snapshots" in tables
     assert "users" in tables

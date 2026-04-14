@@ -32,6 +32,86 @@ OBSERVABILITY_TABLES = {
     "llm_usage", "metric_baselines",
 }
 
+# Per-section token budgets for the planning prompt. Total ~17k tokens which
+# is well under any model limit and leaves headroom for response + synthesis.
+OBS_SCHEMA_BUDGET_TOKENS = 2_000
+APP_SCHEMA_BUDGET_TOKENS = 8_000
+BUSINESS_CONTEXT_BUDGET_TOKENS = 3_000
+# Synthesis: tool results can be wide. Cap before sending to LLM.
+TOOL_RESULTS_BUDGET_TOKENS = 15_000
+# Thresholds for _log_prompt_size. Warning fires well before any real limit;
+# error fires close to the 200k context window so it shows up in logs.
+PROMPT_WARN_TOKENS = 30_000
+PROMPT_ERROR_TOKENS = 150_000
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token. Cheap and good enough."""
+    return len(text) // 4
+
+
+def _enforce_budget(text: str, max_tokens: int, label: str) -> str:
+    """Truncate ``text`` so it fits within ``max_tokens`` tokens.
+
+    Truncation is char-based (~4 chars/token). Trims to the last newline in
+    the final 30% of the cut so we don't slice mid-entry, then appends a
+    visible note so the LLM knows the section was truncated (not silent
+    data loss). Returns the original text unchanged if already under budget.
+    """
+    est = _estimate_tokens(text)
+    if est <= max_tokens:
+        return text
+    max_chars = max_tokens * 4
+    truncated = text[:max_chars]
+    last_nl = truncated.rfind("\n")
+    if last_nl > max_chars * 0.7:
+        truncated = truncated[:last_nl]
+    log.warning(
+        "Prompt section '%s' truncated: ~%d tokens → ~%d tokens (budget=%d)",
+        label, est, _estimate_tokens(truncated), max_tokens,
+    )
+    return (
+        truncated
+        + f"\n[Truncated: '{label}' exceeded {max_tokens}-token budget]"
+    )
+
+
+def _log_prompt_size(
+    prompt: str,
+    label: str,
+    sections: dict[str, str] | None = None,
+) -> None:
+    """Log the assembled prompt size with a per-section breakdown.
+
+    DEBUG at normal sizes, WARNING above ``PROMPT_WARN_TOKENS``, ERROR above
+    ``PROMPT_ERROR_TOKENS``. The breakdown turns a future 'mystery 400 from
+    Anthropic' into a single grep-able log line.
+    """
+    total_chars = len(prompt)
+    total_tokens = total_chars // 4
+
+    if total_tokens > PROMPT_ERROR_TOKENS:
+        level = logging.ERROR
+    elif total_tokens > PROMPT_WARN_TOKENS:
+        level = logging.WARNING
+    else:
+        level = logging.DEBUG
+
+    breakdown = ""
+    if sections:
+        parts = [
+            f"{k}=~{_estimate_tokens(v)}tok"
+            for k, v in sections.items() if v
+        ]
+        if parts:
+            breakdown = f" [{', '.join(parts)}]"
+
+    log.log(
+        level,
+        "%s prompt: ~%d tokens (%d chars)%s",
+        label, total_tokens, total_chars, breakdown,
+    )
+
 CORRECTION_PATTERNS = [
     re.compile(r"actually,?\s+(\w[\w\s]*?)\s+means?\s+(.+)", re.IGNORECASE),
     re.compile(r"(\w[\w\s]*?)\s+should be defined as\s+(.+)", re.IGNORECASE),
@@ -136,12 +216,17 @@ async def run_chat_agent(
     store: Store,
     app_db: AppDatabasePool | None,
     system_model: SystemModel | None,
+    session_context: list[dict] | None = None,
 ) -> ChatResult:
     """Execute the agentic chat pipeline."""
     start = time.monotonic()
 
     app_enabled = app_db is not None and app_db.is_connected
-    obs_schema = build_observability_schema_description()
+    obs_schema = _enforce_budget(
+        build_observability_schema_description(),
+        OBS_SCHEMA_BUDGET_TOKENS,
+        "obs_schema",
+    )
     app_section = ""
     if app_enabled:
         app_desc = build_app_schema_description(system_model)
@@ -149,6 +234,9 @@ async def run_chat_agent(
             "2. query_application(sql) — Query the monitored application's "
             "production database (read-only). Use for app-specific data.\n"
             f"   Available tables:\n{app_desc}"
+        )
+        app_section = _enforce_budget(
+            app_section, APP_SCHEMA_BUDGET_TOKENS, "app_schema",
         )
     else:
         app_section = (
@@ -168,18 +256,63 @@ async def run_chat_agent(
             else:
                 facts = await knowledge_service.get_context_for_question(question)
                 if facts:
-                    business_context_section = (
-                        await knowledge_service.format_context_for_prompt(facts)
+                    business_context_section = _enforce_budget(
+                        await knowledge_service.format_context_for_prompt(facts),
+                        BUSINESS_CONTEXT_BUDGET_TOKENS,
+                        "business_context",
                     )
                 freshness_warning = await knowledge_service.get_freshness_warning()
     except Exception as exc:
         log.debug("Business context injection skipped: %s", exc)
 
+    session_section = ""
+    if session_context:
+        max_token_budget = 1000
+        lines = []
+        estimated_tokens = 0
+        # Build from most recent turns backward, trimming oldest if over budget
+        for turn in reversed(session_context):
+            role = turn.get("role", "?")
+            summary = turn.get("summary", "")
+            domain = turn.get("domain", "")
+            sql = turn.get("sql_used", "")
+            parts = [f"[{role}] {summary}"]
+            if domain:
+                parts.append(f"Domain: {domain}")
+            if sql:
+                parts.append(f"SQL: {sql}")
+            line = ". ".join(parts)
+            line_tokens = len(line) // 4
+            if estimated_tokens + line_tokens > max_token_budget:
+                break
+            lines.append(line)
+            estimated_tokens += line_tokens
+        lines.reverse()
+        if lines:
+            session_section = (
+                "\n## Conversation Context (prior turns)\n"
+                + "\n".join(
+                    f"Turn {i}: {ln}" for i, ln in enumerate(lines, 1)
+                )
+                + "\n"
+            )
+
     planning_prompt = PLANNING_PROMPT.format(
         obs_schema=obs_schema,
         app_tool_section=app_section,
-        business_context_section=business_context_section,
+        business_context_section=business_context_section + session_section,
         question=question,
+    )
+    _log_prompt_size(
+        planning_prompt,
+        "Planning",
+        {
+            "obs_schema": obs_schema,
+            "app_section": app_section,
+            "business_context": business_context_section,
+            "session": session_section,
+            "question": question,
+        },
     )
 
     plan_response = await provider.analyze(
@@ -208,11 +341,20 @@ async def run_chat_agent(
         )
         tool_results.append(result)
 
-    results_text = _format_tool_results(tool_results)
+    results_text = _enforce_budget(
+        _format_tool_results(tool_results),
+        TOOL_RESULTS_BUDGET_TOKENS,
+        "tool_results",
+    )
 
     synthesis_prompt = SYNTHESIS_PROMPT.format(
         question=question,
         tool_results_text=results_text,
+    )
+    _log_prompt_size(
+        synthesis_prompt,
+        "Synthesis",
+        {"tool_results": results_text, "question": question},
     )
 
     synth_response = await provider.analyze(

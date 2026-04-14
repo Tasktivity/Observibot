@@ -618,12 +618,28 @@ def ask(
             model = await store.get_latest_system_snapshot()
             metrics = await store.get_metrics(limit=50)
             insights = await store.get_recent_insights(limit=10)
+
+            business_context = ""
+            try:
+                from observibot.core.code_intelligence.service import (
+                    CodeKnowledgeService,
+                )
+                knowledge = CodeKnowledgeService(store)
+                if await knowledge.should_inject_context(question):
+                    facts = await knowledge.get_context_for_question(question)
+                    business_context = await knowledge.format_context_for_prompt(
+                        facts,
+                    )
+            except Exception:
+                pass  # business context is best-effort
+
             try:
                 result = await analyzer.answer_question(
                     question=question,
                     system_model=model,
                     recent_metrics=metrics,
                     recent_insights=insights,
+                    business_context=business_context,
                 )
             except LLMError as exc:
                 console.print(f"[red]LLM error:[/red] {exc}")

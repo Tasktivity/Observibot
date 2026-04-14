@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from observibot import __version__
-from observibot.api.routes import auth, chat, discovery, insights, metrics, system, widgets
+from observibot.api.routes import auth, chat, discovery, events, insights, metrics, system, widgets
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _DOCKER_DIST = Path("/app/frontend/dist")
@@ -29,6 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(discovery.router)
     app.include_router(metrics.router)
     app.include_router(insights.router)
+    app.include_router(events.router)
     app.include_router(widgets.router)
     app.include_router(chat.router)
 

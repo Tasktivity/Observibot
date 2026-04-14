@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel
 
 
-class FactType(str, Enum):
+class FactType(StrEnum):
     DEFINITION = "definition"
     WORKFLOW = "workflow"
     MAPPING = "mapping"
@@ -16,7 +16,7 @@ class FactType(str, Enum):
     CORRECTION = "correction"
 
 
-class FactSource(str, Enum):
+class FactSource(StrEnum):
     SCHEMA_ANALYSIS = "schema_analysis"
     SEMANTIC_MODELER = "semantic_modeler"
     CODE_EXTRACTION = "code_extraction"

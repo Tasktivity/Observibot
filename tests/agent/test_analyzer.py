@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -8,7 +8,6 @@ from observibot.agent.analyzer import Analyzer, summarize_system
 from observibot.agent.llm_provider import LLMHardError, LLMSoftError, MockProvider
 from observibot.core.anomaly import Anomaly
 from observibot.core.models import SystemModel
-
 
 
 def _anomaly(severity: str = "critical") -> Anomaly:
@@ -24,7 +23,7 @@ def _anomaly(severity: str = "critical") -> Anomaly:
         severity=severity,
         direction="spike",
         consecutive_count=3,
-        detected_at=datetime.now(timezone.utc),
+        detected_at=datetime.now(UTC),
         sample_count=20,
     )
 

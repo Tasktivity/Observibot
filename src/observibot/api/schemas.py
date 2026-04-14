@@ -1,7 +1,11 @@
 """Pydantic request/response models for the REST API."""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
+
+OUTCOME_TYPE = Literal["noise", "actionable", "investigating", "resolved"]
 
 
 class LoginRequest(BaseModel):
@@ -33,6 +37,7 @@ class InsightResponse(BaseModel):
     source: str = "llm"
     is_hypothesis: bool = False
     created_at: str
+    recurrence_context: dict | None = None
 
 
 class MetricResponse(BaseModel):
@@ -86,8 +91,23 @@ class BatchLayoutUpdate(BaseModel):
     items: list[LayoutItem]
 
 
+class InsightFeedbackRequest(BaseModel):
+    outcome: OUTCOME_TYPE
+    note: str | None = None
+
+
+class InsightFeedbackResponse(BaseModel):
+    id: int | None = None
+    insight_id: str
+    user_id: str | None = None
+    outcome: str
+    note: str | None = None
+    created_at: str
+
+
 class ChatRequest(BaseModel):
     question: str
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -98,6 +118,7 @@ class ChatResponse(BaseModel):
     execution_ms: float | None = None
     domains_hit: list[str] = []
     warnings: list[str] = []
+    session_id: str = ""
 
 
 class SystemStatusResponse(BaseModel):

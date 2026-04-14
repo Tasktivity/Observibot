@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import type { Insight } from '../api/client';
+import { api } from '../api/client';
 import { formatTimestamp } from '../utils/format';
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -16,6 +18,13 @@ const BADGE_COLORS: Record<string, string> = {
   ok: 'bg-green-500',
   discovery: 'bg-purple-500',
 };
+
+const FEEDBACK_OPTIONS = [
+  { outcome: 'noise', label: 'Noise', color: 'text-slate-400 hover:bg-slate-700' },
+  { outcome: 'actionable', label: 'Actionable', color: 'text-green-400 hover:bg-green-900/30' },
+  { outcome: 'investigating', label: 'Investigating', color: 'text-amber-400 hover:bg-amber-900/30' },
+  { outcome: 'resolved', label: 'Resolved', color: 'text-blue-400 hover:bg-blue-900/30' },
+] as const;
 
 interface InsightCardProps {
   insight: Insight;
@@ -36,6 +45,23 @@ export function InsightCard({
 }: InsightCardProps) {
   const colorClass = SEVERITY_COLORS[insight.severity] ?? SEVERITY_COLORS.info;
   const badgeColor = BADGE_COLORS[insight.severity] ?? BADGE_COLORS.info;
+  const [feedbackSent, setFeedbackSent] = useState<string | null>(null);
+  const [feedbackLoading, setFeedbackLoading] = useState(false);
+  const [feedbackError, setFeedbackError] = useState<string | null>(null);
+
+  const handleFeedback = async (outcome: string) => {
+    if (feedbackLoading) return; // double-click guard
+    setFeedbackLoading(true);
+    setFeedbackError(null);
+    try {
+      await api.insights.feedback(insight.id, outcome);
+      setFeedbackSent(outcome);
+    } catch {
+      setFeedbackError('Failed to submit feedback');
+    } finally {
+      setFeedbackLoading(false);
+    }
+  };
 
   return (
     <div className={`rounded-lg border p-4 ${colorClass} transition hover:brightness-110 ${isPinned ? 'ring-1 ring-sky-400/40' : ''}`}>
@@ -51,6 +77,40 @@ export function InsightCard({
         </div>
       </div>
       <p className="text-sm text-slate-300">{insight.summary}</p>
+      {/* Recurrence annotation */}
+      {insight.recurrence_context && insight.recurrence_context.count > 1 && (
+        <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
+          <span title="Recurring event">&#x1F504;</span>
+          <span>
+            Seen {insight.recurrence_context.count} times in last 30 days
+            {insight.recurrence_context.common_hours?.length > 0 && (
+              <> &middot; Usually around {insight.recurrence_context.common_hours.map(h => `${String(h).padStart(2, '0')}:00`).join(', ')} UTC</>
+            )}
+          </span>
+        </div>
+      )}
+      {/* Feedback buttons */}
+      <div className="mt-2 flex items-center gap-1 flex-wrap">
+        {FEEDBACK_OPTIONS.map(({ outcome, label, color }) => (
+          <button
+            key={outcome}
+            onClick={() => handleFeedback(outcome)}
+            disabled={feedbackLoading || feedbackSent === outcome}
+            className={`px-2 py-0.5 rounded-full text-xs border border-slate-600/50 transition ${
+              feedbackSent === outcome
+                ? 'bg-slate-700 text-slate-300 border-slate-500'
+                : feedbackLoading
+                  ? 'opacity-50 cursor-not-allowed'
+                  : color
+            }`}
+          >
+            {feedbackSent === outcome ? `${label} \u2713` : label}
+          </button>
+        ))}
+        {feedbackError && (
+          <span className="text-xs text-red-400 ml-1">{feedbackError}</span>
+        )}
+      </div>
       <div className="mt-2 flex items-center justify-between">
         <div className="text-xs text-slate-500">
           {formatTimestamp(insight.created_at)}

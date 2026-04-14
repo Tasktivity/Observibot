@@ -15,8 +15,15 @@ def _is_sensitive_column(col_name: str) -> bool:
     return any(pat in name_lower for pat in SENSITIVE_COLUMN_PATTERNS)
 
 
-def build_app_schema_description(model: SystemModel | None) -> str:
-    """Build a compact schema description of the monitored app's tables."""
+def build_app_schema_description(
+    model: SystemModel | None, max_chars: int = 30_000,
+) -> str:
+    """Build a compact schema description of the monitored app's tables.
+
+    Caps at 50 tables and 15 columns per table. ``max_chars`` is a hard ceiling
+    enforced after assembly, because column comments can be arbitrarily long
+    and blow the overall budget even when per-table caps look reasonable.
+    """
     if model is None or not model.tables:
         return "(no application schema discovered)"
     lines = []
@@ -33,7 +40,14 @@ def build_app_schema_description(model: SystemModel | None) -> str:
             cols += ", ..."
         row_hint = f" (~{table.row_count} rows)" if table.row_count else ""
         lines.append(f"  {table.fqn}{row_hint}: {cols}")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        cut = result[:max_chars]
+        last_nl = cut.rfind("\n")
+        if last_nl > 0:
+            cut = cut[:last_nl]
+        result = cut + "\n  [Schema truncated due to size]"
+    return result
 
 
 def build_observability_schema_description() -> str:

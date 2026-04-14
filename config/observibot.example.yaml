@@ -17,11 +17,27 @@ connectors:
     connection_string: ${SUPABASE_DB_URL}
     schemas: [public]
     exclude_tables: []
+    options:
+      service_key: ${SUPABASE_SERVICE_KEY}
+      project_ref: ${SUPABASE_PROJECT_REF}
+      # Prometheus Metrics API scraping (~200 metrics: CPU, memory, disk, WAL, etc.)
+      # Enabled automatically when project_ref and service_key are set.
+      # metrics_api_enabled: true
+      # metrics_api_include:
+      #   - "node_cpu_.*"
+      #   - "node_memory_.*"
+      #   - "node_disk_.*"
+      #   - "process_.*"
+      #   - "supavisor_.*"
 
   - name: my-infra
     type: railway
     api_token: ${RAILWAY_API_TOKEN}
     project_id: ${RAILWAY_PROJECT_ID}
+    options:
+      # Optional: deploy a Railway Prometheus exporter for additional metrics.
+      # https://railway.com/deploy/prometheus-exporter
+      # prometheus_endpoint: "https://your-exporter.up.railway.app/metrics"
 
 monitor:
   collection_interval_seconds: 300

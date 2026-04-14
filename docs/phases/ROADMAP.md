@@ -149,63 +149,247 @@ applied. 190+ tests pass, ruff clean, frontend builds.
 
 ---
 
-## Phase 4: Deep Application Intelligence (Future)
+## Phase 4: Deep Application Intelligence ✅ COMPLETE
 
-The agent understands schema structure but not application business logic. This
-phase makes the agent genuinely autonomous by giving it access to the source
-code and the ability to correlate code changes with runtime behavior.
+**Completed:** April 12, 2026. All exit criteria met. Architecture reviewed by
+3 external reviewers (Gemini, ChatGPT, Perplexity) — all critical feedback
+incorporated. Shared Knowledge Layer in `core/code_intelligence/` (not coupled
+to SRE agent). 608 semantic facts (376 from source code, 232 from schema
+analysis) powering business-logic chat queries against the monitored app.
+296 tests pass, ruff clean.
+
+### Architecture Decisions (from 3-reviewer consensus)
+- **SemanticFact model with provenance** — every fact has evidence (file path,
+  commit SHA, line range, confidence, source) and maps to PostgreSQL tables/columns
+- **Shared `core/code_intelligence/`** — not in `agent/`, reusable by future agents
+- **Tree-sitter structural foundation** — `CodeIndex` interface with
+  `TreeSitterIndex` implementation; symbol density ranking for file selection
+- **FTS5 retrieval** — SQLite full-text search over semantic facts, not keyword
+  prompt stuffing
+- **Question classifier** — deterministic gating of business context injection;
+  simple schema queries skip it to prevent regressions
+- **Deterministic secret scanning** — 13 regex patterns before any cloud LLM
+  submission; explicit `cloud_extraction` opt-in config flag
+- **5-minute correlation checks** — cheap deterministic proximity detection
+  every monitoring cycle, LLM escalation only on high-confidence overlaps
 
 ### Deliverables
 
+#### Shared Knowledge Layer (`core/code_intelligence/`)
+- `SemanticFact` Pydantic model with provenance fields (evidence path, commit
+  SHA, line range, confidence, source, tables, columns, sql_condition)
+- `CodeKnowledgeService` — question classifier, FTS5 context retrieval,
+  token-budgeted prompt formatting, freshness tracking, correction storage
+- `semantic_facts` table + `semantic_facts_fts` FTS5 virtual table
+- `code_intelligence_meta` table for freshness tracking (last_indexed_commit,
+  last_index_time)
+- Alembic migration for new tables
+
+#### Schema-Derived Semantic Facts
+- `pg_description` column comments extracted during discovery and stored as
+  DEFINITION facts with 0.95 confidence
+- Naming pattern inference: `*_at` → timestamp transitions, `status` → state
+  machines, `is_*` → boolean flags
+- FK relationship mapping: generates MAPPING facts linking related tables
+- Deduplication: upserts by concept+source+fact_type, prevents duplicates
+  across discovery cycles
+
 #### GitHub Source Code Connector
-- `BaseConnector` subclass via GitHub REST/GraphQL API
-- Fine-grained Personal Access Token, read-only, scoped to specific repos
-- Multi-stage semantic extraction pipeline: discover repo structure → identify
-  high-signal files (models, schemas, routes, README, migrations) → LLM-powered
-  semantic summary → store as business context
-- Security: filter secrets/credentials from source, sensitive file exclusion
-- `SourceCodeConnector` ABC for future platform support (Phase 6)
-- Investigate best open-source options or combination of tools for accurate
-  semantic understanding of codebases (architecture, components, logic flow,
-  connectors, data models)
+- `GitHubConnector(BaseConnector)` with DISCOVERY, CHANGES, HEALTH,
+  CODE_ACCESS, CODE_CHANGES capabilities
+- Fine-grained PAT, read-only, scoped to specific repos
+- ETag conditional requests, rate-limit backoff (Retry-After), 10s timeout,
+  circuit breaker (3 failures → 1hr backoff)
+- Strictly optional — system boots cleanly without GitHub config
+- Wired into `_instantiate_connectors()` when `github.enabled` is true
+
+#### Tree-Sitter Structural Analysis
+- `CodeIndex` ABC — interface for structural code analysis backends
+- `TreeSitterIndex` implementation — Python tree-sitter parsing with regex
+  fallback for JS/TS
+- Universal file selection: 50KB size cap, generated-file exclusion, binary
+  skip, symbol density ranking (not framework-specific heuristics)
+- Top 30 files by score, 100KB total code cap for LLM submission
+
+#### Semantic Extraction Pipeline
+- `SemanticExtractor` — tree-sitter chunks + LLM extraction with Pydantic
+  validation
+- Per-chunk extraction prompt demands PostgreSQL table/column mapping
+- Deterministic validation: facts referencing unknown tables get confidence
+  capped at 0.3
+- Secret scanner: 13 regex patterns, redaction before LLM submission
+- Cloud extraction opt-in: `github.cloud_extraction` config flag
+- Incremental save: facts persist after each chunk (survives timeout)
 
 #### Automated Semantic Refresh
-- Webhook or polling-based refresh on commit/merge to main branch
-- Incremental re-analysis (only changed files, not full repo scan)
-- Change events emitted for source code changes (same model as deploy events)
-- History of semantic changes maintained for trend analysis
+- Polling-based: 15-minute poll interval via GitHub API (configurable)
+- Commit SHA tracking in `code_intelligence_meta`
+- Incremental re-analysis: `git diff` to find changed files, extract only those
+- Full extraction on first discovery cycle, incremental on subsequent cycles
+- 120-second timeout with `asyncio.wait_for()` — never blocks monitor loop
 
-#### Runtime-to-Source Correlation
-- Correlate source code changes with downstream performance impacts
-- Agent uses Discovery Feed history and Static Dashboard baselines to detect
-  performance changes (both positive and negative) following code changes
-- Automatic investigation: when performance shifts, the agent checks recent
-  commits/merges and surfaces both obvious and non-obvious observations
-- Understanding of the runtime stack (what runs where, how components connect)
-  so the agent can reason about blast radius of changes
+#### Change-to-Performance Correlation
+- `CorrelationDetector` — deterministic temporal proximity scoring every
+  monitoring cycle (5-minute)
+- Severity score: severity_weight × proximity_weight × z_weight
+- LLM escalation only when `severity_score > threshold`
+- Deterministic fallback insight when LLM unavailable
+- Correlation prompt includes change details, metric anomalies, system topology
 
 #### Enhanced Self-Discovery
-- Postgres column comments from `pg_description` injected into schema catalog
-- Schema pattern inference (naming patterns → business semantics)
-- Conversational corrections stored as business context, persisted across sessions
+- `pg_description` column comments flow through discovery → schema catalog →
+  semantic facts → chat planning prompt
+- Schema pattern inference via `schema_analyzer.py`
+- Conversational correction detection: 4 regex patterns in chat pipeline
+- Corrections stored as CORRECTION facts with confidence 1.0 (highest priority)
+- `/api/system/code-intelligence-status` endpoint for freshness monitoring
+
+#### Business Context in Chat Pipeline
+- `CodeKnowledgeService.should_inject_context()` — deterministic question
+  classifier gates injection
+- `CodeKnowledgeService.get_context_for_question()` — FTS5 retrieval ranked
+  by source priority (user corrections > code extraction > schema analysis)
+- Token-budgeted formatting: compact one-line-per-fact with sql_condition
+- Freshness warnings when semantic model is stale
+- Business context section added to `PLANNING_PROMPT` only when relevant
 
 ### Exit Criteria
-1. **Source code semantic understanding:** Observibot connects to a GitHub repo,
-   identifies high-signal files, and produces an accurate semantic model of the
-   application: its components, logic flow, connectors, architecture, and data
-   models. The System Intelligence Chat uses this context to answer questions
-   that require business logic understanding (e.g., "what does onboarded mean?").
-2. **Automated refresh:** Semantic model updates automatically on commit or merge
-   (webhook preferred, polling fallback). The agent's understanding stays current
-   without manual intervention.
-3. **Change-to-performance correlation:** When the agent detects a performance
-   change (positive or negative) via the monitoring loop, it automatically
-   investigates recent source code changes and surfaces observations about
-   potential causal relationships. The agent understands the runtime stack well
-   enough to reason about non-obvious downstream impacts.
-4. **Self-improving understanding:** The agent's knowledge of the application
-   improves through at least two mechanisms: automated source code analysis and
-   user-guided conversational correction. Corrections persist across sessions.
+1. **Source code semantic understanding:** ✅ Observibot connects to GitHub,
+   indexes 77 files via tree-sitter, extracts 376 code-derived facts covering
+   access control, business rules, workflows, entity definitions, and domain
+   mappings. Chat uses these facts for business-logic answers (e.g., "How many
+   bug reports are feature requests?" → 3, using `category = 'feature_request'`
+   from code-extracted fact).
+2. **Automated refresh:** ✅ Polling-based (15-min). Commit SHA tracked
+   (`b09194e5`). Incremental extraction on changed files via git diff.
+3. **Change-to-performance correlation:** ✅ `CorrelationDetector` runs every
+   monitoring cycle. Cheap deterministic check with LLM escalation on
+   high-confidence overlaps.
+4. **Self-improving understanding:** ✅ Two mechanisms: automated code
+   extraction (376 facts) + conversational correction detection (4 regex
+   patterns, stored as priority-1.0 facts).
+
+### Phase 4 Known Polish Items
+- Tree-sitter test gaps: route handler, entrypoint, and docstring detection
+  tests fail (tree-sitter implementation, not architecture)
+- Question classifier over-matches: "How many users?" triggers context
+  injection via word overlap with concept terms (no regression, token waste)
+- First-run extraction timeout: 120s limit processes ~21 of 30 files;
+  incremental save mitigates, batching across cycles would fix
+- Minified JS noise: sub-50KB compiled files produce low-value facts;
+  line-length heuristic would filter
+- CLI `ask` command uses different code path from web chat, bypasses
+  business context pipeline
+
+---
+
+## Phase 4.5: Experiential Memory & Connector Enrichment (In Progress)
+
+Observibot currently has no memory across monitoring cycles — every 5-minute
+analysis is stateless. A senior SRE builds institutional knowledge over months:
+which alerts are noise, what patterns recur weekly, which deploys cause which
+symptoms. This phase gives the agent that capability.
+
+Additionally, both Supabase and Railway expose far more metrics than the
+connectors currently collect. Supabase has a Prometheus-compatible Metrics API
+with ~200 metrics (CPU, IO, WAL, memory, disk, replication, auth). Railway's
+GraphQL API exposes CPU/memory/disk/network per service. Enriching the metric
+pipeline before building memory ensures the experiential system learns from
+the full picture from day one.
+
+Architecture reviewed by 3 external reviewers (Gemini, ChatGPT, Perplexity).
+All critical feedback incorporated into the design.
+
+### Architecture Decisions (from 3-reviewer consensus)
+- **Three-tier experiential memory** — Observation Journal (episodic log),
+  Synthesized Knowledge (pattern memory), Working Memory (session context)
+- **Memory and policy are separate records** — "this pattern exists" is
+  descriptive; "suppress this alert" is a policy requiring user confirmation
+- **Deterministic first, LLM second** — deterministic pre-clustering by
+  metric + time-of-day + deploy proximity; LLM only labels/summarizes clusters
+- **Seasonal MAD baselines** — hour-of-week bucketing (168 buckets) for
+  time-aware anomaly detection, eliminating known-pattern false positives
+- **Bayesian confidence** — Beta distribution updated by user feedback
+  (noise/actionable); no full RL infrastructure needed
+- **Bespoke on SQLite/Postgres** — rejected Mem0, Zep, Letta, Cognee due to
+  deployment friction; borrow patterns from ExpeL, Hindsight, MemRL
+- **Shared Prometheus parser** — reusable utility for Supabase Metrics API +
+  Railway Prometheus exporter + future Phase 6 generic connectors
+- **Advisory-only before suppression** — synthesized patterns surface in UI
+  as recommendations before any alert behavior changes
+
+### Step 0 Deliverables (Prerequisites) ✅ COMPLETE
+Completed April 13, 2026. 361 tests passing (65 new total), ruff clean,
+frontend builds clean. Two external code reviews completed — all critical
+and important issues fixed across two hotfix passes.
+
+- `monitor_runs` table — anchors each monitoring cycle with a run ID
+- `insight_feedback` table + API + UI buttons — Noise/Actionable/Investigating/Resolved
+- Chat session ID support — server-side session store (30min TTL, 5 turn max)
+- Shared Prometheus text parser utility (`connectors/prometheus_parser.py`)
+- Supabase Metrics API scraping — ~200 metrics (CPU, IO, WAL, memory, disk, replication, auth, pooler)
+- Railway GraphQL resource metrics (CPU, memory, disk, network) + optional Prometheus exporter
+
+### Step 1 Deliverables (Events Envelope — Tier 1) ✅ COMPLETE
+Completed April 13, 2026. 387 tests passing (26 new), ruff clean, frontend
+builds clean. Unified episodic timeline operational from first monitoring cycle.
+
+- `events` table — lightweight envelope referencing existing tables (5 indexes)
+- FTS5 virtual table (SQLite) / GIN tsvector index (PostgreSQL) for narrative search
+- 7 store methods for event emission, querying, search, and recurrence stats
+- Event emission wired into all code paths (monitor loop, chat, feedback)
+- Events API — 5 endpoints (list, subject, recurrence, search, timeline)
+- Discovery Feed recurrence annotations ("Seen N times in last 30 days")
+
+### Step 2 Deliverables (Session Memory — Tier 3)
+- Server-side session store with structured state + compressed turns
+- Multi-turn chat (pronoun resolution, query refinement)
+- Context injection into planning prompt (~1k token budget)
+
+### Step 3 Deliverables (Deterministic Experiential Retrieval)
+- Seasonal MAD baselines (hour-of-week bucketing)
+- Deterministic lookbacks during anomaly analysis ("seen N times in 30 days")
+- Recurrence annotations on Discovery Feed insights
+
+### Step 4 Deliverables (Synthesis Agent — Tier 2, Advisory Mode)
+- Deterministic pre-clustering of observations
+- LLM synthesis to label and summarize clusters
+- `SynthesizedKnowledge` with pattern_signature + prior/posterior split
+- UI for viewing, confirming, and rejecting learned patterns
+- Advisory-only: patterns displayed but no behavior changes
+
+### Step 5 Deliverables (Policy Layer + Alert Suppression)
+- Separate `suppression_policies` table (memory ≠ policy)
+- Auto-created policies with strict guardrails (never suppress > warning)
+- User-confirmed policies via one-click from UI
+- Bayesian posterior updates from insight feedback
+
+### Step 6 Deliverables (Correction Detection Upgrade)
+- Teaching-intent detection integrated into planning call structured output
+- Structured `/api/feedback` endpoint for UI-driven corrections
+- Retire hardcoded regex patterns
+
+### Exit Criteria
+1. **Monitoring cycles are anchored:** Every cycle creates a `monitor_runs`
+   record linking anomalies, insights, and metrics collected in that cycle.
+2. **User feedback is captured:** Insight cards offer Noise/Actionable/
+   Investigating/Resolved buttons that persist feedback to the database.
+3. **Multi-turn chat works:** "How many users?" followed by "Break that down
+   by month" resolves correctly within a session.
+4. **Supabase metrics are comprehensive:** Connector collects CPU, memory,
+   disk IO, WAL, and connection pooler metrics via the Metrics API (~200 series)
+   in addition to existing pg_stat metrics.
+5. **Railway resource metrics are collected:** CPU, memory, disk, and network
+   per service via GraphQL (and/or Prometheus exporter).
+6. **Experiential retrieval works:** Anomaly insights show recurrence context
+   ("Seen 4 times in 30 days — usually self-resolves in ~20 minutes").
+7. **Synthesized patterns are surfaced:** Learned patterns appear in the UI
+   as advisory recommendations with confidence scores and evidence counts.
+8. **Alert suppression is safe:** Only high-confidence patterns with user
+   confirmation or strict guardrails can suppress alerts. No silent suppression
+   of severity > warning.
+9. **Seasonal baselines reduce false positives:** Known weekly/daily patterns
+   are absorbed into time-bucketed baselines, reducing noise alerts.
 
 ---
 

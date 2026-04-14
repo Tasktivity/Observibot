@@ -11,16 +11,32 @@ from observibot.core.store import Store
 
 log = logging.getLogger(__name__)
 
-STRUCTURAL_ONLY_PATTERN = re.compile(
-    r"^(how many|count|total|list|show|what)\b.*"
-    r"\b(users?|tables?|rows?|columns?|services?|metrics?|insights?|alerts?)\s*\??$",
-    re.IGNORECASE,
-)
-
-SIMPLE_AGGREGATE_WORDS = {
-    "count", "total", "how many", "list", "show me", "what are",
-    "latest", "recent", "last",
+STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "about", "between",
+    "through", "during", "before", "after", "above", "below", "up", "down",
+    "out", "off", "over", "under", "again", "further", "then", "once",
+    "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
+    "neither", "each", "every", "all", "any", "few", "more", "most",
+    "other", "some", "such", "no", "only", "own", "same", "than", "too",
+    "very", "just", "how", "many", "much", "what", "which", "who", "whom",
+    "this", "that", "these", "those", "i", "me", "my", "we", "our", "you",
+    "your", "he", "him", "his", "she", "her", "it", "its", "they", "them",
+    "their", "show", "list", "get", "tell", "give", "find",
+    "count", "total", "number", "recent", "latest", "last",
 }
+
+
+def _extract_ngrams(text: str, sizes: tuple[int, ...] = (2, 3)) -> set[str]:
+    """Extract multi-word ngrams from text."""
+    words = re.findall(r'\b\w+\b', text.lower())
+    ngrams: set[str] = set()
+    for n in sizes:
+        for i in range(len(words) - n + 1):
+            ngrams.add(" ".join(words[i:i + n]))
+    return ngrams
 
 
 class CodeKnowledgeService:
@@ -37,19 +53,47 @@ class CodeKnowledgeService:
         Conservative: returns False when uncertain.
         """
         q = question.lower().strip().rstrip("?").strip()
+        q_words = set(re.findall(r'\b\w+\b', q))
+        meaningful_words = q_words - STOP_WORDS
 
         concepts = await self.store.get_semantic_facts(active_only=True)
         concept_terms = {f["concept"].lower() for f in concepts}
-        q_words = set(re.findall(r'\b\w+\b', q))
-        if q_words & concept_terms:
+        # Business concepts: exclude bare entity facts from schema analysis
+        # (table names like "users" are structural, not business context)
+        business_concepts = {
+            f["concept"].lower() for f in concepts
+            if f.get("source") != "schema_analysis" or f.get("fact_type") != "entity"
+        }
+
+        # Single words: only match against business concepts (not bare table names)
+        if meaningful_words & business_concepts:
             return True
 
+        # Multi-word ngrams: check if any 2-word or 3-word phrase matches a concept
+        ngrams = _extract_ngrams(q)
+        if ngrams & concept_terms:
+            return True
+
+        # Underscore variants: "pilot users" → "pilot_users"
+        underscore_ngrams = {ng.replace(" ", "_") for ng in ngrams}
+        if underscore_ngrams & concept_terms:
+            return True
+
+        # FTS search as secondary check — only match business-relevant facts
         facts = await self.store.search_semantic_facts(q, limit=3)
-        if facts:
-            return True
-
-        if STRUCTURAL_ONLY_PATTERN.match(q):
-            return False
+        for fact in facts:
+            # Skip bare schema entity facts (table descriptions)
+            if fact.get("source") == "schema_analysis" and fact.get("fact_type") == "entity":
+                continue
+            claim = fact.get("claim", "")
+            concept = fact.get("concept", "").lower()
+            # Multi-word concepts that appear in the question are strong signals
+            if " " in concept and concept in q:
+                return True
+            # Check for meaningful word overlap between question and claim
+            claim_words = set(re.findall(r'\b\w+\b', claim.lower())) - STOP_WORDS
+            if len(meaningful_words & claim_words) >= 2:
+                return True
 
         return False
 
@@ -82,7 +126,16 @@ class CodeKnowledgeService:
         result: list[dict] = []
         token_budget = max_tokens
         for fact in ranked[:max_facts]:
-            est_tokens = len(fact.get("claim", "")) // 4 + 20
+            # More accurate estimate: format_context_for_prompt() emits
+            # claim + tables + sql_condition + metadata. The old estimate
+            # (claim // 4 + 20) underweighted facts with long tables lists
+            # or long sql_condition and let oversized payloads through.
+            est_tokens = (
+                len(fact.get("claim", "")) // 4
+                + len(str(fact.get("tables") or [])) // 4
+                + len(str(fact.get("sql_condition") or "")) // 4
+                + 30  # formatting overhead: "- \"concept\" means ... (meta)"
+            )
             if est_tokens > token_budget:
                 break
             token_budget -= est_tokens

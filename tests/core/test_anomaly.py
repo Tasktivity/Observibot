@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -15,7 +15,7 @@ def _m(value: float, name: str = "x", labels: dict | None = None) -> MetricSnaps
         metric_name=name,
         value=value,
         labels=labels or {},
-        collected_at=datetime.now(timezone.utc),
+        collected_at=datetime.now(UTC),
     )
 
 

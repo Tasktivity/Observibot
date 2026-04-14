@@ -22,7 +22,7 @@ def _model_with_comments() -> SystemModel:
     return SystemModel(
         tables=[
             TableInfo(
-                name="users", schema="public", row_count=47,
+                name="users", schema="public", row_count=100,
                 columns=[
                     {"name": "id", "type": "uuid"},
                     {"name": "email", "type": "text"},
@@ -169,3 +169,34 @@ class TestSchemaDescriptionWithComments:
         model = _model_with_comments()
         desc = build_app_schema_description(model)
         assert "Task lifecycle" in desc
+
+    def test_description_caps_at_max_chars(self):
+        """Schema with arbitrarily long column comments must not blow the budget."""
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        # Build a model with many tables whose columns have huge comments.
+        # Without the max_chars cap, this blows past any token budget.
+        long_comment = "X" * 5000
+        tables = []
+        for i in range(40):
+            tables.append(
+                TableInfo(
+                    name=f"bloat_{i}", schema="public",
+                    columns=[
+                        {"name": f"col_{j}", "type": "text", "comment": long_comment}
+                        for j in range(10)
+                    ],
+                )
+            )
+        model = SystemModel(tables=tables, relationships=[])
+
+        desc = build_app_schema_description(model, max_chars=10_000)
+        assert len(desc) <= 10_000 + 100  # budget + room for the truncation note
+        assert "[Schema truncated" in desc
+
+    def test_description_not_truncated_when_under_cap(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = _model_with_comments()
+        desc = build_app_schema_description(model, max_chars=100_000)
+        assert "[Schema truncated" not in desc

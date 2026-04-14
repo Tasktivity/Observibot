@@ -12,7 +12,6 @@ from observibot.api.deps import set_store
 from observibot.core.models import Insight, MetricSnapshot
 from observibot.core.store import Store
 
-
 pytestmark = pytest.mark.asyncio
 
 

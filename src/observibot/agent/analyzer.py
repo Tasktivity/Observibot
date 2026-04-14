@@ -212,12 +212,14 @@ class Analyzer:
         system_model: SystemModel | None,
         recent_metrics: list[MetricSnapshot],
         recent_insights: list[Insight],
+        business_context: str = "",
     ) -> LLMQueryResponse:
         prompt = ON_DEMAND_QUERY_PROMPT.format(
             question=question,
             system_summary=summarize_system(system_model),
             metrics_summary=summarize_metrics(recent_metrics),
             insights_summary=summarize_insights(recent_insights),
+            business_context=business_context,
         )
         response = await self.provider.analyze(
             system_prompt="You are Observibot. Output only JSON.",

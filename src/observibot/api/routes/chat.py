@@ -4,11 +4,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
 
+from observibot.agent.llm_provider import LLMHardError
 from observibot.api.deps import (
     get_analyzer,
     get_app_db,
@@ -221,10 +223,27 @@ async def chat_query(
     store: Store = Depends(get_store),
 ) -> ChatResponse:
     """Process a natural language question via the agentic pipeline."""
+    from observibot.api.session_store import get_session_store
+
+    session_store = get_session_store()
+    user_id = user["id"]
+
+    # Load or create session (with ownership check)
+    session = None
+    if req.session_id:
+        session = session_store.get_session(req.session_id, user_id)
+    if session is None:
+        session = session_store.create_session(user_id)
+
+    session_context = session_store.get_context(session.session_id)
+
     analyzer = get_analyzer()
 
     if analyzer is None:
-        return await _deterministic_fallback(req.question, store)
+        resp = await _deterministic_fallback(req.question, store)
+        resp.session_id = session.session_id
+        _record_turn(session_store, session.session_id, req.question, resp)
+        return resp
 
     app_db = get_app_db()
     system_model = await store.get_latest_system_snapshot()
@@ -237,12 +256,28 @@ async def chat_query(
             store=store,
             app_db=app_db,
             system_model=system_model,
+            session_context=session_context or None,
         )
+    except LLMHardError as exc:
+        # Hard provider failure (prompt too long, auth, quota) — do NOT fall
+        # through silently. Surface the actual error so the user can act.
+        log.error("Agentic chat hard LLM failure: %s", exc)
+        resp = await _deterministic_fallback(req.question, store)
+        resp.session_id = session.session_id
+        resp.warnings = [
+            f"LLM provider error: {exc}. Showing raw data as fallback.",
+            *(resp.warnings or []),
+        ]
+        _record_turn(session_store, session.session_id, req.question, resp)
+        return resp
     except Exception as exc:
         log.warning("Agentic chat failed, using fallback: %s", exc)
-        return await _deterministic_fallback(req.question, store)
+        resp = await _deterministic_fallback(req.question, store)
+        resp.session_id = session.session_id
+        _record_turn(session_store, session.session_id, req.question, resp)
+        return resp
 
-    return ChatResponse(
+    resp = ChatResponse(
         answer=result.answer,
         widget_plan=result.widget_plan,
         vega_lite_spec=result.vega_lite_spec,
@@ -253,4 +288,57 @@ async def chat_query(
         execution_ms=result.execution_ms,
         domains_hit=result.domains_hit,
         warnings=result.warnings,
+        session_id=session.session_id,
     )
+    _record_turn(session_store, session.session_id, req.question, resp)
+
+    try:
+        subject = result.domains_hit[0] if result.domains_hit else "general"
+        ref_id = (
+            _query_hash(result.sql_queries[0])
+            if result.sql_queries else uuid.uuid4().hex[:12]
+        )
+        await store.emit_event(
+            event_type="investigation",
+            source="chat",
+            subject=subject,
+            ref_table="query_cache",
+            ref_id=ref_id,
+            summary=f"User asked: {req.question[:100]}",
+        )
+    except Exception as exc:
+        log.debug("Failed to emit chat event: %s", exc)
+
+    return resp
+
+
+def _truncate_at_word(text: str, max_len: int = 200) -> str:
+    """Truncate text at a word boundary, not mid-word."""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > max_len // 2:
+        return truncated[:last_space]
+    return truncated
+
+
+def _record_turn(
+    session_store,
+    session_id: str,
+    question: str,
+    response: ChatResponse,
+) -> None:
+    """Record a compressed turn in the session."""
+    domain = response.domains_hit[0] if response.domains_hit else None
+    session_store.add_turn(session_id, {
+        "role": "user",
+        "summary": _truncate_at_word(question),
+        "domain": domain,
+    })
+    session_store.add_turn(session_id, {
+        "role": "assistant",
+        "summary": _truncate_at_word(response.answer),
+        "domain": domain,
+        "sql_used": response.sql_query,
+    })

@@ -1,11 +1,8 @@
 """Shared pytest fixtures."""
 from __future__ import annotations
 
-import json
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -15,7 +12,6 @@ from observibot.connectors.base import (
     Capability,
     ConnectorCapabilities,
 )
-from observibot.core.config import load_config
 from observibot.core.models import (
     ChangeEvent,
     HealthStatus,
@@ -27,7 +23,6 @@ from observibot.core.models import (
     TableInfo,
 )
 from observibot.core.store import Store
-
 
 EXAMPLE_TABLES = [
     TableInfo(
@@ -146,7 +141,7 @@ EXAMPLE_SERVICES = [
         type="web",
         environment="production",
         status="SUCCESS",
-        last_deploy_at=datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc),
+        last_deploy_at=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
         last_deploy_id="dep-001",
     ),
     ServiceInfo(
@@ -154,7 +149,7 @@ EXAMPLE_SERVICES = [
         type="worker",
         environment="production",
         status="SUCCESS",
-        last_deploy_at=datetime(2026, 4, 1, 11, 0, tzinfo=timezone.utc),
+        last_deploy_at=datetime(2026, 4, 1, 11, 0, tzinfo=UTC),
         last_deploy_id="dep-002",
     ),
 ]
@@ -193,7 +188,7 @@ class FakeSupabaseConnector(BaseConnector):
 
     async def collect_metrics(self) -> list[MetricSnapshot]:
         self.metrics_calls += 1
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         metrics = []
         for table in EXAMPLE_TABLES:
             metrics.append(
@@ -255,7 +250,7 @@ class FakeRailwayConnector(BaseConnector):
         )
 
     async def collect_metrics(self) -> list[MetricSnapshot]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return [
             MetricSnapshot(
                 connector_name=self.name,
@@ -273,7 +268,7 @@ class FakeRailwayConnector(BaseConnector):
                 event_type="deploy",
                 summary="web deploy SUCCESS",
                 details={"service": "web"},
-                occurred_at=datetime.now(timezone.utc),
+                occurred_at=datetime.now(UTC),
             )
         ]
 
@@ -364,5 +359,5 @@ def make_metric(
         metric_name=name,
         value=value,
         labels=labels or {},
-        collected_at=datetime.now(timezone.utc) - timedelta(seconds=offset_seconds),
+        collected_at=datetime.now(UTC) - timedelta(seconds=offset_seconds),
     )

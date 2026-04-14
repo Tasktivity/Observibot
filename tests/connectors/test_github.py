@@ -1,11 +1,8 @@
 """Tests for GitHubConnector with mocked httpx responses."""
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from observibot.connectors.base import Capability
 from observibot.connectors.github import GitHubConnector
@@ -133,7 +130,7 @@ class TestConditionalRequests:
         assert "/repos/owner/testrepo" in conn._etags
 
         mock_client.get.return_value = _mock_response(status_code=304)
-        fragment = await conn.discover()
+        await conn.discover()
         call_headers = mock_client.get.call_args_list[-1].kwargs.get("headers", {})
         assert call_headers.get("If-None-Match") == '"etag123"'
 
@@ -147,7 +144,7 @@ class TestRateLimitBackoff:
         )
         conn._client = mock_client
 
-        fragment = await conn.discover()
+        await conn.discover()
         assert conn._backed_off_until is not None
 
     async def test_consecutive_failures_trigger_backoff(self):
@@ -200,9 +197,10 @@ class TestConnectorRegistration:
 
     def test_system_boots_without_github(self):
         """Config with no github section should work fine."""
-        from observibot.core.config import load_config
-        import tempfile
         import os
+        import tempfile
+
+        from observibot.core.config import load_config
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("llm:\n  provider: mock\nconnectors: []\n")
             f.flush()

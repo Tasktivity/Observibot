@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from observibot.core.models import (
     ChangeEvent,
@@ -69,7 +69,7 @@ def test_metric_snapshot_roundtrip() -> None:
         metric_name="x",
         value=1.23,
         labels={"table": "users"},
-        collected_at=datetime(2026, 4, 10, 12, tzinfo=timezone.utc),
+        collected_at=datetime(2026, 4, 10, 12, tzinfo=UTC),
     )
     restored = MetricSnapshot.from_dict(m.to_dict())
     assert restored.value == 1.23
@@ -142,7 +142,7 @@ def test_service_info_roundtrip() -> None:
         type="web",
         environment="prod",
         status="SUCCESS",
-        last_deploy_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
+        last_deploy_at=datetime(2026, 4, 10, tzinfo=UTC),
     )
     assert ServiceInfo.from_dict(s.to_dict()).last_deploy_at == s.last_deploy_at
 
