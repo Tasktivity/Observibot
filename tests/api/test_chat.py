@@ -204,3 +204,61 @@ async def test_empty_results_narrative(chat_client):
     )
     data = resp.json()
     assert "Found 0" not in data["answer"]
+
+
+# H7: explicit fallback signal
+
+
+async def test_no_llm_response_has_fallback_true(chat_client):
+    """When no analyzer is configured, the response must flag fallback=True."""
+    client, _ = chat_client
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "Show me recent metrics"},
+    )
+    data = resp.json()
+    assert data["fallback"] is True
+
+
+async def test_llm_response_has_fallback_false(chat_client_with_llm):
+    """A successful agentic response must NOT be flagged as a fallback."""
+    client, _ = chat_client_with_llm
+    resp = await client.post(
+        "/api/chat/query",
+        json={"question": "What do my metrics look like?"},
+    )
+    data = resp.json()
+    assert data["fallback"] is False
+
+
+async def test_hard_llm_failure_marks_fallback(tmp_path: Path):
+    """LLMHardError falls through to deterministic and must set fallback=True."""
+    from observibot.agent.llm_provider import LLMHardError
+
+    class HardFailProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise LLMHardError("auth failed")
+
+    db_path = tmp_path / "chat_hard_fail.db"
+    async with Store(db_path) as store:
+        set_store(store)
+        analyzer = Analyzer(
+            provider=HardFailProvider(model="mock"), store=store,
+        )
+        set_analyzer(analyzer)
+        app = create_app()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(
+                "/api/auth/register",
+                json={"email": "h@test.com", "password": "pass"},
+            )
+            resp = await client.post(
+                "/api/chat/query",
+                json={"question": "Show metrics"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["fallback"] is True
+            assert any("LLM provider error" in w for w in data.get("warnings", []))
+        set_analyzer(None)

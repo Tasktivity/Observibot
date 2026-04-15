@@ -11,9 +11,18 @@ export const Dashboard = forwardRef<DashboardHandle>(function Dashboard(_props, 
   const [widgets, setWidgets] = useState<Widget[]>([]);
   const [viewOverrides, setViewOverrides] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const loadWidgets = useCallback(() => {
-    api.widgets.list().then(setWidgets).catch(() => {}).finally(() => setLoading(false));
+    api.widgets.list()
+      .then((data) => {
+        setWidgets(data);
+        setError(null);
+      })
+      .catch((err: Error) =>
+        setError(err.message ?? 'Failed to load widgets'),
+      )
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => { loadWidgets(); }, [loadWidgets]);
@@ -35,6 +44,14 @@ export const Dashboard = forwardRef<DashboardHandle>(function Dashboard(_props, 
         Static Dashboard
       </h2>
       <div className="flex-1 overflow-y-auto">
+        {error && (
+          <div
+            className="p-3 mb-3 text-amber-400 bg-amber-900/20 border border-amber-500/20 rounded text-sm"
+            role="alert"
+          >
+            Failed to load widgets: {error}
+          </div>
+        )}
         {loading && <p className="text-slate-500 text-sm">Loading widgets...</p>}
         {!loading && widgets.length === 0 && (
           <div className="flex items-center justify-center h-full">

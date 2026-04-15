@@ -11,7 +11,7 @@ from observibot.api.app import create_app
 from observibot.api.deps import set_store
 from observibot.api.session_store import MAX_TURNS, SessionStore
 
-# MAX_TURNS = 10 (5 exchanges × 2 entries)
+# MAX_TURNS = 5 (each turn is now a full exchange — Step 2 structured turns)
 from observibot.core.store import Store
 
 pytestmark = pytest.mark.asyncio
@@ -92,17 +92,19 @@ def test_add_turn_to_nonexistent_session():
 
 
 def test_five_full_exchanges_preserved():
-    """Fix 6: 5 full exchanges (10 messages) should all be preserved."""
+    """Step 2 structured turns: 5 exchanges = 5 records, not 10."""
     store = SessionStore()
     session = store.create_session("user-1")
     for i in range(5):
-        store.add_turn(session.session_id, {"role": "user", "summary": f"q{i}"})
-        store.add_turn(session.session_id, {"role": "assistant", "summary": f"a{i}"})
+        store.add_turn(session.session_id, {
+            "question_summary": f"q{i}",
+            "answer_summary": f"a{i}",
+            "entities": {"domain": "observability"},
+        })
     context = store.get_context(session.session_id)
-    assert len(context) == 10
-    user_msgs = [t for t in context if t["role"] == "user"]
-    assert len(user_msgs) == 5
-    assert [t["summary"] for t in user_msgs] == ["q0", "q1", "q2", "q3", "q4"]
+    assert len(context) == 5
+    assert [t["question_summary"] for t in context] == ["q0", "q1", "q2", "q3", "q4"]
+    assert [t["answer_summary"] for t in context] == ["a0", "a1", "a2", "a3", "a4"]
 
 
 def test_session_ownership_enforced():

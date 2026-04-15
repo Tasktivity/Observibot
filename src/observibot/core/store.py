@@ -1431,6 +1431,236 @@ class Store:
                 .values(is_active=False, updated_at=_utcnow_iso())
             )
 
+    async def get_semantic_facts_filtered(
+        self,
+        source: str | None = None,
+        fact_type: str | None = None,
+        active_only: bool = True,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Query facts with optional filters.
+
+        ``search`` performs FTS5 on SQLite and a simple ILIKE over
+        concept/claim on PostgreSQL. Results are ordered by confidence desc.
+        ``offset`` supports pagination ("Load more") in the Agent Memory tab.
+        """
+        cols = [
+            semantic_facts.c.id,
+            semantic_facts.c.fact_type,
+            semantic_facts.c.concept,
+            semantic_facts.c.claim,
+            semantic_facts.c.tables_json,
+            semantic_facts.c.columns_json,
+            semantic_facts.c.sql_condition,
+            semantic_facts.c.source,
+            semantic_facts.c.confidence,
+            semantic_facts.c.is_active,
+            semantic_facts.c.created_at,
+            semantic_facts.c.updated_at,
+        ]
+
+        if search and "sqlite" in str(self.engine.url):
+            # FTS5 path — join against the virtual table.
+            from observibot.core.code_intelligence.retrieval import (
+                build_fts5_query,
+            )
+            fts_query = build_fts5_query(search)
+            where_clauses = ["semantic_facts_fts MATCH :q"]
+            params: dict[str, Any] = {"q": fts_query, "limit": limit, "offset": offset}
+            if active_only:
+                where_clauses.append("s.is_active = 1")
+            if source:
+                where_clauses.append("s.source = :source")
+                params["source"] = source
+            if fact_type:
+                where_clauses.append("s.fact_type = :fact_type")
+                params["fact_type"] = fact_type
+            sql = sa.text(
+                "SELECT s.id, s.fact_type, s.concept, s.claim, "
+                "s.tables_json, s.columns_json, s.sql_condition, "
+                "s.source, s.confidence, s.is_active, "
+                "s.created_at, s.updated_at "
+                "FROM semantic_facts s "
+                "JOIN semantic_facts_fts f ON s.rowid = f.rowid "
+                f"WHERE {' AND '.join(where_clauses)} "
+                "ORDER BY s.confidence DESC "
+                "LIMIT :limit OFFSET :offset"
+            )
+            async with self.engine.begin() as conn:
+                result = await conn.execute(sql, params)
+                rows = result.fetchall()
+        else:
+            stmt = sa.select(*cols)
+            if active_only:
+                stmt = stmt.where(semantic_facts.c.is_active == True)  # noqa: E712
+            if source:
+                stmt = stmt.where(semantic_facts.c.source == source)
+            if fact_type:
+                stmt = stmt.where(semantic_facts.c.fact_type == fact_type)
+            if search:
+                pattern = f"%{search}%"
+                stmt = stmt.where(
+                    sa.or_(
+                        semantic_facts.c.concept.ilike(pattern),
+                        semantic_facts.c.claim.ilike(pattern),
+                    )
+                )
+            stmt = stmt.order_by(semantic_facts.c.confidence.desc())
+            stmt = stmt.limit(limit).offset(offset)
+            async with self.engine.begin() as conn:
+                result = await conn.execute(stmt)
+                rows = result.fetchall()
+
+        return [
+            {
+                "id": r[0], "fact_type": r[1], "concept": r[2],
+                "claim": r[3],
+                "tables": json.loads(r[4]) if r[4] else [],
+                "columns": json.loads(r[5]) if r[5] else [],
+                "sql_condition": r[6], "source": r[7],
+                "confidence": r[8], "is_active": bool(r[9]),
+                "created_at": r[10], "updated_at": r[11],
+            }
+            for r in rows
+        ]
+
+    async def update_semantic_fact(
+        self,
+        fact_id: str,
+        *,
+        is_active: bool | None = None,
+        claim: str | None = None,
+        confidence: float | None = None,
+    ) -> dict | None:
+        """Patch a single fact. Returns the updated record, or None if missing."""
+        updates: dict[str, Any] = {"updated_at": _utcnow_iso()}
+        if is_active is not None:
+            updates["is_active"] = is_active
+        if claim is not None:
+            updates["claim"] = claim
+        if confidence is not None:
+            updates["confidence"] = float(confidence)
+
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                semantic_facts.update()
+                .where(semantic_facts.c.id == fact_id)
+                .values(**updates)
+            )
+            if result.rowcount == 0:
+                return None
+            # Refresh FTS row if claim changed on SQLite
+            if claim is not None and "sqlite" in str(self.engine.url):
+                await conn.execute(sa.text(
+                    "INSERT OR REPLACE INTO semantic_facts_fts"
+                    "(rowid, concept, claim, tables_json, columns_json) "
+                    "SELECT rowid, concept, claim, tables_json, columns_json "
+                    "FROM semantic_facts WHERE id = :id"
+                ), {"id": fact_id})
+
+            row_result = await conn.execute(
+                sa.select(
+                    semantic_facts.c.id,
+                    semantic_facts.c.fact_type,
+                    semantic_facts.c.concept,
+                    semantic_facts.c.claim,
+                    semantic_facts.c.tables_json,
+                    semantic_facts.c.columns_json,
+                    semantic_facts.c.sql_condition,
+                    semantic_facts.c.source,
+                    semantic_facts.c.confidence,
+                    semantic_facts.c.is_active,
+                    semantic_facts.c.created_at,
+                    semantic_facts.c.updated_at,
+                )
+                .where(semantic_facts.c.id == fact_id)
+            )
+            r = row_result.fetchone()
+        if r is None:
+            return None
+        return {
+            "id": r[0], "fact_type": r[1], "concept": r[2],
+            "claim": r[3],
+            "tables": json.loads(r[4]) if r[4] else [],
+            "columns": json.loads(r[5]) if r[5] else [],
+            "sql_condition": r[6], "source": r[7],
+            "confidence": r[8], "is_active": bool(r[9]),
+            "created_at": r[10], "updated_at": r[11],
+        }
+
+    async def delete_semantic_fact(self, fact_id: str) -> bool:
+        """Permanently remove a fact. Returns True if a row was deleted."""
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                semantic_facts.delete()
+                .where(semantic_facts.c.id == fact_id)
+            )
+            if "sqlite" in str(self.engine.url):
+                await conn.execute(sa.text(
+                    "DELETE FROM semantic_facts_fts WHERE rowid NOT IN "
+                    "(SELECT rowid FROM semantic_facts)"
+                ))
+        return bool(result.rowcount)
+
+    async def get_knowledge_stats(self) -> dict:
+        """Aggregate counts across all knowledge stores.
+
+        Cheap to call (one row per aggregate query). Intended for the Agent
+        Memory dashboard's top-of-page stats bar.
+        """
+        async with self.engine.begin() as conn:
+            by_source = await conn.execute(sa.text(
+                "SELECT source, COUNT(*) FROM semantic_facts "
+                "WHERE is_active = 1 GROUP BY source"
+            ))
+            facts_by_source = {row[0]: row[1] for row in by_source.fetchall()}
+
+            by_type = await conn.execute(sa.text(
+                "SELECT fact_type, COUNT(*) FROM semantic_facts "
+                "WHERE is_active = 1 GROUP BY fact_type"
+            ))
+            facts_by_type = {row[0]: row[1] for row in by_type.fetchall()}
+
+            active = await conn.execute(sa.text(
+                "SELECT COUNT(*) FROM semantic_facts WHERE is_active = 1"
+            ))
+            active_count = active.scalar() or 0
+
+            inactive = await conn.execute(sa.text(
+                "SELECT COUNT(*) FROM semantic_facts WHERE is_active = 0"
+            ))
+            inactive_count = inactive.scalar() or 0
+
+            fb_total = await conn.execute(sa.text(
+                "SELECT COUNT(*) FROM insight_feedback"
+            ))
+            feedback_total = fb_total.scalar() or 0
+
+            fb_by_outcome = await conn.execute(sa.text(
+                "SELECT outcome, COUNT(*) FROM insight_feedback GROUP BY outcome"
+            ))
+            feedback_by_outcome = {
+                row[0]: row[1] for row in fb_by_outcome.fetchall()
+            }
+
+            events_total = await conn.execute(sa.text(
+                "SELECT COUNT(*) FROM events"
+            ))
+            events_count = events_total.scalar() or 0
+
+        return {
+            "total_facts": active_count + inactive_count,
+            "active_facts": active_count,
+            "inactive_facts": inactive_count,
+            "facts_by_source": facts_by_source,
+            "facts_by_type": facts_by_type,
+            "total_feedback": feedback_total,
+            "feedback_by_outcome": feedback_by_outcome,
+            "total_events": events_count,
+        }
+
     async def save_user_correction(
         self, concept: str, claim: str,
         tables: list[str], columns: list[str],

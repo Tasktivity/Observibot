@@ -14,11 +14,16 @@ from observibot.agent.llm_provider import LLMHardError
 from observibot.api.deps import (
     get_analyzer,
     get_app_db,
+    get_chat_config,
     get_current_user,
     get_store,
 )
 from observibot.api.schemas import ChatRequest, ChatResponse
-from observibot.core.sql_sandbox import QueryValidationError, validate_query
+from observibot.core.sql_sandbox import (
+    DEFAULT_EXPLAIN_COST_THRESHOLD,
+    QueryValidationError,
+    validate_query,
+)
 from observibot.core.store import Store, query_cache
 
 log = logging.getLogger(__name__)
@@ -140,7 +145,9 @@ async def _deterministic_fallback(
     try:
         validated = validate_query(raw_sql, OBSERVABILITY_TABLES)
     except QueryValidationError as e:
-        return ChatResponse(answer=f"Query validation failed: {e}")
+        return ChatResponse(
+            answer=f"Query validation failed: {e}", fallback=True,
+        )
 
     sql_hash = _query_hash(validated)
     cached = await _check_cache(store, sql_hash)
@@ -155,6 +162,7 @@ async def _deterministic_fallback(
             sql_query=validated,
             execution_ms=cached["execution_ms"],
             domains_hit=["observability"],
+            fallback=True,
         )
 
     try:
@@ -164,7 +172,7 @@ async def _deterministic_fallback(
             columns = list(result.keys())
     except Exception as e:
         return ChatResponse(
-            answer=f"Query failed: {e}", sql_query=validated,
+            answer=f"Query failed: {e}", sql_query=validated, fallback=True,
         )
 
     elapsed_ms = (time.monotonic() - start) * 1000
@@ -185,6 +193,7 @@ async def _deterministic_fallback(
         execution_ms=round(elapsed_ms, 1),
         domains_hit=["observability"],
         warnings=["LLM not available — showing raw monitoring data."],
+        fallback=True,
     )
 
 
@@ -248,6 +257,14 @@ async def chat_query(
     app_db = get_app_db()
     system_model = await store.get_latest_system_snapshot()
 
+    chat_cfg = get_chat_config()
+    explain_threshold = float(
+        getattr(chat_cfg, "explain_cost_threshold", DEFAULT_EXPLAIN_COST_THRESHOLD)
+    )
+    stmt_timeout_ms = int(
+        getattr(chat_cfg, "statement_timeout_ms", 3000)
+    )
+
     try:
         from observibot.agent.chat_agent import run_chat_agent
         result = await run_chat_agent(
@@ -257,6 +274,8 @@ async def chat_query(
             app_db=app_db,
             system_model=system_model,
             session_context=session_context or None,
+            explain_cost_threshold=explain_threshold,
+            statement_timeout_ms=stmt_timeout_ms,
         )
     except LLMHardError as exc:
         # Hard provider failure (prompt too long, auth, quota) — do NOT fall
@@ -290,7 +309,7 @@ async def chat_query(
         warnings=result.warnings,
         session_id=session.session_id,
     )
-    _record_turn(session_store, session.session_id, req.question, resp)
+    _record_turn(session_store, session.session_id, req.question, resp, result)
 
     try:
         subject = result.domains_hit[0] if result.domains_hit else "general"
@@ -312,33 +331,39 @@ async def chat_query(
     return resp
 
 
-def _truncate_at_word(text: str, max_len: int = 200) -> str:
-    """Truncate text at a word boundary, not mid-word."""
-    if len(text) <= max_len:
-        return text
-    truncated = text[:max_len]
-    last_space = truncated.rfind(" ")
-    if last_space > max_len // 2:
-        return truncated[:last_space]
-    return truncated
-
-
 def _record_turn(
     session_store,
     session_id: str,
     question: str,
     response: ChatResponse,
+    result: object | None = None,
 ) -> None:
-    """Record a compressed turn in the session."""
-    domain = response.domains_hit[0] if response.domains_hit else None
+    """Record one exchange (question + answer + entities) as a single turn.
+
+    ``result`` is the optional ``ChatResult`` from the agentic pipeline. When
+    present, structured entities (table, domain, metric, timeframe, widget)
+    are extracted so future turns can resolve references like "break that
+    down". When absent (deterministic fallback path, LLM hard errors), we
+    still record the exchange but with sparse entities.
+    """
+    from observibot.agent.chat_agent import _extract_entities, _smart_truncate
+
+    if result is not None:
+        entities = _extract_entities(question, result)
+    else:
+        entities = {
+            "domain": response.domains_hit[0] if response.domains_hit else None,
+            "table": None,
+            "all_tables": None,
+            "metric": None,
+            "timeframe": None,
+            "widget_type": None,
+        }
+
     session_store.add_turn(session_id, {
-        "role": "user",
-        "summary": _truncate_at_word(question),
-        "domain": domain,
-    })
-    session_store.add_turn(session_id, {
-        "role": "assistant",
-        "summary": _truncate_at_word(response.answer),
-        "domain": domain,
-        "sql_used": response.sql_query,
+        "question_summary": _smart_truncate(question, 150),
+        "answer_summary": _smart_truncate(response.answer or "", 200),
+        "entities": entities,
+        "sql": response.sql_query,
+        "domain": entities.get("domain"),
     })

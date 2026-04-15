@@ -64,10 +64,14 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, r
       if (response.session_id) {
         setSessionId(response.session_id);
       }
-    } catch {
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Unknown error';
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Sorry, something went wrong.' },
+        {
+          role: 'assistant',
+          content: `Sorry, something went wrong: ${detail}`,
+        },
       ]);
     } finally {
       setLoading(false);
@@ -163,6 +167,16 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function Chat({ onPin }, r
                     {d}
                   </span>
                 ))}
+              </div>
+            )}
+
+            {msg.response?.fallback && (
+              <div
+                className="mt-2 px-2 py-1 bg-amber-500/10 border border-amber-500/30 rounded text-xs text-amber-300"
+                role="status"
+                data-testid="chat-fallback-banner"
+              >
+                ⚠ AI analysis unavailable — showing raw data
               </div>
             )}
 

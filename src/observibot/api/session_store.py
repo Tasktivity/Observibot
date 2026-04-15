@@ -23,7 +23,10 @@ class ChatSession:
 
 
 DEFAULT_TTL_SECONDS = 1800  # 30 minutes
-MAX_TURNS = 10  # 5 exchanges × 2 entries (user + assistant)
+# One turn is now a full exchange (question + answer + structured entities).
+# Phase 4.5 Step 2 rewrote _record_turn() to store a single record per exchange
+# instead of two (user + assistant) separate rows, so 5 turns = 5 exchanges.
+MAX_TURNS = 5
 
 
 class SessionStore:

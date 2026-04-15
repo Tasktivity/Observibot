@@ -236,11 +236,65 @@ async def test_chat_query_returns_results(app_client):
 
 
 async def test_insight_acknowledge(app_client):
-    client, _ = app_client
+    client, store = app_client
     await _register_and_login(client)
-    resp = await client.patch("/api/insights/some-id/ack")
+
+    # Ack for a non-existent insight should 404 now that we persist.
+    resp = await client.patch("/api/insights/does-not-exist/ack")
+    assert resp.status_code == 404
+
+    insight = Insight(
+        id="ins-ack-1",
+        severity="warning",
+        title="ack test",
+        summary="x",
+        source="anomaly",
+        confidence=0.5,
+        created_at=datetime.now(UTC),
+    )
+    await store.save_insight(insight)
+
+    resp = await client.patch(f"/api/insights/{insight.id}/ack")
     assert resp.status_code == 200
-    assert resp.json()["acknowledged"] is True
+    body = resp.json()
+    assert body["acknowledged"] is True
+    assert body["idempotent"] is False
+
+    fb = await store.get_insight_feedback(insight.id)
+    assert any(f["outcome"] == "acknowledged" for f in fb)
+
+    events = await store.get_events(limit=50)
+    assert any(
+        e["event_type"] == "feedback"
+        and e["subject"] == insight.id
+        and "acknowledged" in (e.get("summary") or "").lower()
+        for e in events
+    )
+
+
+async def test_insight_acknowledge_is_idempotent(app_client):
+    client, store = app_client
+    await _register_and_login(client)
+    insight = Insight(
+        id="ins-ack-2",
+        severity="warning",
+        title="ack idem",
+        summary="x",
+        source="anomaly",
+        confidence=0.5,
+        created_at=datetime.now(UTC),
+    )
+    await store.save_insight(insight)
+
+    r1 = await client.patch(f"/api/insights/{insight.id}/ack")
+    r2 = await client.patch(f"/api/insights/{insight.id}/ack")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r2.json()["idempotent"] is True
+
+    fb = await store.get_insight_feedback(insight.id)
+    ack_rows = [f for f in fb if f["outcome"] == "acknowledged"]
+    assert len(ack_rows) == 1
 
 
 async def test_openapi_docs_available(app_client):

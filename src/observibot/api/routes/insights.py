@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from observibot.api.deps import get_current_user, get_store
 from observibot.api.schemas import InsightFeedbackRequest, InsightFeedbackResponse, InsightResponse
-from observibot.core.store import Store
+from observibot.core.store import Store, insight_feedback
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +45,55 @@ async def list_insights(
 async def acknowledge_insight(
     insight_id: str,
     user: dict = Depends(get_current_user),
+    store: Store = Depends(get_store),
 ) -> dict:
-    return {"id": insight_id, "acknowledged": True}
+    """Persist user acknowledgement of an insight.
+
+    Until this lands, the frontend was hiding the card client-side while the
+    backend returned 200 without storing anything — a lie to the user. We now
+    record an ``acknowledged`` feedback row and emit an event so the
+    acknowledgement survives page refresh and leaves an audit trail.
+
+    Idempotent: a second ack for the same (user, insight) pair does not create
+    a duplicate row.
+    """
+    if await store.get_insight_by_id(insight_id) is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+
+    user_id = user.get("id")
+
+    async with store.engine.begin() as conn:
+        result = await conn.execute(
+            sa.select(insight_feedback.c.id)
+            .where(insight_feedback.c.insight_id == insight_id)
+            .where(insight_feedback.c.user_id == user_id)
+            .where(insight_feedback.c.outcome == "acknowledged")
+            .limit(1)
+        )
+        already_acked = result.fetchone() is not None
+
+    if already_acked:
+        return {"id": insight_id, "acknowledged": True, "idempotent": True}
+
+    record = await store.record_insight_feedback(
+        insight_id=insight_id,
+        user_id=user_id,
+        outcome="acknowledged",
+    )
+
+    try:
+        await store.emit_event(
+            event_type="feedback",
+            source="user",
+            subject=insight_id,
+            ref_table="insight_feedback",
+            ref_id=str(record["id"]),
+            summary="Insight acknowledged by user",
+        )
+    except Exception as exc:
+        log.debug("Failed to emit acknowledge event: %s", exc)
+
+    return {"id": insight_id, "acknowledged": True, "idempotent": False}
 
 
 @router.post("/{insight_id}/feedback")

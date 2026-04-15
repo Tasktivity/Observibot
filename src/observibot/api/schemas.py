@@ -5,7 +5,9 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-OUTCOME_TYPE = Literal["noise", "actionable", "investigating", "resolved"]
+OUTCOME_TYPE = Literal[
+    "noise", "actionable", "investigating", "resolved", "acknowledged",
+]
 
 
 class LoginRequest(BaseModel):
@@ -119,6 +121,10 @@ class ChatResponse(BaseModel):
     domains_hit: list[str] = []
     warnings: list[str] = []
     session_id: str = ""
+    # True when the LLM pipeline failed and the answer was produced by the
+    # deterministic keyword-SQL fallback. Frontend surfaces a visual indicator
+    # so users can tell "real LLM answer" from "fallback because things broke."
+    fallback: bool = False
 
 
 class SystemStatusResponse(BaseModel):
@@ -155,3 +161,50 @@ class MonitorIntervalsResponse(BaseModel):
 class MonitorIntervalsUpdate(BaseModel):
     collection_interval_seconds: int | None = None
     analysis_interval_seconds: int | None = None
+
+
+class SemanticFactResponse(BaseModel):
+    id: str
+    fact_type: str
+    concept: str
+    claim: str
+    tables: list[str] = []
+    columns: list[str] = []
+    sql_condition: str | None = None
+    source: str
+    confidence: float
+    is_active: bool
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class FactUpdateRequest(BaseModel):
+    is_active: bool | None = None
+    claim: str | None = None
+    confidence: float | None = None
+
+
+class BusinessContextEntry(BaseModel):
+    key: str
+    value: str  # JSON string or plain text
+
+
+class FeedbackSummaryResponse(BaseModel):
+    total: int
+    since_days: int
+    by_outcome: dict[str, int]
+    recent: list[dict]  # list of {insight_id, insight_title, outcome, note, created_at}
+
+
+class KnowledgeStatsResponse(BaseModel):
+    total_facts: int
+    active_facts: int
+    inactive_facts: int
+    facts_by_source: dict[str, int]
+    facts_by_type: dict[str, int]
+    total_feedback: int
+    feedback_by_outcome: dict[str, int]
+    total_events: int
+    code_intelligence_status: str
+    last_indexed_commit: str | None = None
+    last_index_time: str | None = None

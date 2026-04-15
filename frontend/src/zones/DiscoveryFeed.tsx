@@ -30,33 +30,58 @@ export function DiscoveryFeed({ onPromote, onInvestigate }: DiscoveryFeedProps) 
   const [summary, setSummary] = useState<SystemSummary | null>(null);
   const [acknowledgedIds, setAcknowledgedIds] = useState<Set<string>>(new Set());
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  const [ackError, setAckError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.insights.list(50).then((data) => {
-      setInsights(data);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    api.insights.list(50)
+      .then((data) => {
+        setInsights(data);
+        setError(null);
+      })
+      .catch((err: Error) =>
+        setError(err.message ?? 'Failed to load insights'),
+      )
+      .finally(() => setLoading(false));
 
-    api.discovery.model().then((data) => {
-      setSummary(data as unknown as SystemSummary);
-    }).catch(() => {});
+    api.discovery.model()
+      .then((data) => setSummary(data as unknown as SystemSummary))
+      .catch((err: Error) =>
+        console.error('[DiscoveryFeed] failed to load system model', err),
+      );
 
+    const POLL_INTERVAL_MS = 30_000;
     const interval = setInterval(() => {
-      api.insights.list(10).then((fresh) => {
-        setInsights((prev) => {
-          const existingIds = new Set(prev.map((i) => i.id));
-          const newOnes = fresh.filter((i) => !existingIds.has(i.id));
-          return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
-        });
-      }).catch(() => {});
-    }, 5000);
+      if (document.hidden) return;
+      api.insights.list(10)
+        .then((fresh) => {
+          setInsights((prev) => {
+            const existingIds = new Set(prev.map((i) => i.id));
+            const newOnes = fresh.filter((i) => !existingIds.has(i.id));
+            return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
+          });
+          setError(null);
+        })
+        .catch((err: Error) =>
+          setError(err.message ?? 'Failed to refresh insights'),
+        );
+    }, POLL_INTERVAL_MS);
 
     return () => clearInterval(interval);
   }, []);
 
   const handleAcknowledge = useCallback((insight: Insight) => {
-    api.insights.ack(insight.id).catch(() => {});
+    // Optimistic hide — then roll back on failure so the user isn't lied to.
     setAcknowledgedIds((prev) => new Set(prev).add(insight.id));
+    setAckError(null);
+    api.insights.ack(insight.id).catch((err: Error) => {
+      setAcknowledgedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(insight.id);
+        return next;
+      });
+      setAckError(err.message ?? 'Failed to acknowledge insight');
+    });
   }, []);
 
   const handlePinToFeed = useCallback((insight: Insight) => {
@@ -87,6 +112,22 @@ export function DiscoveryFeed({ onPromote, onInvestigate }: DiscoveryFeedProps) 
         Dynamic Discovery Feed
       </h2>
       <div className="flex-1 overflow-y-auto space-y-3 pr-1">
+        {error && (
+          <div
+            className="p-3 text-amber-400 bg-amber-900/20 border border-amber-500/20 rounded text-sm"
+            role="alert"
+          >
+            Failed to load insights: {error}
+          </div>
+        )}
+        {ackError && (
+          <div
+            className="p-3 text-red-400 bg-red-900/20 border border-red-500/20 rounded text-sm"
+            role="alert"
+          >
+            {ackError}
+          </div>
+        )}
         {loading && <p className="text-slate-500 text-sm">Loading insights...</p>}
 
         {!loading && visibleInsights.length === 0 && summary && (

@@ -104,6 +104,7 @@ export interface ChatResponse {
   domains_hit: string[];
   warnings: string[];
   session_id: string;
+  fallback: boolean;
 }
 
 export interface InsightFeedback {
@@ -118,6 +119,60 @@ export interface InsightFeedback {
 export interface MonitorIntervals {
   collection_interval_seconds: number;
   analysis_interval_seconds: number;
+}
+
+export interface SemanticFact {
+  id: string;
+  fact_type: string;
+  concept: string;
+  claim: string;
+  tables: string[];
+  columns: string[];
+  sql_condition: string | null;
+  source: string;
+  confidence: number;
+  is_active: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface FactUpdate {
+  is_active?: boolean;
+  claim?: string;
+  confidence?: number;
+}
+
+export interface BusinessContextEntry {
+  key: string;
+  value: string;
+}
+
+export interface FeedbackSummary {
+  total: number;
+  since_days: number;
+  by_outcome: Record<string, number>;
+  recent: {
+    id: number;
+    insight_id: string;
+    insight_title: string;
+    outcome: string;
+    note: string | null;
+    created_at: string;
+  }[];
+}
+
+export interface KnowledgeStats {
+  total_facts: number;
+  active_facts: number;
+  inactive_facts: number;
+  facts_by_source: Record<string, number>;
+  facts_by_type: Record<string, number>;
+  total_feedback: number;
+  feedback_by_outcome: Record<string, number>;
+  total_events: number;
+  code_intelligence_status: string;
+  last_indexed_commit: string | null;
+  last_index_time: string | null;
 }
 
 export const api = {
@@ -208,5 +263,38 @@ export const api = {
   },
   discovery: {
     model: () => request<Record<string, unknown>>('/discovery/model'),
+  },
+  knowledge: {
+    facts: (params?: {
+      source?: string;
+      fact_type?: string;
+      active_only?: boolean;
+      search?: string;
+      limit?: number;
+      offset?: number;
+    }) => {
+      const q = new URLSearchParams();
+      if (params?.source) q.set('source', params.source);
+      if (params?.fact_type) q.set('fact_type', params.fact_type);
+      if (params?.active_only !== undefined) q.set('active_only', String(params.active_only));
+      if (params?.search) q.set('search', params.search);
+      if (params?.limit) q.set('limit', String(params.limit));
+      if (params?.offset) q.set('offset', String(params.offset));
+      const qs = q.toString();
+      return request<SemanticFact[]>(`/knowledge/facts${qs ? `?${qs}` : ''}`);
+    },
+    updateFact: (id: string, data: FactUpdate) =>
+      request<SemanticFact>(`/knowledge/facts/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    deleteFact: (id: string) =>
+      request<{ id: string; deleted: boolean }>(`/knowledge/facts/${id}`, {
+        method: 'DELETE',
+      }),
+    stats: () => request<KnowledgeStats>('/knowledge/stats'),
+    feedbackSummary: (days = 30, limit = 20) =>
+      request<FeedbackSummary>(`/knowledge/feedback-summary?days=${days}&limit=${limit}`),
+    context: () => request<BusinessContextEntry[]>('/knowledge/context'),
   },
 };

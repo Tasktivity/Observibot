@@ -17,7 +17,9 @@ export function ChatVisualization({ spec }: ChatVisualizationProps) {
           background: 'transparent',
           axis: { labelColor: '#94a3b8', titleColor: '#94a3b8' },
         },
-      }).catch(() => {});
+      }).catch((err: Error) =>
+        console.error('[ChatVisualization] vega-embed failed', err),
+      );
     }
   }, [spec]);
 

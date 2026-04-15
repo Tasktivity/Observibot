@@ -58,12 +58,22 @@ function IntervalSelect({
   );
 }
 
-export function Layout({ children }: { children: ReactNode }) {
+export function Layout({
+  children,
+  headerSlot,
+}: {
+  children: ReactNode;
+  headerSlot?: ReactNode;
+}) {
   const { user, logout } = useAuth();
   const [intervals, setIntervals] = useState<MonitorIntervals | null>(null);
 
   useEffect(() => {
-    api.system.intervals().then(setIntervals).catch(() => {});
+    api.system.intervals()
+      .then(setIntervals)
+      .catch((err: Error) =>
+        console.error('[Layout] failed to load intervals', err),
+      );
   }, []);
 
   const handleCollectionChange = useCallback(
@@ -81,7 +91,9 @@ export function Layout({ children }: { children: ReactNode }) {
           collection_interval_seconds: value,
           ...(needsBump ? { analysis_interval_seconds: newAnalysis } : {}),
         };
-        api.system.updateIntervals(update).catch(() => {});
+        api.system.updateIntervals(update).catch((err: Error) =>
+          console.error('[Layout] failed to update intervals', err),
+        );
         return { ...prev, collection_interval_seconds: value, analysis_interval_seconds: newAnalysis };
       });
     },
@@ -90,7 +102,10 @@ export function Layout({ children }: { children: ReactNode }) {
 
   const handleAnalysisChange = useCallback(
     (value: number) => {
-      api.system.updateIntervals({ analysis_interval_seconds: value }).catch(() => {});
+      api.system.updateIntervals({ analysis_interval_seconds: value }).catch(
+        (err: Error) =>
+          console.error('[Layout] failed to update analysis interval', err),
+      );
       setIntervals((prev) => prev ? { ...prev, analysis_interval_seconds: value } : prev);
     },
     [],
@@ -106,6 +121,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-bold text-sky-400">Observibot</h1>
           <span className="text-xs text-slate-500">AI SRE Dashboard</span>
+          {headerSlot && <div className="ml-3">{headerSlot}</div>}
         </div>
         {intervals && (
           <div className="flex items-center gap-4">

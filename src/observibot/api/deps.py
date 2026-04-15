@@ -19,6 +19,7 @@ _store_instance: Store | None = None
 _analyzer_instance: object | None = None
 _app_db_instance: object | None = None
 _monitor_loop_instance: object | None = None
+_chat_config_instance: object | None = None
 
 
 def _get_secret_key() -> str:
@@ -65,6 +66,17 @@ def set_monitor_loop(monitor_loop: object) -> None:
 def get_monitor_loop():
     """Return the shared MonitorLoop, or None if not running."""
     return _monitor_loop_instance
+
+
+def set_chat_config(chat_config: object) -> None:
+    """Set the shared ChatConfig instance used by the chat route."""
+    global _chat_config_instance
+    _chat_config_instance = chat_config
+
+
+def get_chat_config():
+    """Return the shared ChatConfig, or None if monitor hasn't registered one."""
+    return _chat_config_instance
 
 
 async def get_store() -> Store:
