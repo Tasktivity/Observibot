@@ -34,8 +34,8 @@ def build_app_schema_description(
     Pipeline-audit Fix 3: when ``question`` is provided, score tables by
     keyword overlap and emit the top-N with full column detail PLUS a thin
     index (name + row count) for the remaining tables. This prevents the
-    old alphabetical cut from silently dropping high-value views (e.g.
-    v_pilot_*) past index 50.
+    old alphabetical cut from silently dropping high-value aggregate views
+    (e.g. anything starting with ``v_*``) past index 50.
 
     When ``question`` is None we keep the legacy behaviour: alphabetical,
     full detail for the first ``full_detail_tables`` and a thin index for

@@ -280,13 +280,13 @@ class TestRetrievalRankingAndBudget:
         """Default max_facts=10 (was 5), max_tokens=3000 (was 1500)."""
         for i in range(20):
             await ci_store.save_semantic_fact(_make_fact(
-                concept=f"pilot_metric_{i}",
-                claim=f"pilot metric definition number {i}",
+                concept=f"order_metric_{i}",
+                claim=f"order metric definition number {i}",
                 source=FactSource.SCHEMA_ANALYSIS,
             ))
 
         service = CodeKnowledgeService(ci_store)
-        facts = await service.get_context_for_question("pilot metric")
+        facts = await service.get_context_for_question("order metric")
         # New default lets up to 10 through (was capped at 5)
         assert len(facts) > 5
         assert len(facts) <= 10
@@ -303,14 +303,14 @@ class TestRetrievalRankingAndBudget:
         # Both schema_analysis (same source priority) — only FTS rank should
         # determine the ordering between them.
         relevant = _make_fact(
-            concept="pilot_sync_health",
-            claim="v_pilot_sync_health view tracks pilot sync errors",
+            concept="inventory_sync_health",
+            claim="v_inventory_sync_health view tracks inventory sync errors",
             source=FactSource.SCHEMA_ANALYSIS,
             confidence=0.6,
         )
         unrelated = _make_fact(
-            concept="generic_user",
-            claim="generic user record without pilot context",
+            concept="generic_record",
+            claim="generic record without inventory context",
             source=FactSource.SCHEMA_ANALYSIS,
             confidence=0.95,
         )
@@ -318,11 +318,11 @@ class TestRetrievalRankingAndBudget:
         await ci_store.save_semantic_fact(unrelated)
 
         service = CodeKnowledgeService(ci_store)
-        facts = await service.get_context_for_question("pilot sync errors")
+        facts = await service.get_context_for_question("inventory sync errors")
         assert facts, "FTS should return at least the relevant fact"
         # The FTS-most-relevant fact must rank first within its source bucket
         # even though it has a lower confidence score.
-        assert facts[0]["concept"] == "pilot_sync_health"
+        assert facts[0]["concept"] == "inventory_sync_health"
 
     async def test_user_corrections_still_outrank_fts(self, ci_store: Store):
         """Source priority still wins overall — corrections beat everything."""

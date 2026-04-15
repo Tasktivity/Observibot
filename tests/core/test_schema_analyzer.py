@@ -206,8 +206,9 @@ class TestSchemaDescriptionWithComments:
 class TestRelevanceRankedSchemaDescription:
     """Pipeline-audit Fix 3: prefer relevance ranking over alphabetical cut.
 
-    Why: the old alphabetical sort dropped the v_pilot_* analytics views past
-    index 50, which were exactly the tables an SRE would ask about.
+    Why: with a 50-table cap and an alphabetical sort, late-alphabetical
+    aggregate views (anything starting with v_*) get silently dropped —
+    yet those are usually the ones a question targets.
     """
 
     def _build_60_table_model(self) -> SystemModel:
@@ -225,11 +226,11 @@ class TestRelevanceRankedSchemaDescription:
                 row_count=10,
             ))
         view_names = [
-            "v_pilot_summary",
-            "v_pilot_sync_health",
-            "v_pilot_user_costs",
-            "v_pilot_user_list",
-            "v_pilot_weekly_retention",
+            "v_revenue_summary",
+            "v_revenue_by_region",
+            "v_customer_lifetime_value",
+            "v_customer_overview",
+            "v_subscription_retention",
             "v_platform_breakdown",
             "v_user_overview",
         ]
@@ -238,8 +239,8 @@ class TestRelevanceRankedSchemaDescription:
                 name=name,
                 schema="public",
                 columns=[
-                    {"name": "user_id", "type": "uuid"},
-                    {"name": "pilot_program", "type": "text"},
+                    {"name": "customer_id", "type": "uuid"},
+                    {"name": "segment", "type": "text"},
                     {"name": "metric_value", "type": "numeric"},
                 ],
                 row_count=100,
@@ -251,19 +252,19 @@ class TestRelevanceRankedSchemaDescription:
 
         model = self._build_60_table_model()
         desc = build_app_schema_description(
-            model, question="how are pilot users doing?",
+            model, question="how is customer revenue trending?",
         )
-        # The pilot views must appear with full column detail, not just in
-        # the thin index.
-        assert "v_pilot_user_list" in desc
-        assert "pilot_program (text)" in desc
+        # The customer/revenue views must appear with full column detail,
+        # not just in the thin index.
+        assert "v_customer_overview" in desc
+        assert "segment (text)" in desc
 
     def test_thin_index_lists_remaining_tables(self):
         from observibot.agent.schema_catalog import build_app_schema_description
 
         model = self._build_60_table_model()
         desc = build_app_schema_description(
-            model, question="how are pilot users doing?",
+            model, question="how is customer revenue trending?",
         )
         # Tables that lost the relevance race must still appear in the thin
         # index — none should be silently dropped.
@@ -290,6 +291,6 @@ class TestRelevanceRankedSchemaDescription:
         assert "audit_log_00" in desc
         # And every table is still represented somewhere (thin index)
         for name in [
-            "v_pilot_summary", "v_pilot_user_list", "v_user_overview",
+            "v_revenue_summary", "v_customer_overview", "v_user_overview",
         ]:
             assert name in desc
