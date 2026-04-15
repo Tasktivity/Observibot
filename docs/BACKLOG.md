@@ -77,8 +77,8 @@ All 6 prerequisites implemented. 339 tests passing (43 new, zero regressions).
 ### ~~Events Envelope (Tier 1)~~ ✅
 Unified episodic timeline. 387 tests passing.
 
-### Session Memory (Tier 3)
-Structured state + compressed turns for multi-turn chat resolution.
+### ~~Session Memory (Tier 3)~~ ✅
+Structured turns, multi-turn resolution, EXPLAIN gating, Agent Memory Inspector. 478 tests.
 
 ### Deterministic Experiential Retrieval
 Seasonal MAD baselines (hour-of-week bucketing). Deterministic lookbacks

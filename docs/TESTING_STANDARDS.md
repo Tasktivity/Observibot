@@ -164,6 +164,49 @@ Every CC implementation report must include:
 A report that says "all tests pass" without live verification evidence
 is incomplete and must be sent back for proper verification.
 
+## External Architecture Reviews
+
+External AI reviews (Gemini, Claude Code, Codex, etc.) are mandatory before
+major milestones (phase completions, pre-Step-3 type boundaries). They
+consistently find issues that internal testing and CC implementation miss.
+
+Rules for crafting review prompts:
+- Give reviewers full repo access and specific file paths to read
+- Ask explicit questions (yes/no format forces concrete answers)
+- Tell them to read the actual code, not trust the summary
+- Ask about downstream impacts and unintended consequences
+- Bias toward "fix it now" — don't defer things that will bite later
+
+Review findings that surfaced real bugs in this project:
+- Railway GraphQL schema change (silent 400s for weeks)
+- 204k-token prompt overflow (silently retried 3×)
+- React error boundary missing (one crash blanks entire dashboard)
+- SQL sandbox schema-qualified bypass (auth.users accessible)
+- Freshness key mismatch (semantic facts never reached LLM)
+- Baseline contamination (current batch in own evaluation)
+- Alphabetical schema sort dropping high-value analytics views
+
+## Lessons Learned (Updated Periodically)
+
+1. **Token budgets are safety nets, not quality filters.** The 204k→4.9k
+   overcorrection fixed the overflow but starved the LLM. The real fix was
+   selection quality (relevance ranking, FTS preservation), not tighter caps.
+
+2. **Verify claims against source code.** A one-key mismatch
+   (last_extraction_at vs last_index_time) silenced semantic fact injection
+   for the entire project. CC never caught it. Always trace end-to-end.
+
+3. **Acceptance tests should not use hardcoded production values.** Data
+   changes (47→48 users). Use behavioral assertions instead.
+
+4. **CC will skip browser testing unless forced.** Every CC prompt must
+   include explicit Chrome DevTools MCP tool names and the instruction to
+   STOP and ask the user to log in. "N/A — requires browser" is not acceptable.
+
+5. **Silent failures are the most dangerous bugs.** Errors caught with
+   log.debug() and swallowed with .catch(() => {}) create invisible breakage.
+   Always surface errors to the user.
+
 ## Full System Verification Plan
 
 After major deliverables (step completions, hotfix passes), CC must execute

@@ -341,10 +341,18 @@ builds clean. Unified episodic timeline operational from first monitoring cycle.
 - Events API — 5 endpoints (list, subject, recurrence, search, timeline)
 - Discovery Feed recurrence annotations ("Seen N times in last 30 days")
 
-### Step 2 Deliverables (Session Memory — Tier 3)
-- Server-side session store with structured state + compressed turns
-- Multi-turn chat (pronoun resolution, query refinement)
-- Context injection into planning prompt (~1k token budget)
+### Step 2 Deliverables (Session Memory — Tier 3) ✅ COMPLETE
+Completed April 14, 2026. 478 tests passing (59 new), ruff clean, frontend
+builds clean. Browser-verified via Chrome DevTools MCP.
+
+- EXPLAIN cost gating + query timeouts (Layers 4-5 of 5-layer SQL sandbox)
+- Structured session turns with entity extraction (table, metric, domain, timeframe)
+- Token-budget-aware context building (~1k token cap, word-boundary truncation)
+- Multi-turn resolution instructions in PLANNING_PROMPT + conversation state block
+- Agent Memory Inspector tab: facts CRUD, knowledge stats, feedback summary,
+  events timeline, business context viewer
+- 6 API endpoints under /api/knowledge/*
+- Contract tests for Railway GraphQL and Supabase Metrics API response shapes
 
 ### Step 3 Deliverables (Deterministic Experiential Retrieval)
 - Seasonal MAD baselines (hour-of-week bucketing)
