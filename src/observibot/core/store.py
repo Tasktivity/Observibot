@@ -87,6 +87,7 @@ insights_table = Table(
     Column("source", String),
     Column("fingerprint", String),
     Column("created_at", String, nullable=False),
+    Column("recurrence_context", Text),
 )
 
 alert_history = Table(
@@ -123,16 +124,35 @@ llm_usage = Table(
     Column("recorded_at", String, nullable=False),
 )
 
-metric_baselines = Table(
-    "metric_baselines",
+seasonal_baselines = Table(
+    "seasonal_baselines",
     metadata,
-    Column("metric_name", String, primary_key=True),
-    Column("connector_name", String, primary_key=True),
-    Column("labels_key", String, primary_key=True),
+    Column("tenant_id", String, nullable=False, server_default="default"),
+    Column("metric_name", String, nullable=False),
+    Column("connector_name", String, nullable=False),
+    Column("labels_key", String, nullable=False),
+    Column("hour_of_week", Integer, nullable=False),
+    Column("samples_json", Text, nullable=False),
     Column("sample_count", Integer, nullable=False),
-    Column("mean", Float, nullable=False),
-    Column("stddev", Float, nullable=False),
+    Column("weeks_observed", Integer, nullable=False, server_default="0"),
+    Column("last_week", String),
+    Column("median", Float, nullable=False),
+    Column("mad", Float, nullable=False),
     Column("last_updated", String, nullable=False),
+)
+sa.Index(
+    "idx_seasonal_unique",
+    seasonal_baselines.c.tenant_id,
+    seasonal_baselines.c.metric_name,
+    seasonal_baselines.c.connector_name,
+    seasonal_baselines.c.labels_key,
+    seasonal_baselines.c.hour_of_week,
+    unique=True,
+)
+sa.Index(
+    "idx_seasonal_how",
+    seasonal_baselines.c.hour_of_week,
+    seasonal_baselines.c.weeks_observed,
 )
 
 # Phase 3 tables
@@ -553,6 +573,11 @@ class Store:
             )
             if result.fetchone() is not None:
                 return False
+            recurrence_json = (
+                json.dumps(insight.recurrence_context)
+                if insight.recurrence_context
+                else None
+            )
             stmt = (
                 _dialect_insert(insights_table, self.engine)
                 .values(
@@ -568,6 +593,7 @@ class Store:
                     source=insight.source,
                     fingerprint=insight.fingerprint,
                     created_at=insight.created_at.isoformat(),
+                    recurrence_context=recurrence_json,
                 )
                 .on_conflict_do_update(
                     index_elements=["id"],
@@ -583,6 +609,7 @@ class Store:
                         source=insight.source,
                         fingerprint=insight.fingerprint,
                         created_at=insight.created_at.isoformat(),
+                        recurrence_context=recurrence_json,
                     ),
                 )
             )
@@ -605,28 +632,36 @@ class Store:
                     insights_table.c.source,
                     insights_table.c.fingerprint,
                     insights_table.c.created_at,
+                    insights_table.c.recurrence_context,
                 )
                 .order_by(insights_table.c.created_at.desc())
                 .limit(limit)
             )
             rows = result.fetchall()
-        return [
-            Insight(
-                id=r[0],
-                severity=r[1],
-                title=r[2] or "",
-                summary=r[3] or "",
-                details=r[4] or "",
-                recommended_actions=json.loads(r[5]) if r[5] else [],
-                related_metrics=json.loads(r[6]) if r[6] else [],
-                related_tables=json.loads(r[7]) if r[7] else [],
-                confidence=r[8] if r[8] is not None else 0.5,
-                source=r[9] or "llm",
-                fingerprint=r[10] or "",
-                created_at=datetime.fromisoformat(r[11]),
+        insights: list[Insight] = []
+        for r in rows:
+            try:
+                recurrence = json.loads(r[12]) if r[12] else None
+            except (json.JSONDecodeError, TypeError):
+                recurrence = None
+            insights.append(
+                Insight(
+                    id=r[0],
+                    severity=r[1],
+                    title=r[2] or "",
+                    summary=r[3] or "",
+                    details=r[4] or "",
+                    recommended_actions=json.loads(r[5]) if r[5] else [],
+                    related_metrics=json.loads(r[6]) if r[6] else [],
+                    related_tables=json.loads(r[7]) if r[7] else [],
+                    confidence=r[8] if r[8] is not None else 0.5,
+                    source=r[9] or "llm",
+                    fingerprint=r[10] or "",
+                    created_at=datetime.fromisoformat(r[11]),
+                    recurrence_context=recurrence,
+                )
             )
-            for r in rows
-        ]
+        return insights
 
     # ---------- alert history ----------
 
@@ -735,67 +770,6 @@ class Store:
             "total_tokens": int(row[1]) if row else 0,
             "cost_usd": float(row[2]) if row else 0.0,
             "since": since.isoformat(),
-        }
-
-    # ---------- baselines ----------
-
-    async def upsert_baseline(
-        self,
-        metric_name: str,
-        connector_name: str,
-        labels: dict[str, str],
-        sample_count: int,
-        mean: float,
-        stddev: float,
-    ) -> None:
-        lk = _labels_key(labels)
-        async with self.engine.begin() as conn:
-            stmt = (
-                _dialect_insert(metric_baselines, self.engine)
-                .values(
-                    metric_name=metric_name,
-                    connector_name=connector_name,
-                    labels_key=lk,
-                    sample_count=sample_count,
-                    mean=mean,
-                    stddev=stddev,
-                    last_updated=_utcnow_iso(),
-                )
-                .on_conflict_do_update(
-                    index_elements=["metric_name", "connector_name", "labels_key"],
-                    set_=dict(
-                        sample_count=sample_count,
-                        mean=mean,
-                        stddev=stddev,
-                        last_updated=_utcnow_iso(),
-                    ),
-                )
-            )
-            await conn.execute(stmt)
-
-    async def get_baseline(
-        self, metric_name: str, connector_name: str, labels: dict[str, str]
-    ) -> dict[str, Any] | None:
-        async with self.engine.begin() as conn:
-            result = await conn.execute(
-                sa.select(
-                    metric_baselines.c.sample_count,
-                    metric_baselines.c.mean,
-                    metric_baselines.c.stddev,
-                    metric_baselines.c.last_updated,
-                )
-                .where(metric_baselines.c.metric_name == metric_name)
-                .where(metric_baselines.c.connector_name == connector_name)
-                .where(metric_baselines.c.labels_key == _labels_key(labels))
-            )
-            row = result.fetchone()
-        if row is None:
-            return None
-        return {
-            "sample_count": int(row[0]),
-            "mean": float(row[1]),
-            "stddev": float(row[2]),
-            "last_updated": row[3],
         }
 
     # ---------- monitor runs ----------
@@ -1214,6 +1188,245 @@ class Store:
             "first_seen": first_seen,
             "last_seen": last_seen,
             "common_hours": common_hours,
+        }
+
+    async def get_event_recurrence_summaries(
+        self,
+        subjects: list[str],
+        event_type: str = "anomaly",
+        days: int = 30,
+    ) -> dict[str, dict]:
+        """Batch version of get_event_recurrence_summary.
+
+        Executes a single ``WHERE subject IN (...)`` query and groups the
+        timestamps in Python. Subjects with zero matching events are omitted
+        from the result — callers should treat missing keys as "no recurrence".
+        """
+        if not subjects:
+            return {}
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        stmt = (
+            sa.select(
+                events_table.c.subject,
+                events_table.c.occurred_at,
+            )
+            .where(events_table.c.subject.in_(subjects))
+            .where(events_table.c.event_type == event_type)
+            .where(events_table.c.occurred_at >= cutoff)
+            .order_by(events_table.c.subject, events_table.c.occurred_at.asc())
+        )
+        async with self.engine.begin() as conn:
+            rows = (await conn.execute(stmt)).fetchall()
+
+        by_subject: dict[str, list[str]] = {}
+        for subj, ts in rows:
+            by_subject.setdefault(subj, []).append(ts)
+
+        result: dict[str, dict] = {}
+        for subj, timestamps in by_subject.items():
+            hour_counts: dict[int, int] = {}
+            for ts in timestamps:
+                try:
+                    h = datetime.fromisoformat(ts).hour
+                    hour_counts[h] = hour_counts.get(h, 0) + 1
+                except (ValueError, TypeError):
+                    pass
+            max_count = max(hour_counts.values()) if hour_counts else 0
+            common_hours = (
+                sorted(h for h, c in hour_counts.items() if c == max_count)
+                if max_count > 0
+                else []
+            )
+            result[subj] = {
+                "count": len(timestamps),
+                "first_seen": timestamps[0],
+                "last_seen": timestamps[-1],
+                "common_hours": common_hours,
+            }
+        return result
+
+    # ---------- seasonal baselines ----------
+
+    async def fetch_seasonal_buckets(
+        self,
+        bucket_keys: list[tuple],
+    ) -> dict[tuple, dict]:
+        """Batch-fetch existing seasonal bucket state.
+
+        Keys are ``(metric_name, connector_name, labels_key, hour_of_week)``.
+        Returns a dict mapping each found key to
+        ``{"samples": list[float], "weeks_observed": int, "last_week": str|None}``.
+        Missing buckets are absent from the result.
+        """
+        if not bucket_keys:
+            return {}
+        clauses = [
+            sa.and_(
+                seasonal_baselines.c.metric_name == k[0],
+                seasonal_baselines.c.connector_name == k[1],
+                seasonal_baselines.c.labels_key == k[2],
+                seasonal_baselines.c.hour_of_week == k[3],
+            )
+            for k in bucket_keys
+        ]
+        stmt = sa.select(
+            seasonal_baselines.c.metric_name,
+            seasonal_baselines.c.connector_name,
+            seasonal_baselines.c.labels_key,
+            seasonal_baselines.c.hour_of_week,
+            seasonal_baselines.c.samples_json,
+            seasonal_baselines.c.weeks_observed,
+            seasonal_baselines.c.last_week,
+        ).where(sa.or_(*clauses))
+        async with self.engine.begin() as conn:
+            rows = (await conn.execute(stmt)).fetchall()
+
+        out: dict[tuple, dict] = {}
+        for r in rows:
+            key = (r[0], r[1], r[2], r[3])
+            try:
+                samples = json.loads(r[4]) if r[4] else []
+            except (json.JSONDecodeError, TypeError):
+                samples = []
+            out[key] = {
+                "samples": [
+                    float(v) for v in samples if isinstance(v, (int, float))
+                ],
+                "weeks_observed": int(r[5] or 0),
+                "last_week": r[6],
+            }
+        return out
+
+    async def bulk_upsert_seasonal_baselines(self, rows: list[dict]) -> int:
+        """Bulk-upsert seasonal baseline buckets in one DB round-trip.
+
+        Each row dict must include: metric_name, connector_name, labels_key,
+        hour_of_week, samples_json, sample_count, weeks_observed, last_week,
+        median, mad.
+        """
+        if not rows:
+            return 0
+        now_iso = _utcnow_iso()
+        values = [
+            {
+                "tenant_id": "default",
+                "metric_name": r["metric_name"],
+                "connector_name": r["connector_name"],
+                "labels_key": r["labels_key"],
+                "hour_of_week": r["hour_of_week"],
+                "samples_json": r["samples_json"],
+                "sample_count": r["sample_count"],
+                "weeks_observed": r["weeks_observed"],
+                "last_week": r.get("last_week"),
+                "median": r["median"],
+                "mad": r["mad"],
+                "last_updated": now_iso,
+            }
+            for r in rows
+        ]
+        insert_stmt = _dialect_insert(seasonal_baselines, self.engine)
+        excluded = insert_stmt.excluded
+        update_cols = (
+            "samples_json",
+            "sample_count",
+            "weeks_observed",
+            "last_week",
+            "median",
+            "mad",
+            "last_updated",
+        )
+        stmt = insert_stmt.values(values).on_conflict_do_update(
+            index_elements=[
+                "tenant_id",
+                "metric_name",
+                "connector_name",
+                "labels_key",
+                "hour_of_week",
+            ],
+            set_={col: getattr(excluded, col) for col in update_cols},
+        )
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or len(rows)
+
+    async def get_seasonal_baselines_for_hour(
+        self,
+        hour_of_week: int,
+        min_weeks_observed: int = 4,
+    ) -> dict[tuple, tuple[float, float, int]]:
+        """Return trusted seasonal baselines for a specific hour-of-week.
+
+        The returned dict is keyed by ``(metric_name, connector_name,
+        labels_key)`` (labels_key uses the seasonal identity-stripped form) and
+        maps to ``(median, mad, weeks_observed)``. Only buckets with
+        ``weeks_observed >= min_weeks_observed`` are returned — callers fall
+        back to rolling-window MAD for missing entries.
+        """
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(
+                    seasonal_baselines.c.metric_name,
+                    seasonal_baselines.c.connector_name,
+                    seasonal_baselines.c.labels_key,
+                    seasonal_baselines.c.median,
+                    seasonal_baselines.c.mad,
+                    seasonal_baselines.c.weeks_observed,
+                )
+                .where(seasonal_baselines.c.hour_of_week == hour_of_week)
+                .where(
+                    seasonal_baselines.c.weeks_observed >= min_weeks_observed
+                )
+            )
+            rows = result.fetchall()
+        return {
+            (r[0], r[1], r[2]): (float(r[3]), float(r[4]), int(r[5]))
+            for r in rows
+        }
+
+    async def get_seasonal_coverage(
+        self, min_weeks_observed: int = 4
+    ) -> dict[str, Any]:
+        """Return coverage stats for the Agent Memory Inspector.
+
+        Shape: ``{total_buckets, trusted_buckets, pct_trusted,
+        oldest_bucket_age_days}``.
+        """
+        async with self.engine.begin() as conn:
+            total = (
+                await conn.execute(
+                    sa.select(sa.func.count()).select_from(seasonal_baselines)
+                )
+            ).scalar() or 0
+            trusted = (
+                await conn.execute(
+                    sa.select(sa.func.count())
+                    .select_from(seasonal_baselines)
+                    .where(
+                        seasonal_baselines.c.weeks_observed
+                        >= min_weeks_observed
+                    )
+                )
+            ).scalar() or 0
+            oldest_iso = (
+                await conn.execute(
+                    sa.select(sa.func.min(seasonal_baselines.c.last_updated))
+                )
+            ).scalar()
+
+        oldest_age_days: float | None = None
+        if oldest_iso:
+            try:
+                delta = datetime.now(UTC) - datetime.fromisoformat(oldest_iso)
+                oldest_age_days = round(delta.total_seconds() / 86400.0, 2)
+            except (ValueError, TypeError):
+                oldest_age_days = None
+
+        return {
+            "total_buckets": int(total),
+            "trusted_buckets": int(trusted),
+            "pct_trusted": round(100 * trusted / total, 1) if total else 0.0,
+            "oldest_bucket_age_days": oldest_age_days,
+            "min_weeks_observed": int(min_weeks_observed),
         }
 
     # ---------- semantic facts ----------

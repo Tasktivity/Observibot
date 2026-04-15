@@ -77,6 +77,26 @@ def summarize_anomalies(anomalies: Iterable[Anomaly]) -> str:
     return "\n".join(rows) if rows else "(none)"
 
 
+def summarize_recurrence(recurrence: dict[str, dict] | None) -> str:
+    """Render recurrence context for the LLM anomaly-analysis prompt."""
+    if not recurrence:
+        return "(no recurrence history available)"
+    rows: list[str] = []
+    for metric, rec in sorted(recurrence.items()):
+        count = rec.get("count", 0)
+        if count <= 0:
+            continue
+        hrs = ", ".join(str(h) for h in rec.get("common_hours") or [])
+        line = f"  - {metric}: seen {count} times in last 30 days"
+        if hrs:
+            line += f", most common at hours [{hrs}] UTC"
+        last_seen = rec.get("last_seen")
+        if isinstance(last_seen, str) and len(last_seen) >= 10:
+            line += f", last seen {last_seen[:10]}"
+        rows.append(line)
+    return "\n".join(rows) if rows else "(no recurrence history available)"
+
+
 def summarize_changes(events: Iterable[ChangeEvent]) -> str:
     rows = [
         f"- {e.occurred_at.isoformat()} {e.connector_name} {e.event_type}: {e.summary}"
@@ -110,6 +130,7 @@ class Analyzer:
         system_model: SystemModel | None,
         recent_changes: list[ChangeEvent] | None = None,
         business_context: dict[str, Any] | None = None,
+        recurrence_context: dict[str, dict] | None = None,
     ) -> list[Insight]:
         """Produce :class:`Insight` objects for the given anomalies.
 
@@ -126,6 +147,7 @@ class Analyzer:
             return []
         prompt = ANOMALY_ANALYSIS_PROMPT.format(
             anomalies=summarize_anomalies(anomalies),
+            recurrence_history=summarize_recurrence(recurrence_context),
             changes=summarize_changes(recent_changes or []),
             business_context=json.dumps(business_context or {}, indent=2),
             system_summary=summarize_system(system_model),

@@ -33,7 +33,7 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 OBSERVABILITY_TABLES = {
     "system_snapshots", "metric_snapshots", "change_events",
     "insights", "alert_history", "business_context",
-    "llm_usage", "metric_baselines",
+    "llm_usage",
 }
 
 CACHE_TTL_SECONDS = 120
@@ -123,12 +123,6 @@ def _build_sql_for_question(question: str) -> str:
             "SELECT provider, model, total_tokens, cost_usd, recorded_at "
             "FROM llm_usage ORDER BY recorded_at DESC LIMIT 20"
         )
-    if "baseline" in q:
-        return (
-            "SELECT metric_name, connector_name, mean, stddev, "
-            "sample_count FROM metric_baselines LIMIT 20"
-        )
-
     return (
         "SELECT metric_name, value, collected_at "
         "FROM metric_snapshots ORDER BY collected_at DESC LIMIT 20"

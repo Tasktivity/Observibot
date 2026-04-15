@@ -110,14 +110,6 @@ async def test_llm_usage_summary(tmp_store) -> None:
     assert summary["total_tokens"] == 150
 
 
-async def test_baseline_upsert(tmp_store) -> None:
-    await tmp_store.upsert_baseline("x", "c", {"table": "t"}, 20, 10.0, 1.5)
-    row = await tmp_store.get_baseline("x", "c", {"table": "t"})
-    assert row is not None
-    assert row["mean"] == 10.0
-    assert row["stddev"] == 1.5
-
-
 async def test_retention_cleanup(tmp_store) -> None:
     now = datetime.now(UTC)
     # Old metric

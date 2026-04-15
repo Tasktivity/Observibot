@@ -25,6 +25,7 @@ from observibot.core.code_intelligence.schema_analyzer import analyze_schema_for
 from observibot.core.config import ObservibotConfig
 from observibot.core.discovery import DiscoveryEngine, diff_models
 from observibot.core.models import Insight, SystemModel
+from observibot.core.seasonal import compute_seasonal_updates, hour_of_week
 from observibot.core.store import Store
 
 log = logging.getLogger(__name__)
@@ -677,10 +678,62 @@ class MonitorLoop:
             history = await self.store.get_metrics(
                 since=datetime.now(UTC) - baseline_window
             )
-            anomalies = self.detector.evaluate(history=history, latest=all_metrics)
+
+            # Isolated seasonal-lookup fetch: a transient read failure must
+            # NOT drop the whole cycle. An empty seasonal_lookup makes
+            # evaluate_seasonal() delegate to evaluate() unchanged.
+            try:
+                seasonal_lookup = await self.store.get_seasonal_baselines_for_hour(
+                    hour_of_week(started_at),
+                    min_weeks_observed=self.config.monitor.min_seasonal_weeks,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Seasonal baseline fetch failed, falling back to rolling: %s",
+                    exc,
+                )
+                seasonal_lookup = {}
+
+            strip_set = frozenset(self.config.monitor.seasonal_identity_labels)
+            anomalies = self.detector.evaluate_seasonal(
+                history=history,
+                latest=all_metrics,
+                seasonal_lookup=seasonal_lookup,
+                identity_strip_set=strip_set,
+            )
 
             if all_metrics:
                 await self.store.save_metrics(all_metrics)
+                try:
+                    n_updated = await compute_seasonal_updates(
+                        store=self.store,
+                        metrics=all_metrics,
+                        identity_strip_set=strip_set,
+                        max_samples=self.config.monitor.max_seasonal_samples,
+                    )
+                    if n_updated:
+                        await self._emit(
+                            "seasonal_update",
+                            "collection_cycle",
+                            "monitor_runs",
+                            run_id,
+                            severity="info",
+                            summary=f"Updated {n_updated} seasonal buckets",
+                            run_id=run_id,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "Seasonal baseline update failed (non-fatal): %s", exc
+                    )
+                    await self._emit(
+                        "seasonal_update",
+                        "collection_cycle",
+                        "monitor_runs",
+                        run_id,
+                        severity="warning",
+                        summary=f"Seasonal update failed: {exc}",
+                        run_id=run_id,
+                    )
             anomaly_count = len(anomalies)
             if anomalies:
                 log.info("Detected %s sustained anomalies", len(anomalies))
@@ -756,12 +809,28 @@ class MonitorLoop:
             since=datetime.now(UTC) - timedelta(hours=2)
         )
         business_context = await self.store.get_all_business_context()
+
+        # Batch recurrence lookup BEFORE the LLM call so the prompt can
+        # include historical context ("seen N times at this hour"). Per-subject
+        # queries would be N+1; the batch variant runs as a single WHERE IN.
+        anomaly_subjects = sorted({a.metric_name for a in anomalies})
+        try:
+            recurrence_map = await self.store.get_event_recurrence_summaries(
+                subjects=anomaly_subjects,
+                event_type="anomaly",
+                days=30,
+            )
+        except Exception as exc:
+            log.debug("Recurrence lookup failed (non-fatal): %s", exc)
+            recurrence_map = {}
+
         try:
             insights = await self.analyzer.analyze_anomalies(
                 anomalies=anomalies,
                 system_model=self._cached_model,
                 recent_changes=recent_changes,
                 business_context=business_context,
+                recurrence_context=recurrence_map,
             )
             self.circuit_breaker.record_success()
         except LLMHardError as exc:
@@ -774,17 +843,14 @@ class MonitorLoop:
             return []
 
         for insight in insights:
-            # Annotate with recurrence context
-            try:
+            # Attach a matching recurrence entry so it gets persisted by
+            # save_insight(). Prefer the first related metric with recurrence.
+            if recurrence_map:
                 for metric in insight.related_metrics:
-                    recurrence = await self.store.get_event_recurrence_summary(
-                        subject=metric, event_type="anomaly", days=30,
-                    )
-                    if recurrence and recurrence["count"] > 1:
-                        insight.recurrence_context = recurrence
+                    rec = recurrence_map.get(metric)
+                    if rec and rec.get("count", 0) > 1:
+                        insight.recurrence_context = rec
                         break
-            except Exception as exc:
-                log.debug("Recurrence lookup failed: %s", exc)
 
             await self._emit(
                 "insight",

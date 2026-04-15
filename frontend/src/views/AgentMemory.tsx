@@ -2,6 +2,7 @@ import { FactsTable } from '../components/FactsTable';
 import { FeedbackSummary } from '../components/FeedbackSummary';
 import { KnowledgeStats } from '../components/KnowledgeStats';
 import { RecentEventsTimeline } from '../components/RecentEventsTimeline';
+import { SeasonalCoveragePanel } from '../components/SeasonalCoveragePanel';
 
 export function AgentMemory() {
   return (
@@ -18,6 +19,7 @@ export function AgentMemory() {
           </p>
         </div>
         <KnowledgeStats />
+        <SeasonalCoveragePanel />
         <div className="mb-4">
           <FactsTable />
         </div>

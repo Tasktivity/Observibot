@@ -82,6 +82,13 @@ Schema:
 Detected anomalies:
 {anomalies}
 
+Historical recurrence (last 30 days):
+{recurrence_history}
+
+Use the recurrence history to distinguish novel incidents from expected
+recurring patterns. If a metric has fired at the same hour repeatedly, say so
+explicitly in the summary and temper the severity/confidence accordingly.
+
 Recent change events:
 {changes}
 

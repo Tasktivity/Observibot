@@ -17,10 +17,23 @@ from observibot.core.store import Store
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
+# Second router for /api/health/* endpoints exposed to the Agent Memory tab
+# and external monitoring. Kept in this module so ops-facing health signals
+# live in one place.
+health_router = APIRouter(prefix="/api/health", tags=["health"])
+
 
 @router.get("/health")
 async def health() -> HealthResponse:
     return HealthResponse(status="ok", version=__version__)
+
+
+@health_router.get("/seasonal-coverage")
+async def seasonal_coverage(
+    store: Store = Depends(get_store),
+) -> dict:
+    """Seasonal-baseline coverage stats for the Agent Memory tab."""
+    return await store.get_seasonal_coverage()
 
 
 @router.get("/status")

@@ -50,6 +50,10 @@ class Anomaly:
     consecutive_count: int
     detected_at: datetime
     sample_count: int
+    # "seasonal" when the baseline came from a trusted seasonal bucket, in
+    # which case sample_count carries weeks_observed rather than rolling-window
+    # sample count. "rolling" for the legacy MAD-on-history path.
+    baseline_source: str = "rolling"
 
     @property
     def is_alertable(self) -> bool:
@@ -216,6 +220,7 @@ class AnomalyDetector:
                 consecutive_count=count,
                 detected_at=m.collected_at or now,
                 sample_count=len(samples),
+                baseline_source="rolling",
             )
             if anomaly.is_alertable:
                 results.append(anomaly)
@@ -226,6 +231,121 @@ class AnomalyDetector:
                     value,
                     count,
                 )
+        return results
+
+    def evaluate_seasonal(
+        self,
+        history: Iterable[MetricSnapshot],
+        latest: Iterable[MetricSnapshot],
+        seasonal_lookup: dict[tuple, tuple[float, float, int]],
+        identity_strip_set: frozenset[str] | None = None,
+    ) -> list[Anomaly]:
+        """Evaluate metrics with seasonal baselines, delegating fallback to evaluate().
+
+        Args:
+            history: Rolling-window snapshots, passed to :meth:`evaluate` for
+                metrics without a trusted seasonal bucket.
+            latest: Current cycle metrics to evaluate.
+            seasonal_lookup: Result of
+                :meth:`Store.get_seasonal_baselines_for_hour`. Keys are
+                ``(metric_name, connector_name, seasonal_labels_key)`` where
+                ``seasonal_labels_key`` has identity labels stripped. Values
+                are ``(median, mad, weeks_observed)``.
+            identity_strip_set: Labels to strip when building seasonal lookup
+                keys. Must match what was used when baselines were written.
+
+        Returns alertable anomalies (severity >= warning).
+        """
+        from observibot.core.seasonal import (
+            seasonal_labels_key as _slk,
+        )
+
+        if identity_strip_set is None:
+            identity_strip_set = frozenset({"instance", "job", "pid", "cpu"})
+
+        latest_list = list(latest)
+
+        if not seasonal_lookup:
+            return self.evaluate(history=history, latest=latest_list)
+
+        seasonal_metrics: list[
+            tuple[MetricSnapshot, tuple[float, float, int]]
+        ] = []
+        fallback_metrics: list[MetricSnapshot] = []
+        for m in latest_list:
+            key = (
+                m.metric_name,
+                m.connector_name,
+                _slk(m.labels, identity_strip_set),
+            )
+            entry = seasonal_lookup.get(key)
+            if entry is not None:
+                seasonal_metrics.append((m, entry))
+            else:
+                fallback_metrics.append(m)
+
+        results = self.evaluate(history=history, latest=fallback_metrics)
+
+        now = datetime.now(UTC)
+        for m, (median, mad, weeks) in seasonal_metrics:
+            value = float(m.value)
+            if not math.isfinite(value):
+                log.warning(
+                    "Skipping non-finite metric %s value=%s",
+                    m.metric_name,
+                    value,
+                )
+                continue
+
+            bucket = _bucket_key(m)
+            absolute_diff = abs(value - median)
+
+            if mad == 0.0:
+                is_statistically_anomalous = absolute_diff > 0
+                modified_z = (
+                    float("inf") if absolute_diff > 0 else 0.0
+                )
+            else:
+                modified_z = MAD_SCALE * (value - median) / mad
+                is_statistically_anomalous = (
+                    abs(modified_z) >= self.mad_threshold
+                )
+
+            if not (
+                is_statistically_anomalous
+                and absolute_diff >= self.min_absolute_diff
+            ):
+                self._consecutive.pop(bucket, None)
+                continue
+
+            self._consecutive[bucket] = self._consecutive.get(bucket, 0) + 1
+            count = self._consecutive[bucket]
+            if count >= self.sustained_intervals_critical:
+                severity = "critical"
+            elif count >= self.sustained_intervals_warning:
+                severity = "warning"
+            else:
+                severity = "info"
+
+            anomaly = Anomaly(
+                metric_name=m.metric_name,
+                connector_name=m.connector_name,
+                labels=dict(m.labels),
+                value=value,
+                median=median,
+                mad=mad,
+                modified_z=modified_z,
+                absolute_diff=absolute_diff,
+                severity=severity,
+                direction="spike" if value > median else "dip",
+                consecutive_count=count,
+                detected_at=m.collected_at or now,
+                sample_count=weeks,
+                baseline_source="seasonal",
+            )
+            if anomaly.is_alertable:
+                results.append(anomaly)
+
         return results
 
     def detect_sustained_drift(
@@ -290,6 +410,7 @@ class AnomalyDetector:
                     consecutive_count=drift_window,
                     detected_at=last.collected_at,
                     sample_count=len(history_samples),
+                    baseline_source="rolling",
                 )
             )
         return results

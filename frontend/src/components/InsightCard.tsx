@@ -19,6 +19,11 @@ const BADGE_COLORS: Record<string, string> = {
   discovery: 'bg-purple-500',
 };
 
+function formatLocalHour(utcHour: number): string {
+  const d = new Date(Date.UTC(1970, 0, 1, utcHour, 0, 0));
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 const FEEDBACK_OPTIONS = [
   { outcome: 'noise', label: 'Noise', color: 'text-slate-400 hover:bg-slate-700' },
   { outcome: 'actionable', label: 'Actionable', color: 'text-green-400 hover:bg-green-900/30' },
@@ -84,7 +89,7 @@ export function InsightCard({
           <span>
             Seen {insight.recurrence_context.count} times in last 30 days
             {insight.recurrence_context.common_hours?.length > 0 && (
-              <> &middot; Usually around {insight.recurrence_context.common_hours.map(h => `${String(h).padStart(2, '0')}:00`).join(', ')} UTC</>
+              <> &middot; Usually around {insight.recurrence_context.common_hours.map(formatLocalHour).join(', ')} (local)</>
             )}
           </span>
         </div>

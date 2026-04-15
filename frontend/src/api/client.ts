@@ -42,6 +42,14 @@ export interface RecurrenceContext {
   common_hours: number[];
 }
 
+export interface SeasonalCoverage {
+  total_buckets: number;
+  trusted_buckets: number;
+  pct_trusted: number;
+  oldest_bucket_age_days: number | null;
+  min_weeks_observed: number;
+}
+
 export interface Insight {
   id: string;
   severity: string;
@@ -244,6 +252,10 @@ export const api = {
         method: 'PATCH',
         body: JSON.stringify(data),
       }),
+  },
+  health: {
+    seasonalCoverage: () =>
+      request<SeasonalCoverage>('/health/seasonal-coverage'),
   },
   events: {
     list: (params?: { event_type?: string; subject?: string; limit?: number }) => {

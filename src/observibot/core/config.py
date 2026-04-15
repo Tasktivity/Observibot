@@ -60,6 +60,11 @@ class MonitorConfig:
     sustained_intervals_critical: int = 3
     baseline_window_hours: int = 24
     min_samples_for_baseline: int = 12
+    min_seasonal_weeks: int = 4
+    max_seasonal_samples: int = 30
+    seasonal_identity_labels: list[str] = field(
+        default_factory=lambda: ["instance", "job", "pid", "cpu"]
+    )
 
 
 @dataclass
@@ -324,6 +329,9 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         connectors.append(ConnectorConfig(name=name, type=ctype, options=opts))
 
     mon_raw = data.get("monitor") or {}
+    id_labels = mon_raw.get("seasonal_identity_labels")
+    if id_labels is None:
+        id_labels = ["instance", "job", "pid", "cpu"]
     monitor = MonitorConfig(
         collection_interval_seconds=int(mon_raw.get("collection_interval_seconds", 300)),
         analysis_interval_seconds=int(mon_raw.get("analysis_interval_seconds", 1800)),
@@ -334,6 +342,9 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         sustained_intervals_critical=int(mon_raw.get("sustained_intervals_critical", 3)),
         baseline_window_hours=int(mon_raw.get("baseline_window_hours", 24)),
         min_samples_for_baseline=int(mon_raw.get("min_samples_for_baseline", 12)),
+        min_seasonal_weeks=int(mon_raw.get("min_seasonal_weeks", 4)),
+        max_seasonal_samples=int(mon_raw.get("max_seasonal_samples", 30)),
+        seasonal_identity_labels=[str(x) for x in id_labels],
     )
 
     alert_raw = data.get("alerting") or {}

@@ -445,6 +445,7 @@ class Insight:
             "source": self.source,
             "fingerprint": self.fingerprint,
             "created_at": _to_iso(self.created_at),
+            "recurrence_context": self.recurrence_context,
         }
 
     @classmethod
@@ -463,5 +464,6 @@ class Insight:
             source=data.get("source", "llm"),
             fingerprint=data.get("fingerprint", ""),
             created_at=_from_iso(data.get("created_at")) or _utcnow(),
+            recurrence_context=data.get("recurrence_context"),
         )
         return obj

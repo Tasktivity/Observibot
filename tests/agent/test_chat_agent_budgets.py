@@ -208,15 +208,16 @@ def test_format_tool_results_uses_smart_sampling() -> None:
     assert "2026-01-100" in out
 
 
-# Pipeline-audit Fix 6: metric_baselines is empty today and was producing
-# "no baselines" narratives — leave it out of the planner allowlist until the
-# seasonal-baseline work in Step 3 actually populates it.
+# metric_baselines was dropped in Step 3 (replaced by seasonal_baselines, which
+# is intentionally NOT exposed to the LLM planner). This test pins that exclusion.
 
 
-def test_metric_baselines_not_in_planner_allowlists() -> None:
+def test_seasonal_baselines_not_in_planner_allowlists() -> None:
     from observibot.agent.chat_agent import OBSERVABILITY_TABLES
     from observibot.agent.schema_catalog import build_observability_schema_description
 
     assert "metric_baselines" not in OBSERVABILITY_TABLES
+    assert "seasonal_baselines" not in OBSERVABILITY_TABLES
     desc = build_observability_schema_description()
     assert "metric_baselines" not in desc
+    assert "seasonal_baselines" not in desc
