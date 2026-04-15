@@ -280,12 +280,14 @@ class MonitorLoop:
                 from observibot.api.deps import (
                     set_analyzer,
                     set_app_db,
+                    set_chat_config,
                     set_monitor_loop,
                     set_store,
                 )
                 set_store(self.store)
                 set_analyzer(self.analyzer)
                 set_monitor_loop(self)
+                set_chat_config(self.config.chat)
                 if self._app_db is not None:
                     set_app_db(self._app_db)
 
@@ -668,14 +670,17 @@ class MonitorLoop:
                         connector.name, exc,
                     )
 
-            if all_metrics:
-                await self.store.save_metrics(all_metrics)
-
+            # Load baseline history BEFORE saving the current batch, otherwise
+            # each new value contaminates its own baseline (median/MAD) and
+            # biases the detector toward false negatives.
             baseline_window = timedelta(hours=self.config.monitor.baseline_window_hours)
             history = await self.store.get_metrics(
                 since=datetime.now(UTC) - baseline_window
             )
             anomalies = self.detector.evaluate(history=history, latest=all_metrics)
+
+            if all_metrics:
+                await self.store.save_metrics(all_metrics)
             anomaly_count = len(anomalies)
             if anomalies:
                 log.info("Detected %s sustained anomalies", len(anomalies))

@@ -200,13 +200,18 @@ class TestUserCorrections:
 
 
 class TestQuestionClassifier:
-    async def test_simple_count_skips_context(self, ci_store: Store):
-        service = CodeKnowledgeService(ci_store)
-        assert await service.should_inject_context("how many users?") is False
+    """Pipeline-audit Fix 8: classifier is now always-on.
 
-    async def test_simple_list_skips_context(self, ci_store: Store):
+    Why: the prior conservative gate excluded schema_analysis entity facts
+    and silently dropped most questions; FTS retrieval + ranking now provides
+    the actual relevance filter (returns [] when nothing matches).
+    """
+
+    async def test_always_returns_true(self, ci_store: Store):
         service = CodeKnowledgeService(ci_store)
-        assert await service.should_inject_context("list all tables") is False
+        assert await service.should_inject_context("how many users?") is True
+        assert await service.should_inject_context("list all tables") is True
+        assert await service.should_inject_context("what is the churn rate?") is True
 
     async def test_business_term_triggers_context(self, ci_store: Store):
         fact = _make_fact(concept="onboarded")
@@ -215,9 +220,15 @@ class TestQuestionClassifier:
         service = CodeKnowledgeService(ci_store)
         assert await service.should_inject_context("how many onboarded users?") is True
 
-    async def test_unknown_term_conservative(self, ci_store: Store):
+    async def test_retrieval_returns_empty_for_unrelated_questions(
+        self, ci_store: Store
+    ):
+        """When the gate is open, retrieval is the filter — no false matches."""
         service = CodeKnowledgeService(ci_store)
-        assert await service.should_inject_context("what is the churn rate?") is False
+        facts = await service.get_context_for_question(
+            "what color is the sky on mars?"
+        )
+        assert facts == []
 
 
 class TestFormatContextForPrompt:
@@ -259,6 +270,80 @@ class TestTokenBudget:
         )
         total_chars = sum(len(f.get("claim", "")) for f in facts)
         assert total_chars < 200 * 4 + 200
+
+
+class TestRetrievalRankingAndBudget:
+    """Pipeline-audit Fix 4 + Fix 7: FTS rank preserved as tiebreaker, and
+    larger default budget so complex questions get more facts."""
+
+    async def test_default_budget_raised(self, ci_store: Store):
+        """Default max_facts=10 (was 5), max_tokens=3000 (was 1500)."""
+        for i in range(20):
+            await ci_store.save_semantic_fact(_make_fact(
+                concept=f"pilot_metric_{i}",
+                claim=f"pilot metric definition number {i}",
+                source=FactSource.SCHEMA_ANALYSIS,
+            ))
+
+        service = CodeKnowledgeService(ci_store)
+        facts = await service.get_context_for_question("pilot metric")
+        # New default lets up to 10 through (was capped at 5)
+        assert len(facts) > 5
+        assert len(facts) <= 10
+
+    async def test_fts_rank_used_as_tiebreaker_within_same_source(
+        self, ci_store: Store
+    ):
+        """Within the same source priority, the higher-FTS-relevance fact wins.
+
+        Why: previously the sort key was (source_priority, -confidence) which
+        completely discarded FTS rank. A high-relevance fact with confidence
+        0.7 would lose to a less-relevant one with confidence 0.8.
+        """
+        # Both schema_analysis (same source priority) — only FTS rank should
+        # determine the ordering between them.
+        relevant = _make_fact(
+            concept="pilot_sync_health",
+            claim="v_pilot_sync_health view tracks pilot sync errors",
+            source=FactSource.SCHEMA_ANALYSIS,
+            confidence=0.6,
+        )
+        unrelated = _make_fact(
+            concept="generic_user",
+            claim="generic user record without pilot context",
+            source=FactSource.SCHEMA_ANALYSIS,
+            confidence=0.95,
+        )
+        await ci_store.save_semantic_fact(relevant)
+        await ci_store.save_semantic_fact(unrelated)
+
+        service = CodeKnowledgeService(ci_store)
+        facts = await service.get_context_for_question("pilot sync errors")
+        assert facts, "FTS should return at least the relevant fact"
+        # The FTS-most-relevant fact must rank first within its source bucket
+        # even though it has a lower confidence score.
+        assert facts[0]["concept"] == "pilot_sync_health"
+
+    async def test_user_corrections_still_outrank_fts(self, ci_store: Store):
+        """Source priority still wins overall — corrections beat everything."""
+        correction = _make_fact(
+            concept="active_user",
+            claim="user correction definition",
+            source=FactSource.USER_CORRECTION,
+            confidence=1.0,
+        )
+        relevant_schema = _make_fact(
+            concept="active_user",
+            claim="active user from schema analysis",
+            source=FactSource.SCHEMA_ANALYSIS,
+            confidence=0.7,
+        )
+        await ci_store.save_semantic_fact(correction)
+        await ci_store.save_semantic_fact(relevant_schema)
+
+        service = CodeKnowledgeService(ci_store)
+        facts = await service.get_context_for_question("active user")
+        assert facts[0]["source"] == "user_correction"
 
 
 class TestFTS5QueryBuilder:

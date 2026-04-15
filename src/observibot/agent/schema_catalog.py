@@ -15,31 +15,71 @@ def _is_sensitive_column(col_name: str) -> bool:
     return any(pat in name_lower for pat in SENSITIVE_COLUMN_PATTERNS)
 
 
+def _col_desc(c: dict) -> str:
+    base = f"{c['name']} ({c.get('type', '?')})"
+    if c.get("comment"):
+        base += f' — "{c["comment"]}"'
+    return base
+
+
 def build_app_schema_description(
-    model: SystemModel | None, max_chars: int = 30_000,
+    model: SystemModel | None,
+    question: str | None = None,
+    max_chars: int = 50_000,
+    full_detail_tables: int = 15,
+    max_columns: int = 20,
 ) -> str:
     """Build a compact schema description of the monitored app's tables.
 
-    Caps at 50 tables and 15 columns per table. ``max_chars`` is a hard ceiling
-    enforced after assembly, because column comments can be arbitrarily long
-    and blow the overall budget even when per-table caps look reasonable.
+    Pipeline-audit Fix 3: when ``question`` is provided, score tables by
+    keyword overlap and emit the top-N with full column detail PLUS a thin
+    index (name + row count) for the remaining tables. This prevents the
+    old alphabetical cut from silently dropping high-value views (e.g.
+    v_pilot_*) past index 50.
+
+    When ``question`` is None we keep the legacy behaviour: alphabetical,
+    full detail for the first ``full_detail_tables`` and a thin index for
+    the rest. ``max_chars`` is a hard ceiling enforced after assembly.
     """
     if model is None or not model.tables:
         return "(no application schema discovered)"
-    lines = []
-    for table in sorted(model.tables, key=lambda t: t.fqn)[:50]:
-        safe_cols = [c for c in table.columns if not _is_sensitive_column(c.get("name", ""))]
-        def _col_desc(c: dict) -> str:
-            base = f"{c['name']} ({c.get('type', '?')})"
-            if c.get("comment"):
-                base += f' — "{c["comment"]}"'
-            return base
 
-        cols = ", ".join(_col_desc(c) for c in safe_cols[:15])
-        if len(safe_cols) > 15:
+    all_tables = sorted(model.tables, key=lambda t: t.fqn)
+
+    detail_tables: list = []
+    if question:
+        relevant = retrieve_relevant_tables(
+            question, model, max_tables=full_detail_tables,
+        )
+        relevant_names = {t.name for t in relevant}
+        # Preserve the relevance ordering for the detail section
+        detail_tables = [t for t in relevant if t.name in relevant_names]
+
+    if not detail_tables:
+        # Either no question, or no keyword overlap — fall back to alphabetical
+        detail_tables = all_tables[:full_detail_tables]
+
+    detail_names = {t.name for t in detail_tables}
+
+    lines: list[str] = []
+    for table in detail_tables:
+        safe_cols = [
+            c for c in table.columns if not _is_sensitive_column(c.get("name", ""))
+        ]
+        cols = ", ".join(_col_desc(c) for c in safe_cols[:max_columns])
+        if len(safe_cols) > max_columns:
             cols += ", ..."
         row_hint = f" (~{table.row_count} rows)" if table.row_count else ""
         lines.append(f"  {table.fqn}{row_hint}: {cols}")
+
+    remaining = [t for t in all_tables if t.name not in detail_names]
+    if remaining:
+        lines.append("")
+        lines.append("  Other tables (name, approximate rows):")
+        for table in remaining:
+            row_hint = f" ~{table.row_count} rows" if table.row_count else ""
+            lines.append(f"    {table.fqn}{row_hint}")
+
     result = "\n".join(lines)
     if len(result) > max_chars:
         cut = result[:max_chars]
@@ -58,7 +98,8 @@ def build_observability_schema_description() -> str:
     internal_tables = [
         "metric_snapshots", "insights", "alert_history",
         "change_events", "business_context", "llm_usage",
-        "metric_baselines", "system_snapshots",
+        "system_snapshots",
+        # metric_baselines: re-add when seasonal baselines (Step 3) populate it.
     ]
     for name in internal_tables:
         table = store_metadata.tables.get(name)

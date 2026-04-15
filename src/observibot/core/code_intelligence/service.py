@@ -46,62 +46,25 @@ class CodeKnowledgeService:
         self.store = store
 
     async def should_inject_context(self, question: str) -> bool:
-        """Deterministic question classifier: does this question need business context?
+        """Always inject context. FTS retrieval + ranking is the real filter.
 
-        Returns False for pure schema/aggregate questions like 'how many users?'
-        Returns True for business-logic questions like 'how many onboarded users?'
-        Conservative: returns False when uncertain.
+        Why: the prior conservative classifier excluded schema_analysis entity
+        facts and dropped most questions, but the budget cost of injection is
+        now ~500-800 tokens per query (well under the 3k budget). If FTS finds
+        nothing relevant, get_context_for_question returns an empty list
+        naturally, so an "always-on" gate has no observable downside.
         """
-        q = question.lower().strip().rstrip("?").strip()
-        q_words = set(re.findall(r'\b\w+\b', q))
-        meaningful_words = q_words - STOP_WORDS
-
-        concepts = await self.store.get_semantic_facts(active_only=True)
-        concept_terms = {f["concept"].lower() for f in concepts}
-        # Business concepts: exclude bare entity facts from schema analysis
-        # (table names like "users" are structural, not business context)
-        business_concepts = {
-            f["concept"].lower() for f in concepts
-            if f.get("source") != "schema_analysis" or f.get("fact_type") != "entity"
-        }
-
-        # Single words: only match against business concepts (not bare table names)
-        if meaningful_words & business_concepts:
-            return True
-
-        # Multi-word ngrams: check if any 2-word or 3-word phrase matches a concept
-        ngrams = _extract_ngrams(q)
-        if ngrams & concept_terms:
-            return True
-
-        # Underscore variants: "pilot users" → "pilot_users"
-        underscore_ngrams = {ng.replace(" ", "_") for ng in ngrams}
-        if underscore_ngrams & concept_terms:
-            return True
-
-        # FTS search as secondary check — only match business-relevant facts
-        facts = await self.store.search_semantic_facts(q, limit=3)
-        for fact in facts:
-            # Skip bare schema entity facts (table descriptions)
-            if fact.get("source") == "schema_analysis" and fact.get("fact_type") == "entity":
-                continue
-            claim = fact.get("claim", "")
-            concept = fact.get("concept", "").lower()
-            # Multi-word concepts that appear in the question are strong signals
-            if " " in concept and concept in q:
-                return True
-            # Check for meaningful word overlap between question and claim
-            claim_words = set(re.findall(r'\b\w+\b', claim.lower())) - STOP_WORDS
-            if len(meaningful_words & claim_words) >= 2:
-                return True
-
-        return False
+        return True
 
     async def get_context_for_question(
-        self, question: str, max_facts: int = 5, max_tokens: int = 1500,
+        self, question: str, max_facts: int = 10, max_tokens: int = 3000,
     ) -> list[dict]:
         """Retrieve relevant semantic facts for a user question."""
-        fts_results = await self.store.search_semantic_facts(question, limit=max_facts * 2)
+        # Pipeline-audit Fix 7: pull a wider candidate pool (3x final budget)
+        # so the post-FTS sort has more to work with.
+        fts_results = await self.store.search_semantic_facts(
+            question, limit=max_facts * 3,
+        )
 
         seen_ids: set[str] = set()
         ranked: list[dict] = []
@@ -113,13 +76,19 @@ class CodeKnowledgeService:
             FactSource.SCHEMA_ANALYSIS.value: 3,
         }
 
-        for fact in fts_results:
+        # Pipeline-audit Fix 4: preserve FTS rank as a tiebreaker. Without
+        # this, the source-priority sort silently dropped relevance ranking
+        # so a low-relevance code_extraction fact would beat a high-relevance
+        # schema_analysis fact about the actual question.
+        for i, fact in enumerate(fts_results):
             if fact["id"] not in seen_ids:
                 seen_ids.add(fact["id"])
+                fact["_fts_rank"] = i
                 ranked.append(fact)
 
         ranked.sort(key=lambda f: (
             source_priority.get(f.get("source", ""), 4),
+            f.get("_fts_rank", 999),
             -(f.get("confidence", 0.0)),
         ))
 
@@ -175,7 +144,7 @@ class CodeKnowledgeService:
     async def get_freshness_status(self, stale_threshold_hours: int = 24) -> dict:
         """Get code intelligence freshness metadata."""
         last_commit = await self.store.get_code_intelligence_meta("last_indexed_commit")
-        last_time_str = await self.store.get_code_intelligence_meta("last_index_time")
+        last_time_str = await self.store.get_code_intelligence_meta("last_extraction_at")
         error_msg = await self.store.get_code_intelligence_meta("index_error")
 
         if last_time_str is None:

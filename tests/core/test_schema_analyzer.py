@@ -114,10 +114,11 @@ class TestBusinessContextInjection:
         should = await service.should_inject_context("how many onboarded users are there?")
         assert should is False or should is True
 
-    async def test_no_context_for_simple_count(self, ci_store: Store):
+    async def test_classifier_always_open(self, ci_store: Store):
+        """Pipeline-audit Fix 8: gate is open; retrieval is the actual filter."""
         service = CodeKnowledgeService(ci_store)
         result = await service.should_inject_context("how many users?")
-        assert result is False
+        assert result is True
 
     async def test_context_format_compact(self, ci_store: Store):
         model = _model_with_comments()
@@ -200,3 +201,95 @@ class TestSchemaDescriptionWithComments:
         model = _model_with_comments()
         desc = build_app_schema_description(model, max_chars=100_000)
         assert "[Schema truncated" not in desc
+
+
+class TestRelevanceRankedSchemaDescription:
+    """Pipeline-audit Fix 3: prefer relevance ranking over alphabetical cut.
+
+    Why: the old alphabetical sort dropped the v_pilot_* analytics views past
+    index 50, which were exactly the tables an SRE would ask about.
+    """
+
+    def _build_60_table_model(self) -> SystemModel:
+        # 50 mundane "a*" tables that win alphabetically, plus the views
+        # that should only appear via relevance ranking.
+        tables: list[TableInfo] = []
+        for i in range(50):
+            tables.append(TableInfo(
+                name=f"audit_log_{i:02d}",
+                schema="public",
+                columns=[
+                    {"name": "id", "type": "uuid"},
+                    {"name": "created_at", "type": "timestamp"},
+                ],
+                row_count=10,
+            ))
+        view_names = [
+            "v_pilot_summary",
+            "v_pilot_sync_health",
+            "v_pilot_user_costs",
+            "v_pilot_user_list",
+            "v_pilot_weekly_retention",
+            "v_platform_breakdown",
+            "v_user_overview",
+        ]
+        for name in view_names:
+            tables.append(TableInfo(
+                name=name,
+                schema="public",
+                columns=[
+                    {"name": "user_id", "type": "uuid"},
+                    {"name": "pilot_program", "type": "text"},
+                    {"name": "metric_value", "type": "numeric"},
+                ],
+                row_count=100,
+            ))
+        return SystemModel(tables=tables, relationships=[])
+
+    def test_relevant_tables_promoted_to_full_detail(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = self._build_60_table_model()
+        desc = build_app_schema_description(
+            model, question="how are pilot users doing?",
+        )
+        # The pilot views must appear with full column detail, not just in
+        # the thin index.
+        assert "v_pilot_user_list" in desc
+        assert "pilot_program (text)" in desc
+
+    def test_thin_index_lists_remaining_tables(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = self._build_60_table_model()
+        desc = build_app_schema_description(
+            model, question="how are pilot users doing?",
+        )
+        # Tables that lost the relevance race must still appear in the thin
+        # index — none should be silently dropped.
+        assert "Other tables" in desc
+        for i in range(50):
+            assert f"audit_log_{i:02d}" in desc
+
+    def test_no_tables_silently_dropped(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = self._build_60_table_model()
+        desc = build_app_schema_description(
+            model, question="anything unrelated to schema",
+        )
+        for table in model.tables:
+            assert table.name in desc, f"{table.name} silently dropped"
+
+    def test_no_question_uses_legacy_alphabetical(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = self._build_60_table_model()
+        desc = build_app_schema_description(model)
+        # Without a question, the first 15 alphabetical tables get full detail
+        assert "audit_log_00" in desc
+        # And every table is still represented somewhere (thin index)
+        for name in [
+            "v_pilot_summary", "v_pilot_user_list", "v_user_overview",
+        ]:
+            assert name in desc

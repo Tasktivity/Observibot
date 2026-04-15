@@ -30,7 +30,7 @@ class TestFreshnessStatus:
             "last_indexed_commit", "abc123",
         )
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", now.isoformat(),
+            "last_extraction_at", now.isoformat(),
         )
         service = CodeKnowledgeService(fresh_store)
         status = await service.get_freshness_status()
@@ -43,7 +43,7 @@ class TestFreshnessStatus:
             "last_indexed_commit", "old123",
         )
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", old_time.isoformat(),
+            "last_extraction_at", old_time.isoformat(),
         )
         service = CodeKnowledgeService(fresh_store)
         status = await service.get_freshness_status()
@@ -52,7 +52,7 @@ class TestFreshnessStatus:
     async def test_error_when_error_recorded(self, fresh_store: Store):
         now = datetime.now(UTC)
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", now.isoformat(),
+            "last_extraction_at", now.isoformat(),
         )
         await fresh_store.set_code_intelligence_meta(
             "index_error", "GitHub API rate limited",
@@ -65,7 +65,7 @@ class TestFreshnessStatus:
     async def test_custom_threshold(self, fresh_store: Store):
         recent = datetime.now(UTC) - timedelta(hours=2)
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", recent.isoformat(),
+            "last_extraction_at", recent.isoformat(),
         )
         service = CodeKnowledgeService(fresh_store)
 
@@ -80,7 +80,7 @@ class TestFreshnessWarning:
     async def test_no_warning_when_current(self, fresh_store: Store):
         now = datetime.now(UTC)
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", now.isoformat(),
+            "last_extraction_at", now.isoformat(),
         )
         service = CodeKnowledgeService(fresh_store)
         warning = await service.get_freshness_warning()
@@ -89,7 +89,7 @@ class TestFreshnessWarning:
     async def test_warning_when_stale(self, fresh_store: Store):
         old = datetime.now(UTC) - timedelta(hours=48)
         await fresh_store.set_code_intelligence_meta(
-            "last_index_time", old.isoformat(),
+            "last_extraction_at", old.isoformat(),
         )
         service = CodeKnowledgeService(fresh_store)
         warning = await service.get_freshness_warning()
@@ -100,6 +100,41 @@ class TestFreshnessWarning:
         service = CodeKnowledgeService(fresh_store)
         warning = await service.get_freshness_warning()
         assert warning is None
+
+
+class TestMetadataKeyContract:
+    """Regression: monitor.py write keys must match service.py read keys.
+
+    Why: silently mismatched keys (e.g. last_index_time vs last_extraction_at)
+    cause get_freshness_status to always return 'unavailable' and
+    chat_agent.py to skip fact injection — bug found in PIPELINE_AUDIT.
+    """
+
+    async def test_monitor_extraction_keys_are_readable_by_service(
+        self, fresh_store: Store
+    ):
+        from datetime import UTC, datetime
+
+        # Simulate the same writes monitor.py:486-553 makes after a successful
+        # extraction batch.
+        now = datetime.now(UTC)
+        await fresh_store.set_code_intelligence_meta(
+            "last_indexed_commit", "deadbeef",
+        )
+        await fresh_store.set_code_intelligence_meta(
+            "last_extraction_at", now.isoformat(),
+        )
+
+        service = CodeKnowledgeService(fresh_store)
+        status = await service.get_freshness_status()
+
+        assert status["status"] == "current", (
+            "Service must read the same metadata key the monitor writes "
+            "(last_extraction_at). If this assertion fails, fact injection is "
+            "silently disabled in chat."
+        )
+        assert status["last_indexed_commit"] == "deadbeef"
+        assert status["last_index_time"] == now.isoformat()
 
 
 class TestFreshnessAPIResponse:
