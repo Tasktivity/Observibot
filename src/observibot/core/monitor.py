@@ -24,6 +24,7 @@ from observibot.core.anomaly import Anomaly, build_detector_from_config
 from observibot.core.code_intelligence.schema_analyzer import analyze_schema_for_facts
 from observibot.core.config import ObservibotConfig
 from observibot.core.discovery import DiscoveryEngine, diff_models
+from observibot.core.evidence import EvidenceBundle
 from observibot.core.models import Insight, SystemModel
 from observibot.core.seasonal import compute_seasonal_updates, hour_of_week
 from observibot.core.store import Store
@@ -824,6 +825,16 @@ class MonitorLoop:
             log.debug("Recurrence lookup failed (non-fatal): %s", exc)
             recurrence_map = {}
 
+        # Step 3.3: build a unified EvidenceBundle for this cycle. Today it
+        # carries recurrence only; Step 3.4 will populate correlations and
+        # diagnostic query results on the same bundle before the analyzer
+        # is invoked.
+        pending_bundle = EvidenceBundle.from_recurrence_map(recurrence_map)
+        # TODO(step-3.4): invoke CorrelationDetector here and extend
+        # pending_bundle.correlations before the analyzer call.
+        # TODO(step-3.4): run sandboxed diagnostic queries and extend
+        # pending_bundle.diagnostics before the analyzer call.
+
         try:
             insights = await self.analyzer.analyze_anomalies(
                 anomalies=anomalies,
@@ -831,6 +842,7 @@ class MonitorLoop:
                 recent_changes=recent_changes,
                 business_context=business_context,
                 recurrence_context=recurrence_map,
+                evidence=pending_bundle,
             )
             self.circuit_breaker.record_success()
         except LLMHardError as exc:
@@ -842,14 +854,22 @@ class MonitorLoop:
             self.circuit_breaker.record_soft_failure()
             return []
 
+        bundle_dict = pending_bundle.to_dict() if not pending_bundle.is_empty() else None
+
         saved_insights: list[Insight] = []
         for insight in insights:
+            # Legacy single-metric recurrence_context is still populated so
+            # older consumers (dashboard "seen N times" badge) continue to
+            # render during the one-release backcompat window.
             if recurrence_map:
                 for metric in insight.related_metrics:
                     rec = recurrence_map.get(metric)
                     if rec and rec.get("count", 0) > 1:
                         insight.recurrence_context = rec
                         break
+            # Unified bundle — preserves cross-metric and (future) diagnostic
+            # evidence the legacy single-metric field can't express.
+            insight.evidence = bundle_dict
 
             stored = await self.store.save_insight(insight)
             if not stored:

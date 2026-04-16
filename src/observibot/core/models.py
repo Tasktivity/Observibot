@@ -407,6 +407,12 @@ class Insight:
     anomaly_signature: str = ""
     created_at: datetime = field(default_factory=_utcnow)
     recurrence_context: dict[str, Any] | None = None
+    # Step 3.3 unified evidence carrier — serialized
+    # :class:`observibot.core.evidence.EvidenceBundle`. Holds recurrence,
+    # change-event correlations, and (Step 3.4) diagnostic query results.
+    # ``recurrence_context`` is retained for one release cycle for
+    # backwards compatibility with rows written before this field existed.
+    evidence: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.fingerprint:
@@ -475,6 +481,7 @@ class Insight:
             "anomaly_signature": self.anomaly_signature,
             "created_at": _to_iso(self.created_at),
             "recurrence_context": self.recurrence_context,
+            "evidence": self.evidence,
         }
 
     @classmethod
@@ -495,5 +502,6 @@ class Insight:
             anomaly_signature=data.get("anomaly_signature", ""),
             created_at=_from_iso(data.get("created_at")) or _utcnow(),
             recurrence_context=data.get("recurrence_context"),
+            evidence=data.get("evidence"),
         )
         return obj

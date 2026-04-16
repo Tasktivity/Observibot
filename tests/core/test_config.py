@@ -106,6 +106,47 @@ def test_observibot_config_env_override(tmp_path: Path, monkeypatch: pytest.Monk
     assert cfg.source_path == cfg_path
 
 
+def test_diagnostics_config_defaults_are_scale_invariant(tmp_path: Path) -> None:
+    """Step 3.3: DiagnosticsConfig defaults must be scale-invariant
+    (token/wall-clock budgets, not row counts calibrated to a customer).
+    """
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text("llm: {provider: mock}\nconnectors: []\n")
+    cfg = load_config(cfg_path)
+    diag = cfg.monitor.diagnostics
+    assert diag.enabled is False  # off by default
+    assert diag.explain_cost_threshold == 10_000
+    assert diag.statement_timeout_ms == 2000
+    assert diag.max_queries_per_cycle == 3
+    assert diag.max_rows_per_query == 50
+    assert diag.cooldown_minutes == 10
+    assert diag.fail_closed_on_explain_error is True
+
+
+def test_diagnostics_config_roundtrips_yaml(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "c.yaml"
+    cfg_path.write_text(
+        "monitor:\n"
+        "  diagnostics:\n"
+        "    enabled: true\n"
+        "    explain_cost_threshold: 5000\n"
+        "    statement_timeout_ms: 1500\n"
+        "    max_queries_per_cycle: 2\n"
+        "    max_rows_per_query: 25\n"
+        "    cooldown_minutes: 5\n"
+        "    fail_closed_on_explain_error: false\n"
+    )
+    cfg = load_config(cfg_path)
+    diag = cfg.monitor.diagnostics
+    assert diag.enabled is True
+    assert diag.explain_cost_threshold == 5000
+    assert diag.statement_timeout_ms == 1500
+    assert diag.max_queries_per_cycle == 2
+    assert diag.max_rows_per_query == 25
+    assert diag.cooldown_minutes == 5
+    assert diag.fail_closed_on_explain_error is False
+
+
 def test_alerting_config_defaults(tmp_path: Path) -> None:
     cfg_path = tmp_path / "c.yaml"
     cfg_path.write_text(

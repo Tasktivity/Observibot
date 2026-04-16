@@ -97,12 +97,16 @@ When multiple anomalies point in OPPOSITE directions, narrate them
 separately — do not collapse a mixed-direction set into a single
 directional claim.
 
-Historical recurrence (last 30 days):
-{recurrence_history}
+{evidence}
 
-Use the recurrence history to distinguish novel incidents from expected
-recurring patterns. If a metric has fired at the same hour repeatedly, say so
-explicitly in the summary and temper the severity/confidence accordingly.
+Use the evidence block above to distinguish novel incidents from expected
+recurring patterns, and to ground your narrative in observed signals rather
+than speculation. Recurrence history tells you whether this anomaly has
+fired before; correlations tell you whether a recent change event may
+explain it; diagnostic query results (when present) give you direct
+evidence from the application database. When a section says "(none
+attached)" or "(not run for this cycle)", do NOT invent evidence — state
+plainly that none is available.
 
 Recent change events:
 {changes}

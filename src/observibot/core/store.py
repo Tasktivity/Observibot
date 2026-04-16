@@ -92,6 +92,10 @@ insights_table = Table(
     Column("anomaly_signature", String),
     Column("created_at", String, nullable=False),
     Column("recurrence_context", Text),
+    # Step 3.3 unified evidence bundle — JSON blob holding recurrence,
+    # correlations, and (Step 3.4) diagnostic query results. Nullable
+    # because legacy insights may only have ``recurrence_context`` set.
+    Column("evidence", Text),
 )
 
 alert_history = Table(
@@ -397,6 +401,9 @@ class Store:
                 await _ensure_sqlite_column(
                     conn, "insights", "anomaly_signature", "TEXT"
                 )
+                await _ensure_sqlite_column(
+                    conn, "insights", "evidence", "TEXT"
+                )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -604,6 +611,9 @@ class Store:
                 if insight.recurrence_context
                 else None
             )
+            evidence_json = (
+                json.dumps(insight.evidence) if insight.evidence else None
+            )
             stmt = (
                 _dialect_insert(insights_table, self.engine)
                 .values(
@@ -621,6 +631,7 @@ class Store:
                     anomaly_signature=insight.anomaly_signature or None,
                     created_at=insight.created_at.isoformat(),
                     recurrence_context=recurrence_json,
+                    evidence=evidence_json,
                 )
                 .on_conflict_do_update(
                     index_elements=["id"],
@@ -638,6 +649,7 @@ class Store:
                         anomaly_signature=insight.anomaly_signature or None,
                         created_at=insight.created_at.isoformat(),
                         recurrence_context=recurrence_json,
+                        evidence=evidence_json,
                     ),
                 )
             )
@@ -662,6 +674,7 @@ class Store:
                     insights_table.c.created_at,
                     insights_table.c.recurrence_context,
                     insights_table.c.anomaly_signature,
+                    insights_table.c.evidence,
                 )
                 .order_by(insights_table.c.created_at.desc())
                 .limit(limit)
@@ -673,6 +686,10 @@ class Store:
                 recurrence = json.loads(r[12]) if r[12] else None
             except (json.JSONDecodeError, TypeError):
                 recurrence = None
+            try:
+                evidence = json.loads(r[14]) if r[14] else None
+            except (json.JSONDecodeError, TypeError):
+                evidence = None
             insights.append(
                 Insight(
                     id=r[0],
@@ -689,6 +706,7 @@ class Store:
                     created_at=datetime.fromisoformat(r[11]),
                     recurrence_context=recurrence,
                     anomaly_signature=r[13] or "",
+                    evidence=evidence,
                 )
             )
         return insights

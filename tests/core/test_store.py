@@ -122,6 +122,111 @@ async def test_insight_anomaly_signature_roundtrips_through_store(tmp_store) -> 
     assert perturbed.compute_fingerprint() == original.fingerprint
 
 
+async def test_legacy_sqlite_db_gains_evidence_column_on_open(tmp_path: Path) -> None:
+    """Step 3.3 ``_ensure_sqlite_column`` must idempotently ADD the
+    ``evidence`` column to a SQLite file that predates it, so upgrading
+    an existing deployment does not require a manual migration.
+    """
+    import aiosqlite
+
+    db_path = tmp_path / "legacy.db"
+    async with aiosqlite.connect(db_path) as conn:
+        # Simulate a pre-Step-3.3 schema (no evidence column).
+        await conn.execute(
+            "CREATE TABLE insights ("
+            "  id TEXT PRIMARY KEY,"
+            "  severity TEXT,"
+            "  title TEXT,"
+            "  summary TEXT,"
+            "  details TEXT,"
+            "  recommended_actions TEXT,"
+            "  related_metrics TEXT,"
+            "  related_tables TEXT,"
+            "  confidence REAL,"
+            "  source TEXT,"
+            "  fingerprint TEXT,"
+            "  created_at TEXT NOT NULL,"
+            "  recurrence_context TEXT,"
+            "  anomaly_signature TEXT"
+            ")"
+        )
+        await conn.commit()
+
+    async with Store(db_path) as store:
+        async with store.engine.begin() as conn:
+            result = await conn.execute(
+                sa.text("PRAGMA table_info(insights)")
+            )
+            cols = {row[1] for row in result.fetchall()}
+        assert "evidence" in cols, (
+            "Step 3.3 ALTER must have added the evidence column on open"
+        )
+
+
+async def test_insight_evidence_roundtrips_through_store(tmp_store) -> None:
+    """Step 3.3: the new ``evidence`` column must survive save/fetch with
+    all three evidence types populated, including nested datetimes.
+    """
+    from datetime import UTC, datetime
+
+    from observibot.core.evidence import (
+        CorrelationEvidence,
+        DiagnosticEvidence,
+        EvidenceBundle,
+        RecurrenceEvidence,
+    )
+
+    bundle = EvidenceBundle()
+    bundle.recurrence["m"] = RecurrenceEvidence(
+        metric_name="m",
+        count=3,
+        first_seen="2026-04-01T00:00:00+00:00",
+        last_seen="2026-04-14T00:00:00+00:00",
+        common_hours=[9, 10],
+    )
+    bundle.correlations.append(
+        CorrelationEvidence(
+            metric_name="m",
+            change_event_id="chg-1",
+            change_type="deploy",
+            change_summary="v42",
+            time_delta_seconds=300.0,
+            severity_score=3.0,
+        )
+    )
+    bundle.diagnostics.append(
+        DiagnosticEvidence(
+            hypothesis="h",
+            sql="SELECT 1",
+            row_count=1,
+            rows=[{"c": 1}],
+            explanation="because",
+            executed_at=datetime(2026, 4, 16, 12, 30, tzinfo=UTC),
+            error=None,
+        )
+    )
+
+    ins = Insight(
+        title="evidence roundtrip",
+        summary="s",
+        severity="warning",
+        anomaly_signature="sigevidence1234",
+        evidence=bundle.to_dict(),
+    )
+    ins.fingerprint = ins.compute_fingerprint()
+    assert await tmp_store.save_insight(ins) is True
+
+    fetched = await tmp_store.get_recent_insights(limit=5)
+    assert len(fetched) == 1
+    restored = EvidenceBundle.from_dict(fetched[0].evidence)
+    assert restored.recurrence["m"].count == 3
+    assert restored.correlations[0].change_type == "deploy"
+    assert restored.diagnostics[0].rows == [{"c": 1}]
+    assert restored.diagnostics[0].executed_at == datetime(
+        2026, 4, 16, 12, 30, tzinfo=UTC
+    )
+
+
 async def test_insight_without_signature_falls_back_to_legacy_fingerprint(
     tmp_store,
 ) -> None:

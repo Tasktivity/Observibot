@@ -244,3 +244,105 @@ def test_prompt_contains_direction_guidance() -> None:
     assert "INCREASE" in ANOMALY_ANALYSIS_PROMPT
     assert "DECREASE" in ANOMALY_ANALYSIS_PROMPT
     assert "Do NOT describe an INCREASE as a drop" in ANOMALY_ANALYSIS_PROMPT
+
+
+def test_prompt_has_evidence_placeholder() -> None:
+    """Step 3.3: the prompt body must use the unified {evidence} slot so
+    recurrence, correlations, and diagnostics render together.
+    """
+    assert "{evidence}" in ANOMALY_ANALYSIS_PROMPT
+    assert "{recurrence_history}" not in ANOMALY_ANALYSIS_PROMPT
+
+
+def test_summarize_evidence_renders_all_three_sections_when_empty() -> None:
+    """An empty bundle must still render all three sections so the LLM
+    can see what is and isn't available.
+    """
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import EvidenceBundle
+
+    out = summarize_evidence(EvidenceBundle())
+    assert "Recurrence history" in out
+    assert "Change-event correlations:" in out
+    assert "Diagnostic query results:" in out
+    assert "(no prior occurrences)" in out
+    assert "(none attached)" in out
+    assert "(not run for this cycle)" in out
+
+
+def test_summarize_evidence_renders_recurrence_entries() -> None:
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import EvidenceBundle, RecurrenceEvidence
+
+    bundle = EvidenceBundle()
+    bundle.recurrence["payouts"] = RecurrenceEvidence(
+        metric_name="payouts",
+        count=12,
+        last_seen="2026-04-15T08:00:00+00:00",
+        common_hours=[9, 10],
+    )
+    out = summarize_evidence(bundle)
+    assert "payouts: seen 12 times" in out
+    assert "hours [9, 10]" in out
+    assert "last seen 2026-04-15" in out
+
+
+def test_summarize_evidence_renders_correlations() -> None:
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import CorrelationEvidence, EvidenceBundle
+
+    bundle = EvidenceBundle()
+    bundle.correlations.append(
+        CorrelationEvidence(
+            metric_name="latency_p95_ms",
+            change_event_id="ch-1",
+            change_type="deploy",
+            change_summary="api-gw v9",
+            time_delta_seconds=600.0,
+            severity_score=4.5,
+        )
+    )
+    out = summarize_evidence(bundle)
+    assert "latency_p95_ms anomaly 10 min after deploy" in out
+    assert "api-gw v9" in out
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_accepts_evidence_kwarg(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """When evidence kwarg is supplied, analyze_anomalies should succeed
+    without falling back to the legacy recurrence_context path.
+    """
+    from observibot.core.evidence import EvidenceBundle, RecurrenceEvidence
+
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+    bundle = EvidenceBundle()
+    bundle.recurrence["table_inserts"] = RecurrenceEvidence(
+        metric_name="table_inserts",
+        count=4,
+    )
+    insights = await analyzer.analyze_anomalies(
+        anomalies=[_anomaly()],
+        system_model=sample_system_model,
+        evidence=bundle,
+    )
+    assert insights
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_synthesizes_bundle_from_legacy_recurrence(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """Absent evidence kwarg, the analyzer must synthesize a bundle from
+    the legacy recurrence_context dict so existing callers still work.
+    """
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+    insights = await analyzer.analyze_anomalies(
+        anomalies=[_anomaly()],
+        system_model=sample_system_model,
+        recurrence_context={
+            "table_inserts": {"count": 2, "last_seen": "2026-04-15"}
+        },
+    )
+    assert insights

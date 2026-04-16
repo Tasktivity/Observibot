@@ -9,11 +9,13 @@ from observibot.agent.chat_agent import (
     APP_SCHEMA_BUDGET_TOKENS,
     BUSINESS_CONTEXT_BUDGET_TOKENS,
     OBS_SCHEMA_BUDGET_TOKENS,
-    PROMPT_ERROR_TOKENS,
-    PROMPT_WARN_TOKENS,
     _enforce_budget,
     _estimate_tokens,
     _log_prompt_size,
+)
+from observibot.agent.prompt_utils import (
+    PROMPT_ERROR_TOKENS,
+    PROMPT_WARN_TOKENS,
 )
 
 
@@ -65,7 +67,7 @@ def test_estimate_tokens_rough_4_chars_per_token() -> None:
 
 
 def test_log_prompt_size_debug_for_small_prompt(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG, logger="observibot.agent.chat_agent")
+    caplog.set_level(logging.DEBUG, logger="observibot.agent.prompt_utils")
     _log_prompt_size("x" * 100, "Planning", {"a": "hi", "b": "there"})
     planning_records = [r for r in caplog.records if "Planning prompt" in r.message]
     assert planning_records, "expected Planning prompt log line"
@@ -73,7 +75,7 @@ def test_log_prompt_size_debug_for_small_prompt(caplog: pytest.LogCaptureFixture
 
 
 def test_log_prompt_size_warning_over_30k(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG, logger="observibot.agent.chat_agent")
+    caplog.set_level(logging.DEBUG, logger="observibot.agent.prompt_utils")
     # ~35k tokens = ~140k chars.
     big = "x" * (PROMPT_WARN_TOKENS * 4 + 10_000)
     _log_prompt_size(big, "Planning", {"giant": big})
@@ -82,7 +84,7 @@ def test_log_prompt_size_warning_over_30k(caplog: pytest.LogCaptureFixture) -> N
 
 
 def test_log_prompt_size_error_over_150k(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG, logger="observibot.agent.chat_agent")
+    caplog.set_level(logging.DEBUG, logger="observibot.agent.prompt_utils")
     huge = "x" * (PROMPT_ERROR_TOKENS * 4 + 10_000)
     _log_prompt_size(huge, "Planning", {"massive": huge})
     records = [r for r in caplog.records if "Planning prompt" in r.message]
@@ -92,7 +94,7 @@ def test_log_prompt_size_error_over_150k(caplog: pytest.LogCaptureFixture) -> No
 def test_log_prompt_size_includes_section_breakdown(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger="observibot.agent.chat_agent")
+    caplog.set_level(logging.DEBUG, logger="observibot.agent.prompt_utils")
     _log_prompt_size(
         "full prompt text",
         "Planning",
@@ -119,7 +121,7 @@ def test_log_prompt_size_handles_empty_sections(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Empty section values must be omitted, not rendered as '=0tok'."""
-    caplog.set_level(logging.DEBUG, logger="observibot.agent.chat_agent")
+    caplog.set_level(logging.DEBUG, logger="observibot.agent.prompt_utils")
     _log_prompt_size(
         "prompt",
         "Planning",

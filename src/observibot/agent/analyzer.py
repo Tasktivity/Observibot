@@ -29,6 +29,7 @@ from observibot.agent.schemas import (
     LLMSystemAnalysis,
 )
 from observibot.core.anomaly import Anomaly, compute_anomaly_signature
+from observibot.core.evidence import EvidenceBundle
 from observibot.core.models import ChangeEvent, Insight, MetricSnapshot, SystemModel
 from observibot.core.store import Store
 
@@ -93,24 +94,76 @@ def summarize_anomalies(anomalies: Iterable[Anomaly]) -> str:
     return "\n".join(rows) if rows else "(none)"
 
 
-def summarize_recurrence(recurrence: dict[str, dict] | None) -> str:
-    """Render recurrence context for the LLM anomaly-analysis prompt."""
-    if not recurrence:
-        return "(no recurrence history available)"
-    rows: list[str] = []
-    for metric, rec in sorted(recurrence.items()):
-        count = rec.get("count", 0)
-        if count <= 0:
+def summarize_evidence(bundle: EvidenceBundle | None) -> str:
+    """Render an :class:`EvidenceBundle` for the LLM anomaly-analysis prompt.
+
+    Always emits three clearly-labeled sections — recurrence,
+    change-event correlations, diagnostic query results — so the LLM
+    can tell what evidence is present versus absent. Absent sections
+    say "(none attached)" or "(not run for this cycle)" rather than
+    being dropped, which prevents the model from inventing correlations
+    that don't exist.
+    """
+    if bundle is None:
+        bundle = EvidenceBundle()
+
+    lines: list[str] = ["## Evidence attached to this anomaly set", ""]
+
+    lines.append("Recurrence history (last 30 days):")
+    recurrence_lines: list[str] = []
+    for metric, rec in sorted(bundle.recurrence.items()):
+        if rec.count <= 0:
             continue
-        hrs = ", ".join(str(h) for h in rec.get("common_hours") or [])
-        line = f"  - {metric}: seen {count} times in last 30 days"
+        hrs = ", ".join(str(h) for h in rec.common_hours)
+        line = f"  - {metric}: seen {rec.count} times"
         if hrs:
             line += f", most common at hours [{hrs}] UTC"
-        last_seen = rec.get("last_seen")
-        if isinstance(last_seen, str) and len(last_seen) >= 10:
-            line += f", last seen {last_seen[:10]}"
-        rows.append(line)
-    return "\n".join(rows) if rows else "(no recurrence history available)"
+        if rec.last_seen and len(rec.last_seen) >= 10:
+            line += f", last seen {rec.last_seen[:10]}"
+        recurrence_lines.append(line)
+    if recurrence_lines:
+        lines.extend(recurrence_lines)
+    else:
+        lines.append("  (no prior occurrences)")
+    lines.append("")
+
+    lines.append("Change-event correlations:")
+    if bundle.correlations:
+        for corr in bundle.correlations:
+            minutes = corr.time_delta_seconds / 60.0
+            lines.append(
+                f"  - {corr.metric_name} anomaly {minutes:.0f} min after "
+                f"{corr.change_type}: {corr.change_summary} "
+                f"(severity_score={corr.severity_score:.2f})"
+            )
+    else:
+        lines.append("  (none attached)")
+    lines.append("")
+
+    lines.append("Diagnostic query results:")
+    if bundle.diagnostics:
+        for diag in bundle.diagnostics:
+            status = f" ERROR: {diag.error}" if diag.error else ""
+            lines.append(
+                f"  - hypothesis: {diag.hypothesis}\n"
+                f"    rows returned: {diag.row_count}{status}"
+            )
+            if diag.explanation:
+                lines.append(f"    explanation: {diag.explanation}")
+    else:
+        lines.append("  (not run for this cycle)")
+
+    return "\n".join(lines)
+
+
+def summarize_recurrence(recurrence: dict[str, dict] | None) -> str:
+    """Backwards-compatible recurrence renderer.
+
+    Step 3.3 prefers :func:`summarize_evidence`, which renders a full
+    :class:`EvidenceBundle`. This shim is retained for any external
+    caller still passing the legacy dict-of-dicts shape.
+    """
+    return summarize_evidence(EvidenceBundle.from_recurrence_map(recurrence))
 
 
 def summarize_changes(events: Iterable[ChangeEvent]) -> str:
@@ -147,6 +200,7 @@ class Analyzer:
         recent_changes: list[ChangeEvent] | None = None,
         business_context: dict[str, Any] | None = None,
         recurrence_context: dict[str, dict] | None = None,
+        evidence: EvidenceBundle | None = None,
     ) -> list[Insight]:
         """Produce unsaved :class:`Insight` objects for the given anomalies.
 
@@ -167,9 +221,14 @@ class Analyzer:
         """
         if not anomalies:
             return []
+        # Prefer an explicit EvidenceBundle when provided (Step 3.3+); fall
+        # back to the legacy dict-of-dicts recurrence_context so existing
+        # callers and tests continue to work unchanged.
+        if evidence is None:
+            evidence = EvidenceBundle.from_recurrence_map(recurrence_context)
         prompt = ANOMALY_ANALYSIS_PROMPT.format(
             anomalies=summarize_anomalies(anomalies),
-            recurrence_history=summarize_recurrence(recurrence_context),
+            evidence=summarize_evidence(evidence),
             changes=summarize_changes(recent_changes or []),
             business_context=json.dumps(business_context or {}, indent=2),
             system_summary=summarize_system(system_model),

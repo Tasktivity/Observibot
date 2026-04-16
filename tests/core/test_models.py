@@ -136,6 +136,74 @@ def test_insight_roundtrip() -> None:
     assert restored.recommended_actions == ["do it"]
 
 
+# Tier 0: synthetic coverage via ecommerce_anomaly()
+def test_fingerprint_stable_with_new_evidence_field() -> None:
+    """Insight fingerprints must be unchanged by the Step 3.3 ``evidence``
+    field. An insight with evidence set must hash to the same value as
+    the same insight with evidence absent — evidence is diagnostic, not
+    identity. Exercised against ecommerce_anomaly() to confirm the Step
+    3.2 signature path is still the only fingerprint input.
+    """
+    from observibot.core.anomaly import compute_anomaly_signature
+    from tests.fixtures.synthetic_schemas import ecommerce_anomaly
+
+    sig = compute_anomaly_signature([ecommerce_anomaly()])
+    without_evidence = Insight(
+        severity="warning",
+        title="order spike",
+        summary="",
+        source="llm",
+        anomaly_signature=sig,
+    )
+    with_evidence = Insight(
+        severity="warning",
+        title="order spike",
+        summary="",
+        source="llm",
+        anomaly_signature=sig,
+        evidence={
+            "recurrence": {
+                "order_count": {"metric_name": "order_count", "count": 3}
+            },
+            "correlations": [],
+            "diagnostics": [],
+        },
+    )
+    assert (
+        without_evidence.compute_fingerprint()
+        == with_evidence.compute_fingerprint()
+    )
+
+
+def test_insight_evidence_roundtrips_through_to_dict() -> None:
+    original = Insight(
+        title="with evidence",
+        summary="s",
+        severity="warning",
+        evidence={
+            "recurrence": {"m": {"metric_name": "m", "count": 2}},
+            "correlations": [],
+            "diagnostics": [],
+        },
+    )
+    restored = Insight.from_dict(original.to_dict())
+    assert restored.evidence == original.evidence
+
+
+def test_insight_from_dict_missing_evidence_is_none() -> None:
+    """Legacy rows (pre-Step 3.3) serialize without an ``evidence`` key.
+    from_dict must produce ``evidence=None`` rather than crash.
+    """
+    legacy = {
+        "severity": "warning",
+        "title": "x",
+        "summary": "",
+        "anomaly_signature": "abc123",
+    }
+    restored = Insight.from_dict(legacy)
+    assert restored.evidence is None
+
+
 def test_insight_fingerprint_uses_anomaly_signature_when_present() -> None:
     """When a stable anomaly_signature is supplied, jitter in LLM-authored
     related_tables/metrics must not change the fingerprint — this is what

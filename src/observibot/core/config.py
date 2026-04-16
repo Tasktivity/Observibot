@@ -66,6 +66,11 @@ class MonitorConfig:
     seasonal_identity_labels: list[str] = field(
         default_factory=lambda: ["instance", "job", "pid", "cpu"]
     )
+    # Step 3.3: reserved for Step 3.4 diagnostic queries. READ but not
+    # acted on in Step 3.3. See :class:`DiagnosticsConfig` for details.
+    diagnostics: DiagnosticsConfig = field(
+        default_factory=lambda: DiagnosticsConfig()
+    )
 
 
 @dataclass
@@ -130,6 +135,45 @@ class ChatConfig:
     statement_timeout_ms: int = 3000
     max_result_rows: int = 500
     explain_cost_threshold: float = 100_000
+
+
+@dataclass
+class DiagnosticsConfig:
+    """Reserved for Step 3.4. Autonomous diagnostic query generation.
+
+    When enabled, the monitor generates SQL queries against the
+    application database to collect evidence about anomalies before
+    synthesis. Independent of :class:`ChatConfig`; autonomous use
+    requires stricter guardrails than user-initiated chat queries.
+
+    All default values are deliberately scale-invariant (Tier 0):
+
+    - ``explain_cost_threshold``: 10x tighter than chat to bound the
+      worst-case query cost per cycle, not calibrated to any customer's
+      row counts.
+    - ``statement_timeout_ms``: a wall-clock budget the database
+      enforces, independent of dataset size.
+    - ``max_queries_per_cycle``: bounds LLM/database fan-out per
+      analysis cycle, not per customer.
+    - ``max_rows_per_query``: evidence surface sent back to the LLM,
+      not an absolute row cap on the underlying query (LIMIT injection
+      handles that at sandbox-time).
+    - ``cooldown_minutes``: rate-limit on diagnostic firings to avoid
+      re-querying the same hypothesis before conditions change.
+    - ``fail_closed_on_explain_error``: safety posture — on EXPLAIN
+      failure, suppress the query rather than run it.
+
+    In Step 3.3 this config is READ (wired through YAML) but not
+    ACTED ON. No diagnostic queries are generated or executed.
+    """
+
+    enabled: bool = False
+    explain_cost_threshold: float = 10_000
+    statement_timeout_ms: int = 2000
+    max_queries_per_cycle: int = 3
+    max_rows_per_query: int = 50
+    cooldown_minutes: int = 10
+    fail_closed_on_explain_error: bool = True
 
 
 @dataclass
@@ -333,6 +377,20 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
     id_labels = mon_raw.get("seasonal_identity_labels")
     if id_labels is None:
         id_labels = ["instance", "job", "pid", "cpu"]
+    diag_raw = mon_raw.get("diagnostics") or {}
+    diagnostics = DiagnosticsConfig(
+        enabled=bool(diag_raw.get("enabled", False)),
+        explain_cost_threshold=float(
+            diag_raw.get("explain_cost_threshold", 10_000)
+        ),
+        statement_timeout_ms=int(diag_raw.get("statement_timeout_ms", 2000)),
+        max_queries_per_cycle=int(diag_raw.get("max_queries_per_cycle", 3)),
+        max_rows_per_query=int(diag_raw.get("max_rows_per_query", 50)),
+        cooldown_minutes=int(diag_raw.get("cooldown_minutes", 10)),
+        fail_closed_on_explain_error=bool(
+            diag_raw.get("fail_closed_on_explain_error", True)
+        ),
+    )
     monitor = MonitorConfig(
         collection_interval_seconds=int(mon_raw.get("collection_interval_seconds", 300)),
         analysis_interval_seconds=int(mon_raw.get("analysis_interval_seconds", 1800)),
@@ -347,6 +405,7 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         min_seasonal_weeks=int(mon_raw.get("min_seasonal_weeks", 4)),
         max_seasonal_samples=int(mon_raw.get("max_seasonal_samples", 30)),
         seasonal_identity_labels=[str(x) for x in id_labels],
+        diagnostics=diagnostics,
     )
 
     alert_raw = data.get("alerting") or {}
