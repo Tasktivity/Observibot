@@ -346,3 +346,95 @@ async def test_analyze_anomalies_synthesizes_bundle_from_legacy_recurrence(
         },
     )
     assert insights
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_enforces_section_budgets(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """A diagnostic bundle with 100s of rows on multiple queries must not
+    push the final prompt past the per-section evidence budget. Budget
+    enforcement is the safety net that keeps the overall prompt inside
+    any current model context window.
+    """
+    from observibot.agent.analyzer import (
+        ANOMALIES_BUDGET_TOKENS,
+        BUSINESS_CONTEXT_BUDGET_TOKENS,
+        CHANGES_BUDGET_TOKENS,
+        EVIDENCE_BUDGET_TOKENS,
+        SYSTEM_SUMMARY_BUDGET_TOKENS,
+    )
+    from observibot.core.evidence import DiagnosticEvidence, EvidenceBundle
+    from tests.fixtures.synthetic_schemas import ecommerce_anomaly
+
+    captured_prompt: list[str] = []
+
+    class CapturingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            captured_prompt.append(user_prompt)
+            return await super()._call(system_prompt, user_prompt)
+
+    big_rows = [{"id": i, "value": "x" * 200} for i in range(100)]
+    bundle = EvidenceBundle()
+    for i in range(3):
+        bundle.diagnostics.append(
+            DiagnosticEvidence(
+                hypothesis=f"hypothesis {i}",
+                sql=f"SELECT * FROM t{i}",
+                row_count=len(big_rows),
+                rows=big_rows,
+                explanation="x" * 2000,
+            )
+        )
+
+    analyzer = Analyzer(provider=CapturingProvider(), store=tmp_store)
+    await analyzer.analyze_anomalies(
+        anomalies=[ecommerce_anomaly()],
+        system_model=sample_system_model,
+        evidence=bundle,
+    )
+    assert captured_prompt
+    prompt = captured_prompt[0]
+    # Very rough headroom: sum of section budgets plus prompt scaffolding
+    # plus truncation markers. Token ≈ chars/4.
+    total_budget_tokens = (
+        ANOMALIES_BUDGET_TOKENS
+        + EVIDENCE_BUDGET_TOKENS
+        + CHANGES_BUDGET_TOKENS
+        + BUSINESS_CONTEXT_BUDGET_TOKENS
+        + SYSTEM_SUMMARY_BUDGET_TOKENS
+    )
+    ceiling_chars = (total_budget_tokens + 2_000) * 4
+    assert len(prompt) < ceiling_chars, (
+        f"Prompt {len(prompt)} chars exceeded ceiling {ceiling_chars}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_logs_prompt_size(
+    tmp_store, sample_system_model: SystemModel, caplog
+) -> None:
+    """A prompt-size breakdown line must be emitted for every anomaly
+    analysis call so a future mystery overflow leaves a grep-able trace.
+    Uses a synthetic e-commerce anomaly per Tier 0.
+    """
+    import logging as std_logging
+
+    from tests.fixtures.synthetic_schemas import ecommerce_anomaly
+
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+    with caplog.at_level(std_logging.DEBUG, logger="observibot.agent.prompt_utils"):
+        await analyzer.analyze_anomalies(
+            anomalies=[ecommerce_anomaly()],
+            system_model=sample_system_model,
+        )
+    matched = [
+        r for r in caplog.records
+        if "anomaly_analysis prompt" in r.getMessage()
+    ]
+    assert matched, "Expected a log line with 'anomaly_analysis prompt' breakdown"
+    # Breakdown must include every section label so operators can see where
+    # tokens went when the prompt ever approaches a limit.
+    msg = matched[-1].getMessage()
+    for label in ("anomalies", "evidence", "changes", "system_summary"):
+        assert f"{label}=~" in msg, f"missing label {label!r} in prompt breakdown"

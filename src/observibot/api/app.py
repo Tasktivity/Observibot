@@ -10,6 +10,7 @@ from observibot import __version__
 from observibot.api.routes import (
     auth,
     chat,
+    diagnostics,
     discovery,
     events,
     insights,
@@ -44,6 +45,7 @@ def create_app() -> FastAPI:
     app.include_router(widgets.router)
     app.include_router(chat.router)
     app.include_router(knowledge.router)
+    app.include_router(diagnostics.router)
 
     if FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

@@ -1,6 +1,7 @@
 """LLM analyzer — turns anomalies + context into Insight objects."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Iterable
@@ -17,23 +18,54 @@ from observibot.agent.llm_provider import (
     LLMSoftError,
     estimate_cost_usd,
 )
+from observibot.agent.prompt_utils import enforce_budget, log_prompt_size, sample_rows
 from observibot.agent.prompts import (
     ANOMALY_ANALYSIS_PROMPT,
+    DIAGNOSTIC_HYPOTHESIS_PROMPT,
     ON_DEMAND_QUERY_PROMPT,
     SYSTEM_ANALYSIS_PROMPT,
     TEXT_TO_SQL_PROMPT,
 )
+from observibot.agent.schema_catalog import (
+    _is_sensitive_column,
+    build_app_schema_description,
+    get_app_table_names,
+)
 from observibot.agent.schemas import (
+    DiagnosticHypothesisResponse,
+    DiagnosticQuery,
     LLMAnalysisResponse,
     LLMQueryResponse,
     LLMSystemAnalysis,
 )
 from observibot.core.anomaly import Anomaly, compute_anomaly_signature
-from observibot.core.evidence import EvidenceBundle
+from observibot.core.app_db import AppDatabasePool
+from observibot.core.config import DiagnosticsConfig
+from observibot.core.evidence import (
+    DiagnosticEvidence,
+    EvidenceBundle,
+    RecurrenceEvidence,
+)
 from observibot.core.models import ChangeEvent, Insight, MetricSnapshot, SystemModel
+from observibot.core.sql_sandbox import (
+    QueryValidationError,
+    explain_check,
+    validate_query,
+)
 from observibot.core.store import Store
 
 log = logging.getLogger(__name__)
+
+
+# Per-section budgets for the anomaly analysis prompt. Sum sits well under
+# any current model context window with headroom for the response. Each
+# value is a token count (scale-invariant): it caps how much of a section
+# the LLM ever sees, not how much data we collect.
+ANOMALIES_BUDGET_TOKENS = 3_000
+EVIDENCE_BUDGET_TOKENS = 6_000
+CHANGES_BUDGET_TOKENS = 2_000
+BUSINESS_CONTEXT_BUDGET_TOKENS = 2_000
+SYSTEM_SUMMARY_BUDGET_TOKENS = 4_000
 
 
 def summarize_system(model: SystemModel | None) -> str:
@@ -226,13 +258,35 @@ class Analyzer:
         # callers and tests continue to work unchanged.
         if evidence is None:
             evidence = EvidenceBundle.from_recurrence_map(recurrence_context)
-        prompt = ANOMALY_ANALYSIS_PROMPT.format(
-            anomalies=summarize_anomalies(anomalies),
-            evidence=summarize_evidence(evidence),
-            changes=summarize_changes(recent_changes or []),
-            business_context=json.dumps(business_context or {}, indent=2),
-            system_summary=summarize_system(system_model),
-        )
+        sections = {
+            "anomalies": enforce_budget(
+                summarize_anomalies(anomalies),
+                ANOMALIES_BUDGET_TOKENS,
+                "anomalies",
+            ),
+            "evidence": enforce_budget(
+                summarize_evidence(evidence),
+                EVIDENCE_BUDGET_TOKENS,
+                "evidence",
+            ),
+            "changes": enforce_budget(
+                summarize_changes(recent_changes or []),
+                CHANGES_BUDGET_TOKENS,
+                "changes",
+            ),
+            "business_context": enforce_budget(
+                json.dumps(business_context or {}, indent=2),
+                BUSINESS_CONTEXT_BUDGET_TOKENS,
+                "business_context",
+            ),
+            "system_summary": enforce_budget(
+                summarize_system(system_model),
+                SYSTEM_SUMMARY_BUDGET_TOKENS,
+                "system_summary",
+            ),
+        }
+        prompt = ANOMALY_ANALYSIS_PROMPT.format(**sections)
+        log_prompt_size(prompt, "anomaly_analysis", sections)
         try:
             response = await self.provider.analyze(
                 system_prompt="You are Observibot. Output only JSON.",
@@ -366,6 +420,197 @@ class Analyzer:
             "encoding": response.data.get("encoding", {}),
         }
         return sql, widget_hints
+
+    async def generate_diagnostic_queries(
+        self,
+        anomalies: list[Anomaly],
+        system_model: SystemModel | None,
+        recent_changes: list[ChangeEvent] | None = None,
+        recurrence: dict[str, RecurrenceEvidence] | None = None,
+        max_schema_tokens: int = 4_000,
+    ) -> list[DiagnosticQuery]:
+        """Ask the LLM for up to 3 diagnostic SQL queries to investigate
+        ``anomalies``. Returns ``[]`` on any failure — the caller treats an
+        empty list as "no evidence available," not as an error.
+
+        Uses anomaly-scoped schema retrieval (narrower than chat's 15
+        tables, since diagnostics should target fewer tables). Validation
+        and execution are separate concerns handled in
+        :meth:`execute_diagnostics`.
+        """
+        if not anomalies:
+            return []
+        if system_model is None or not system_model.tables:
+            # Without a schema the LLM would hallucinate table names, and
+            # the sandbox would reject every query. Skip the call.
+            return []
+
+        schema_text = build_app_schema_description(
+            system_model,
+            question=summarize_anomalies(anomalies),
+            full_detail_tables=8,
+        )
+
+        sections = {
+            "anomalies": enforce_budget(
+                summarize_anomalies(anomalies),
+                ANOMALIES_BUDGET_TOKENS,
+                "diag_anomalies",
+            ),
+            "changes": enforce_budget(
+                summarize_changes(recent_changes or []),
+                CHANGES_BUDGET_TOKENS,
+                "diag_changes",
+            ),
+            "recurrence": enforce_budget(
+                _summarize_recurrence_lines(recurrence or {}),
+                EVIDENCE_BUDGET_TOKENS,
+                "diag_recurrence",
+            ),
+            "schema": enforce_budget(
+                schema_text, max_schema_tokens, "diag_schema",
+            ),
+        }
+        prompt = DIAGNOSTIC_HYPOTHESIS_PROMPT.format(**sections)
+        log_prompt_size(prompt, "diagnostic_hypothesis", sections)
+
+        try:
+            response = await self.provider.analyze(
+                system_prompt="You are Observibot. Output only JSON.",
+                user_prompt=prompt,
+            )
+        except LLMHardError as exc:
+            log.warning("LLM hard failure during diagnostic hypothesis: %s", exc)
+            await self._record_failure("diagnostic_hypothesis", "hard", str(exc))
+            return []
+        except LLMError as exc:
+            log.warning("LLM soft failure during diagnostic hypothesis: %s", exc)
+            await self._record_failure("diagnostic_hypothesis", "soft", str(exc))
+            return []
+        except Exception as exc:
+            log.warning("Unexpected failure during diagnostic hypothesis: %s", exc)
+            await self._record_failure(
+                "diagnostic_hypothesis", "soft", f"unexpected: {exc}",
+            )
+            return []
+
+        try:
+            validated = DiagnosticHypothesisResponse.model_validate(response.data)
+        except ValidationError as exc:
+            log.warning("Diagnostic hypothesis schema validation failed: %s", exc)
+            await self._record_failure(
+                "diagnostic_hypothesis", "soft", f"validation error: {exc}",
+            )
+            return []
+
+        await self._record_usage(response, purpose="diagnostic_hypothesis")
+        # Defensive: Pydantic enforces max_length=3, but a future lib bump
+        # must not silently raise the fan-out.
+        return list(validated.queries[:3])
+
+    async def execute_diagnostics(
+        self,
+        queries: list[DiagnosticQuery],
+        app_db: AppDatabasePool | None,
+        system_model: SystemModel | None,
+        *,
+        cfg: DiagnosticsConfig,
+    ) -> list[DiagnosticEvidence]:
+        """Run each query through the full 5-layer sandbox and return
+        one :class:`DiagnosticEvidence` per input query.
+
+        Rejected/errored queries return evidence with a populated
+        ``error`` field rather than being silently dropped — auditability
+        (Step 3.4 objective O5) requires the operator can reconstruct
+        which queries the LLM tried but couldn't run.
+
+        EXPLAIN is fail-CLOSED here (opposite of chat's fail-open): when
+        the planner can't produce a cost, autonomous diagnostics suppress
+        rather than run.
+        """
+        if not queries:
+            return []
+
+        now = datetime.now(UTC)
+        if (
+            app_db is None
+            or not app_db.is_connected
+            or system_model is None
+        ):
+            reason = "application database unavailable"
+            return [
+                DiagnosticEvidence(
+                    hypothesis=q.hypothesis,
+                    sql=q.sql,
+                    row_count=0,
+                    explanation=q.explanation,
+                    executed_at=now,
+                    error=reason,
+                )
+                for q in queries
+            ]
+
+        allowed = get_app_table_names(system_model)
+        results: list[DiagnosticEvidence] = []
+        max_rows = cfg.max_rows_per_query
+        per_query_timeout = cfg.statement_timeout_ms / 1000.0
+
+        async with app_db.acquire() as conn:
+            for q in queries:
+                evidence = DiagnosticEvidence(
+                    hypothesis=q.hypothesis,
+                    sql=q.sql,
+                    row_count=0,
+                    explanation=q.explanation,
+                    executed_at=datetime.now(UTC),
+                )
+                try:
+                    validated = validate_query(
+                        q.sql, allowed_tables=allowed, max_limit=max_rows,
+                    )
+                except QueryValidationError as exc:
+                    evidence.error = f"sandbox rejected: {exc}"
+                    results.append(evidence)
+                    continue
+                except Exception as exc:
+                    evidence.error = f"sandbox rejected: {exc}"
+                    results.append(evidence)
+                    continue
+
+                evidence.sql = validated
+
+                ok, cost, reason = await _explain_check_fail_closed(
+                    conn, validated, cfg.explain_cost_threshold,
+                )
+                if not ok:
+                    evidence.error = f"EXPLAIN rejected: {reason} (cost={cost:.0f})"
+                    results.append(evidence)
+                    continue
+
+                try:
+                    rows = await asyncio.wait_for(
+                        conn.fetch(validated), timeout=per_query_timeout,
+                    )
+                except TimeoutError:
+                    evidence.error = (
+                        f"timeout after {cfg.statement_timeout_ms}ms"
+                    )
+                    results.append(evidence)
+                    continue
+                except Exception as exc:
+                    evidence.error = f"execution failed: {exc}"
+                    results.append(evidence)
+                    continue
+
+                row_dicts = [_redact_row(dict(r)) for r in rows]
+                sample, _description = sample_rows(
+                    row_dicts, max_rows=max_rows,
+                )
+                evidence.row_count = len(row_dicts)
+                evidence.rows = sample
+                results.append(evidence)
+
+        return results
 
     async def _persist(self, insights: list[Insight]) -> None:
         if self.store is None:
@@ -621,6 +866,83 @@ class CorrelationDetector:
             confidence=0.3,
             source="code_correlation",
         )
+
+
+def _summarize_recurrence_lines(
+    recurrence: dict[str, RecurrenceEvidence] | None,
+) -> str:
+    """Render a compact, one-line-per-metric recurrence summary for the
+    diagnostic hypothesis prompt. Absent or empty input yields "(none)".
+    """
+    if not recurrence:
+        return "(none)"
+    lines: list[str] = []
+    for metric, rec in sorted(recurrence.items()):
+        if rec.count <= 0:
+            continue
+        hrs = (
+            f", common hours={rec.common_hours}"
+            if rec.common_hours else ""
+        )
+        last = f", last seen {rec.last_seen[:10]}" if rec.last_seen else ""
+        lines.append(f"- {metric}: {rec.count} prior occurrences{hrs}{last}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _redact_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize one diagnostic result row.
+
+    Two concerns in one pass so every row hits the sanitizer exactly once:
+
+    - Sensitive columns (api keys, tokens, password hashes) are replaced
+      with ``[REDACTED]``. Shares the column-name pattern list with
+      chat's ``_exec_application`` so both surfaces converge on a
+      single redaction policy.
+    - Non-JSON-primitive values (UUID, datetime, Decimal, asyncpg
+      Records, etc.) are coerced to ``str`` so the final evidence dict
+      round-trips through :func:`json.dumps` when ``Insight.evidence``
+      is persisted by :meth:`Store.save_insight`.
+    """
+    for key in list(row.keys()):
+        if _is_sensitive_column(str(key)):
+            row[key] = "[REDACTED]"
+            continue
+        value = row[key]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            continue
+        row[key] = str(value)
+    return row
+
+
+async def _explain_check_fail_closed(
+    conn: Any, sql: str, threshold: float,
+) -> tuple[bool, float, str]:
+    """Fail-closed EXPLAIN gate for autonomous diagnostics.
+
+    The chat-path ``explain_check`` fails open (returns ``True, 0.0`` on
+    EXPLAIN error) because a typed user is on the other end waiting for
+    feedback. Autonomous diagnostics have no such tiebreaker: if we can't
+    confirm the plan cost, we must suppress the query rather than run it.
+    """
+
+    async def _runner(sql_to_explain: str) -> Any:
+        row = await conn.fetchrow(sql_to_explain)
+        return row[0] if row else None
+
+    try:
+        ok, cost = await explain_check(_runner, sql, threshold)
+    except Exception as exc:
+        return False, 0.0, f"EXPLAIN raised: {exc}"
+    if not ok:
+        return False, cost, "cost above threshold"
+    if cost <= 0.0:
+        # Autonomous diagnostics only ever run against the application DB
+        # (asyncpg/Postgres). A non-positive cost means either the
+        # planner didn't give us a number or EXPLAIN output parsing
+        # failed — either way we can't confirm the query is bounded, so
+        # suppress.
+        return False, 0.0, "cost unavailable"
+    return True, cost, "ok"
 
 
 def _describe_store_schema(allowed_tables: set[str]) -> str:

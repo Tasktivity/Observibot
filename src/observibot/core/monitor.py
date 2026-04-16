@@ -20,11 +20,15 @@ from observibot.agent.analyzer import Analyzer
 from observibot.agent.llm_provider import LLMHardError
 from observibot.alerting.base import AlertManager
 from observibot.connectors.base import BaseConnector, Capability
-from observibot.core.anomaly import Anomaly, build_detector_from_config
+from observibot.core.anomaly import (
+    Anomaly,
+    build_detector_from_config,
+    compute_anomaly_signature,
+)
 from observibot.core.code_intelligence.schema_analyzer import analyze_schema_for_facts
 from observibot.core.config import ObservibotConfig
 from observibot.core.discovery import DiscoveryEngine, diff_models
-from observibot.core.evidence import EvidenceBundle
+from observibot.core.evidence import DiagnosticEvidence, EvidenceBundle
 from observibot.core.models import Insight, SystemModel
 from observibot.core.seasonal import compute_seasonal_updates, hour_of_week
 from observibot.core.store import Store
@@ -182,6 +186,14 @@ class MonitorLoop:
         self._health_port = health_port
         self._health_task: asyncio.Task[None] | None = None
         self._app_db: object | None = None
+        # Diagnostic hypothesis-test cooldown cache. Key = anomaly
+        # signature (stable fingerprint of metric+labels+direction per
+        # Step 3.2); value = (cached_at, evidence_list). Prevents a
+        # sustained incident from firing the LLM + sandbox on every
+        # analysis cycle.
+        self._diagnostic_cache: dict[
+            str, tuple[datetime, list[DiagnosticEvidence]]
+        ] = {}
 
     # ---------- event emission ----------
 
@@ -826,14 +838,13 @@ class MonitorLoop:
             recurrence_map = {}
 
         # Step 3.3: build a unified EvidenceBundle for this cycle. Today it
-        # carries recurrence only; Step 3.4 will populate correlations and
-        # diagnostic query results on the same bundle before the analyzer
-        # is invoked.
+        # carries recurrence only; Step 3.4 populates diagnostics via the
+        # hypothesis-test loop below.
         pending_bundle = EvidenceBundle.from_recurrence_map(recurrence_map)
-        # TODO(step-3.4): invoke CorrelationDetector here and extend
+        # TODO(future-step): invoke CorrelationDetector here and extend
         # pending_bundle.correlations before the analyzer call.
-        # TODO(step-3.4): run sandboxed diagnostic queries and extend
-        # pending_bundle.diagnostics before the analyzer call.
+
+        await self._maybe_run_diagnostics(anomalies, pending_bundle)
 
         try:
             insights = await self.analyzer.analyze_anomalies(
@@ -884,6 +895,115 @@ class MonitorLoop:
             )
             await self.alert_manager.dispatch(insight)
         return saved_insights
+
+    async def _maybe_run_diagnostics(
+        self,
+        anomalies: list[Anomaly],
+        pending_bundle: EvidenceBundle,
+    ) -> None:
+        """Hypothesis-test loop: generate SQL queries against the app DB
+        and attach evidence to ``pending_bundle.diagnostics`` when it's
+        safe to do so.
+
+        The whole phase degrades to "no diagnostics" on any failure —
+        never raises. Hard ceilings bound wall-clock; cooldown cache
+        suppresses repeat firings of the same anomaly signature.
+        """
+        diag_cfg = self.config.monitor.diagnostics
+        if not diag_cfg.enabled:
+            return
+        if self._app_db is None or not getattr(self._app_db, "is_connected", False):
+            return
+        if self._cached_model is None or not anomalies:
+            return
+
+        # Gate 1 (Gemini-4.2 / ChatGPT-6): skip cold-start rolling
+        # anomalies unless severity is critical. A seasonal anomaly
+        # (weeks_observed >= 4) has enough history to trust.
+        diag_candidates = [
+            a for a in anomalies
+            if a.baseline_source == "seasonal" or a.severity == "critical"
+        ]
+        if not diag_candidates:
+            return
+
+        # Gate 2 (Gemini-7.1): if the circuit breaker is open, do not
+        # spend an LLM call on diagnostics either.
+        if self.circuit_breaker.is_open():
+            return
+
+        sig = compute_anomaly_signature(diag_candidates)
+        now = datetime.now(UTC)
+        cooldown = timedelta(minutes=diag_cfg.cooldown_minutes)
+        run_id = uuid.uuid4().hex[:12]
+
+        cached = self._diagnostic_cache.get(sig)
+        if cached and (now - cached[0]) < cooldown:
+            pending_bundle.diagnostics = list(cached[1])
+            await self._emit(
+                "diagnostic_skipped", "analysis_cycle",
+                "monitor_runs", run_id,
+                severity="info",
+                summary=f"diagnostic cooldown active (sig={sig[:8]})",
+                run_id=run_id,
+            )
+        else:
+            try:
+                diag_queries = await asyncio.wait_for(
+                    self.analyzer.generate_diagnostic_queries(
+                        anomalies=diag_candidates,
+                        system_model=self._cached_model,
+                        recent_changes=None,
+                        recurrence=pending_bundle.recurrence,
+                    ),
+                    timeout=diag_cfg.hypothesis_timeout_s,
+                )
+                evidence_list = await asyncio.wait_for(
+                    self.analyzer.execute_diagnostics(
+                        queries=diag_queries,
+                        app_db=self._app_db,
+                        system_model=self._cached_model,
+                        cfg=diag_cfg,
+                    ),
+                    timeout=diag_cfg.execution_timeout_s,
+                )
+                pending_bundle.diagnostics = evidence_list
+                self._diagnostic_cache[sig] = (now, evidence_list)
+                ok = sum(1 for e in evidence_list if not e.error)
+                rej = sum(1 for e in evidence_list if e.error)
+                await self._emit(
+                    "diagnostic_run", "analysis_cycle",
+                    "monitor_runs", run_id,
+                    severity="info",
+                    summary=(
+                        f"{len(evidence_list)} diagnostic(s): "
+                        f"{ok} succeeded, {rej} rejected/errored"
+                    ),
+                    run_id=run_id,
+                )
+            except TimeoutError:
+                log.warning(
+                    "Diagnostic phase exceeded hard ceiling; proceeding "
+                    "without evidence"
+                )
+                await self._emit(
+                    "diagnostic_timeout", "analysis_cycle",
+                    "monitor_runs", run_id,
+                    severity="warning",
+                    summary="diagnostic phase timed out",
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Diagnostic phase failed: %s — proceeding without", exc
+                )
+
+        # Evict entries older than the current cooldown so the cache
+        # stays bounded without a separate timer task.
+        self._diagnostic_cache = {
+            k: v for k, v in self._diagnostic_cache.items()
+            if (now - v[0]) < cooldown
+        }
 
     async def trigger_analysis(self, anomalies: list[Anomaly]) -> list[Insight]:
         """Force an analysis pass with the supplied anomalies."""

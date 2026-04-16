@@ -174,6 +174,11 @@ class DiagnosticsConfig:
     max_rows_per_query: int = 50
     cooldown_minutes: int = 10
     fail_closed_on_explain_error: bool = True
+    # Wall-clock ceilings bounding each autonomous cycle so a stalled LLM
+    # or runaway sandbox batch can never block the analysis loop. Values
+    # are in seconds; Tier 0 scale-invariant (time, not rows/tables).
+    hypothesis_timeout_s: float = 10.0
+    execution_timeout_s: float = 10.0
 
 
 @dataclass
@@ -390,6 +395,10 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         fail_closed_on_explain_error=bool(
             diag_raw.get("fail_closed_on_explain_error", True)
         ),
+        hypothesis_timeout_s=float(
+            diag_raw.get("hypothesis_timeout_s", 10.0)
+        ),
+        execution_timeout_s=float(diag_raw.get("execution_timeout_s", 10.0)),
     )
     monitor = MonitorConfig(
         collection_interval_seconds=int(mon_raw.get("collection_interval_seconds", 300)),

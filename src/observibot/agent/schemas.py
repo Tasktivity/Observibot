@@ -91,3 +91,33 @@ class LLMQueryResponse(BaseModel):
     answer: str = ""
     evidence: list[str] = Field(default_factory=list)
     follow_ups: list[str] = Field(default_factory=list)
+
+
+class DiagnosticQuery(BaseModel):
+    """One hypothesis + the SQL the LLM wants to run to confirm or rule it out.
+
+    Step 3.4 hypothesis-test loop: the LLM emits up to three of these per
+    alertable anomaly set, and the monitor pushes them through the 5-layer
+    sandbox before feeding the results back into synthesis. SQL is hard-
+    capped at 2000 chars because anything longer is almost certainly a
+    hallucinated pasted schema and should be rejected early.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    hypothesis: str = Field(..., min_length=1, max_length=500)
+    sql: str = Field(..., min_length=1, max_length=2000)
+    explanation: str = Field(default="", max_length=500)
+
+
+class DiagnosticHypothesisResponse(BaseModel):
+    """LLM response shape for the diagnostic-query generation (Call A) step.
+
+    Pydantic's ``max_length=3`` enforces the hard cap; the analyzer
+    additionally truncates ``validated.queries[:3]`` after validation so a
+    future Pydantic behavior change can never quietly raise the fan-out.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    queries: list[DiagnosticQuery] = Field(default_factory=list, max_length=3)

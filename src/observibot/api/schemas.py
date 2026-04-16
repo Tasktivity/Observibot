@@ -40,6 +40,13 @@ class InsightResponse(BaseModel):
     is_hypothesis: bool = False
     created_at: str
     recurrence_context: dict | None = None
+    # Step 3.4 unified evidence carrier, serialized from
+    # :class:`observibot.core.evidence.EvidenceBundle`. May contain
+    # ``recurrence``, ``correlations``, and ``diagnostics``. Rendered in
+    # the Discovery Feed so the operator can inspect the actual queries
+    # the agent ran rather than just its narrative.
+    evidence: dict | None = None
+    run_id: str | None = None
 
 
 class MetricResponse(BaseModel):

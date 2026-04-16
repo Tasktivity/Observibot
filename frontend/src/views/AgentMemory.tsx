@@ -1,3 +1,4 @@
+import { DiagnosticActivityPanel } from '../components/DiagnosticActivityPanel';
 import { FactsTable } from '../components/FactsTable';
 import { FeedbackSummary } from '../components/FeedbackSummary';
 import { KnowledgeStats } from '../components/KnowledgeStats';
@@ -20,6 +21,7 @@ export function AgentMemory() {
         </div>
         <KnowledgeStats />
         <SeasonalCoveragePanel />
+        <DiagnosticActivityPanel />
         <div className="mb-4">
           <FactsTable />
         </div>

@@ -42,6 +42,48 @@ export interface RecurrenceContext {
   common_hours: number[];
 }
 
+export interface DiagnosticEvidence {
+  hypothesis: string;
+  sql: string;
+  row_count: number;
+  rows: Array<Record<string, unknown>>;
+  explanation: string;
+  executed_at: string;
+  error: string | null;
+}
+
+export interface CorrelationEvidence {
+  metric_name: string;
+  change_event_id: string;
+  change_type: string;
+  change_summary: string;
+  time_delta_seconds: number;
+  severity_score: number;
+}
+
+export interface EvidenceBundle {
+  recurrence?: Record<string, RecurrenceContext & { metric_name?: string }>;
+  correlations?: CorrelationEvidence[];
+  diagnostics?: DiagnosticEvidence[];
+}
+
+export interface DiagnosticActivity {
+  last_24h: {
+    runs: number;
+    skipped_cooldown: number;
+    timed_out: number;
+    queries_issued: number;
+    queries_succeeded: number;
+    queries_rejected: number;
+  };
+  recent_runs: Array<{
+    run_id: string | null;
+    occurred_at: string;
+    event_type: string;
+    summary: string | null;
+  }>;
+}
+
 export interface SeasonalCoverage {
   total_buckets: number;
   trusted_buckets: number;
@@ -64,6 +106,7 @@ export interface Insight {
   is_hypothesis: boolean;
   created_at: string;
   recurrence_context?: RecurrenceContext | null;
+  evidence?: EvidenceBundle | null;
 }
 
 export interface ObservationEvent {
@@ -256,6 +299,9 @@ export const api = {
   health: {
     seasonalCoverage: () =>
       request<SeasonalCoverage>('/health/seasonal-coverage'),
+  },
+  diagnostics: {
+    recent: () => request<DiagnosticActivity>('/diagnostics/recent'),
   },
   events: {
     list: (params?: { event_type?: string; subject?: string; limit?: number }) => {

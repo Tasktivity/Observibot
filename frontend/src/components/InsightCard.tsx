@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { Insight } from '../api/client';
 import { api } from '../api/client';
 import { formatTimestamp } from '../utils/format';
+import { DiagnosticEvidencePanel } from './DiagnosticEvidencePanel';
 
 const SEVERITY_COLORS: Record<string, string> = {
   critical: 'bg-red-500/20 text-red-400 border-red-500/30',
@@ -93,6 +94,10 @@ export function InsightCard({
             )}
           </span>
         </div>
+      )}
+      {/* Diagnostic evidence — queries the agent ran to back this insight */}
+      {insight.evidence?.diagnostics && insight.evidence.diagnostics.length > 0 && (
+        <DiagnosticEvidencePanel diagnostics={insight.evidence.diagnostics} />
       )}
       {/* Feedback buttons */}
       <div className="mt-2 flex items-center gap-1 flex-wrap">

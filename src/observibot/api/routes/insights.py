@@ -36,6 +36,7 @@ async def list_insights(
             is_hypothesis=i.is_hypothesis,
             created_at=i.created_at.isoformat(),
             recurrence_context=i.recurrence_context,
+            evidence=i.evidence,
         )
         for i in insights
     ]

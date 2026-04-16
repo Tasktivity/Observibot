@@ -118,6 +118,55 @@ System summary:
 {system_summary}
 """
 
+DIAGNOSTIC_HYPOTHESIS_PROMPT = """\
+You are Observibot's diagnostic generator. An anomaly has fired on a
+monitored application. Your job is to propose up to 3 SQL SELECT queries
+against the application database that would confirm or rule out the most
+likely root causes.
+
+Hard rules:
+- SELECT statements only. No INSERT, UPDATE, DELETE, DDL, or functions
+  that modify state.
+- Only tables listed in the schema below may be referenced. Reference
+  them with an optional ``public.`` qualifier; other schemas will be
+  rejected by the sandbox.
+- Every query must include a LIMIT clause of 50 or fewer.
+- No query should take more than 2 seconds under typical load. Prefer
+  indexed lookups, aggregate queries on small result sets, and
+  ``pg_stat_*`` system views over scans of large application tables.
+- Do NOT generate queries that reference sensitive columns (api keys,
+  tokens, passwords, secrets). They will be redacted if returned anyway.
+
+Respond with VALID JSON ONLY. No prose. No markdown. No code fences.
+
+Schema:
+{{
+  "queries": [
+    {{
+      "hypothesis": "short human-readable hypothesis being tested",
+      "sql": "SELECT ... LIMIT 50",
+      "explanation": "what a non-empty / specific result would tell us"
+    }}
+  ]
+}}
+
+Return fewer than 3 queries (including 0) if you don't have
+high-confidence hypotheses. A single well-chosen query is better than
+three speculative ones.
+
+Detected anomalies:
+{anomalies}
+
+Recent change events:
+{changes}
+
+Historical recurrence (last 30 days):
+{recurrence}
+
+Application schema (read-only, SELECT only):
+{schema}
+"""
+
 ON_DEMAND_QUERY_PROMPT = """\
 You are Observibot, an autonomous AI Site Reliability Engineer.
 
