@@ -133,3 +133,66 @@ def test_summarize_system_includes_tables(sample_system_model: SystemModel) -> N
     text = summarize_system(sample_system_model)
     assert "public.users" in text
     assert "public.tasks" in text
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_returns_unsaved_insights(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """Happy path: analyze_anomalies must NOT call save_insight — the caller
+    is responsible for enriching and persisting."""
+    from unittest.mock import AsyncMock
+
+    spy_store = AsyncMock(wraps=tmp_store)
+    analyzer = Analyzer(provider=MockProvider(), store=spy_store)
+    insights = await analyzer.analyze_anomalies(
+        anomalies=[_anomaly()],
+        system_model=sample_system_model,
+    )
+    assert insights
+    assert insights[0].source == "llm"
+    spy_store.save_insight.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_hard_failure_still_persists_fallback(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """Hard failure: fallback insight must be persisted before re-raising,
+    because the caller's except block doesn't run the enrichment path."""
+
+    class HardFailingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise LLMHardError("401 unauthorized")
+
+    analyzer = Analyzer(provider=HardFailingProvider(), store=tmp_store)
+    with pytest.raises(LLMHardError):
+        await analyzer.analyze_anomalies(
+            anomalies=[_anomaly()],
+            system_model=sample_system_model,
+        )
+    stored = await tmp_store.get_recent_insights()
+    assert any(i.source == "anomaly" for i in stored)
+
+
+@pytest.mark.asyncio
+async def test_analyze_anomalies_soft_failure_returns_unsaved_fallback(
+    tmp_store, sample_system_model: SystemModel
+) -> None:
+    """Soft failure: returns unsaved fallback. The caller is responsible for
+    enriching and persisting it."""
+    from unittest.mock import AsyncMock
+
+    class FailingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise RuntimeError("transient timeout")
+
+    spy_store = AsyncMock(wraps=tmp_store)
+    analyzer = Analyzer(provider=FailingProvider(), store=spy_store)
+    insights = await analyzer.analyze_anomalies(
+        anomalies=[_anomaly()],
+        system_model=sample_system_model,
+    )
+    assert len(insights) == 1
+    assert insights[0].source == "anomaly"
+    spy_store.save_insight.assert_not_called()

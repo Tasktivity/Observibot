@@ -1,6 +1,7 @@
 """Agentic chat pipeline — multi-domain tool calling with plan-then-interpret."""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -581,6 +582,18 @@ async def run_chat_agent(
         if tr.success:
             all_data.extend(tr.rows)
 
+    unsupported = _find_unsupported_numbers(narrative, tool_results)
+    if unsupported:
+        warnings.append(
+            "Narrative cites numbers not found in query results: "
+            + ", ".join(unsupported[:5])
+            + ". Re-run the question if precision matters."
+        )
+        log.warning(
+            "Synthesis included %d unsupported number(s): %s",
+            len(unsupported), unsupported[:10],
+        )
+
     widget_plan = _build_widget_plan(widget_config, all_data)
     vega = _build_vega_spec(widget_plan) if widget_plan else None
 
@@ -862,6 +875,89 @@ def _sample_rows(rows: list[dict], max_rows: int = 50) -> tuple[list[dict], str]
     # Default: head + tail so the LLM at least sees both ends of the range.
     sample = rows[:15] + rows[-5:]
     return sample, f"20 of {n} rows (first 15 + last 5)"
+
+
+_NARRATIVE_NUMBER_RE = re.compile(r"(?<![A-Za-z_])(\d[\d,]*(?:\.\d+)?)(?![A-Za-z_])")
+
+
+def _find_unsupported_numbers(
+    narrative: str, results: list[ToolResult],
+) -> list[str]:
+    """Flag numbers in the narrative that aren't traceable to tool results.
+
+    A narrative like ``"117 jobs and 68 files stuck"`` where neither 117 nor
+    68 appear in any fetched row or cell is a hallucination — the exact
+    failure mode we saw in production. This doesn't block the response (that
+    would be too aggressive for a chat UI) but surfaces the problem as a
+    warning so the user and future tests can see it.
+
+    Returns the list of suspicious number strings (empty if all accounted for).
+    """
+    if not narrative or not results:
+        return []
+
+    # Collect every numeric value and row-count from every successful tool
+    # result. Row values are cast to string and matched by substring so
+    # percentages, ratios, and formatted variants all hit.
+    supported: set[float] = set()
+    supported_strings: set[str] = set()
+    total_rows_across_tools = 0
+    column_sums: dict[str, float] = {}
+
+    for tr in results:
+        if not tr.success:
+            continue
+        total_rows_across_tools += len(tr.rows)
+        supported.add(float(len(tr.rows)))
+        for row in tr.rows:
+            for k, v in row.items():
+                if v is None:
+                    continue
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    f = float(v)
+                    supported.add(f)
+                    # Percentages: if values look like fractions, also allow
+                    # the 100x form that narratives usually prefer.
+                    if 0 < abs(f) < 1:
+                        supported.add(round(f * 100, 4))
+                    column_sums[k] = column_sums.get(k, 0.0) + f
+                else:
+                    s = str(v)
+                    supported_strings.add(s)
+                    with contextlib.suppress(ValueError):
+                        supported.add(float(s.replace(",", "")))
+    for s in column_sums.values():
+        supported.add(round(s, 4))
+    supported.add(float(total_rows_across_tools))
+
+    unsupported: list[str] = []
+    for match in _NARRATIVE_NUMBER_RE.finditer(narrative):
+        token = match.group(1)
+        if token in supported_strings:
+            continue
+        # Skip very small integers: they're usually structural ("2-3 sentence
+        # answer", "1 year", "first 10") rather than data claims.
+        try:
+            value = float(token.replace(",", ""))
+        except ValueError:
+            continue
+        if value < 10 and value == int(value):
+            continue
+        # Allow rounding slop: narratives round 99.3% → 99% and 836 → 840.
+        # We accept within ±2% of any supported value, or exact match on the
+        # integer part.
+        if any(
+            abs(value - s) <= max(0.5, abs(s) * 0.02)
+            for s in supported
+        ):
+            continue
+        # Date-like years (1900-2100) are usually structural.
+        if value == int(value) and 1900 <= value <= 2100:
+            continue
+        unsupported.append(token)
+    return unsupported
 
 
 def _format_tool_results(results: list[ToolResult]) -> str:

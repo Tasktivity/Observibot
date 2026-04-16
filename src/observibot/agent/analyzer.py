@@ -132,16 +132,22 @@ class Analyzer:
         business_context: dict[str, Any] | None = None,
         recurrence_context: dict[str, dict] | None = None,
     ) -> list[Insight]:
-        """Produce :class:`Insight` objects for the given anomalies.
+        """Produce unsaved :class:`Insight` objects for the given anomalies.
 
-        On any LLM failure — hard (auth/quota) or soft (bad JSON, validation,
-        timeout) — fall back to a deterministic raw-alert Insight so the
-        underlying signal is never silently dropped.
+        Returns unsaved Insight objects. The caller is responsible for enriching
+        (recurrence_context, diagnostic_evidence, etc.) and persisting via
+        store.save_insight(). This ordering is REQUIRED — save_insight has a
+        fingerprint-based dedup check that prevents re-saving an enriched
+        version of an already-persisted insight.
+
+        On soft LLM failure (bad JSON, timeout) the fallback insight is
+        returned unsaved — the caller enriches and persists it like any other.
 
         Raises:
             LLMHardError: propagated when the provider returned a hard failure,
                 so the monitor's circuit breaker can switch to long-backoff mode.
-                The fallback insight is still saved before re-raising.
+                The fallback insight is still saved before re-raising (the
+                caller's except block doesn't run the enrichment path).
         """
         if not anomalies:
             return []
@@ -166,9 +172,7 @@ class Analyzer:
         except LLMError as exc:
             log.warning("LLM soft failure during anomaly analysis: %s", exc)
             await self._record_failure("anomaly_analysis", "soft", str(exc))
-            fallback = [self._fallback_insight(anomalies, str(exc))]
-            await self._persist(fallback)
-            return fallback
+            return [self._fallback_insight(anomalies, str(exc))]
 
         await self._record_usage(response, purpose="anomaly_analysis")
 
@@ -202,10 +206,6 @@ class Analyzer:
                 source="llm",
             )
             insight.fingerprint = insight.compute_fingerprint()
-            if self.store is not None:
-                stored = await self.store.save_insight(insight)
-                if not stored:
-                    continue
             results.append(insight)
         return results
 

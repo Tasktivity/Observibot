@@ -33,6 +33,16 @@ DEFAULT_SYSTEM_SCHEMAS: tuple[str, ...] = (
 )
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a Postgres identifier safely for string interpolation.
+
+    asyncpg has no built-in identifier quoting (parameters are for values,
+    not names). We need this to splice schema/table/column names into SQL
+    we build dynamically for value sampling.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 class PostgreSQLConnector(BaseConnector):
     """Generic PostgreSQL connector."""
 
@@ -225,6 +235,11 @@ class PostgreSQLConnector(BaseConnector):
         except Exception as exc:
             log.debug("Column comment extraction failed: %s", exc)
 
+        try:
+            await self._enrich_with_value_distributions(conn, tables)
+        except Exception as exc:
+            log.debug("Value distribution sampling failed: %s", exc)
+
         return list(tables.values())
 
     async def _discover_relationships(self, conn: Any) -> list[Relationship]:
@@ -322,6 +337,99 @@ class PostgreSQLConnector(BaseConnector):
             for col in tbl.columns:
                 if col.get("name") == r["column_name"]:
                     col["comment"] = r["column_comment"]
+                    break
+
+    async def _enrich_with_value_distributions(
+        self, conn: Any, tables: dict[tuple[str, str], TableInfo],
+    ) -> None:
+        """Sample top values for enum-like columns so the LLM doesn't guess.
+
+        The LLM's planning prompt otherwise sees only ``status (text)`` and
+        falls back to English-convention guesses like ``'completed'`` —
+        catastrophically wrong when the real value is ``'complete'``. We
+        issue one bounded ``GROUP BY`` per candidate column, capped by a
+        server-side statement timeout so a bad column can never stall
+        discovery.
+        """
+        # Column-name patterns where "which discrete values exist" is the
+        # usual question and one GROUP BY per column is cheap enough. Each
+        # of these exhibits the same failure mode as status: the LLM guesses
+        # the most conventional English values and is confidently wrong.
+        enum_bares = {
+            "status", "state", "type", "kind", "role", "severity",
+            "level", "tier", "phase", "mode", "category",
+        }
+
+        def _is_enum_candidate(col: dict) -> bool:
+            name = (col.get("name") or "").lower()
+            col_type = (col.get("type") or "").lower()
+            matches_name = name in enum_bares or any(
+                name.endswith(f"_{bare}") for bare in enum_bares
+            )
+            if not matches_name:
+                return False
+            # Only text-like columns. Integer status codes don't exhibit
+            # the "English past-tense guess" failure mode this targets.
+            return any(
+                t in col_type
+                for t in ("text", "char", "varchar", "citext")
+            )
+
+        targets: list[tuple[str, str, str]] = []
+        for (schema, table), tbl in tables.items():
+            if tbl.row_count == 0:
+                continue
+            if tbl.row_count is not None and tbl.row_count > 10_000_000:
+                # Avoid GROUP BY on very large tables without an index hint.
+                continue
+            for col in tbl.columns:
+                if _is_enum_candidate(col):
+                    targets.append((schema, table, col["name"]))
+
+        if not targets:
+            return
+
+        try:
+            await conn.execute("SET LOCAL statement_timeout = '2s'")
+        except Exception as exc:
+            log.debug("Could not set statement_timeout for sampling: %s", exc)
+
+        for schema, table, column in targets:
+            qschema = _quote_ident(schema)
+            qtable = _quote_ident(table)
+            qcol = _quote_ident(column)
+            try:
+                rows = await conn.fetch(
+                    f"SELECT {qcol} AS v, COUNT(*) AS n "
+                    f"FROM {qschema}.{qtable} "
+                    f"GROUP BY 1 ORDER BY n DESC NULLS LAST LIMIT 20"
+                )
+            except Exception as exc:
+                log.debug(
+                    "Value sampling failed for %s.%s.%s: %s",
+                    schema, table, column, exc,
+                )
+                continue
+            total = sum(int(r["n"]) for r in rows)
+            if total <= 0:
+                continue
+            top_values = [
+                {
+                    "value": (None if r["v"] is None else str(r["v"])),
+                    "count": int(r["n"]),
+                    "frequency": round(int(r["n"]) / total, 4),
+                }
+                for r in rows
+            ]
+            tbl = tables.get((schema, table))
+            if tbl is None:
+                continue
+            for col in tbl.columns:
+                if col.get("name") == column:
+                    col["top_values"] = top_values
+                    # If LIMIT returned fewer rows than the cap, we saw the
+                    # whole distribution — the LLM can trust this is exhaustive.
+                    col["values_exhaustive"] = len(rows) < 20
                     break
 
     async def _enrich_with_indexes(self, conn: Any, tables: list[TableInfo]) -> None:

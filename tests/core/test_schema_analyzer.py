@@ -98,6 +98,136 @@ class TestSchemaAnalyzer:
         rel_facts = [f for f in facts if "tasks" in f.tables and "users" in f.tables]
         assert len(rel_facts) >= 1
 
+    async def test_emits_value_distribution_fact(self, ci_store: Store):
+        """When the connector samples top_values, analyzer must surface them
+        as a DEFINITION fact so the LLM sees the actual enum values, not
+        only the vague 'has a status column' WORKFLOW fact."""
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="jobs", schema="public", row_count=500,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {
+                            "name": "status", "type": "text",
+                            "top_values": [
+                                {"value": "complete", "count": 475,
+                                 "frequency": 0.95},
+                                {"value": "cancelled", "count": 20,
+                                 "frequency": 0.04},
+                                {"value": "error", "count": 5,
+                                 "frequency": 0.01},
+                            ],
+                            "values_exhaustive": True,
+                        },
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        facts = await analyze_schema_for_facts(model, ci_store)
+        value_facts = [
+            f for f in facts
+            if f.concept == "jobs.status values"
+            and f.fact_type.value == "definition"
+        ]
+        assert len(value_facts) == 1
+        claim = value_facts[0].claim
+        assert "'complete'" in claim
+        assert "'cancelled'" in claim
+        assert "'error'" in claim
+        assert "actual values" in claim  # exhaustive qualifier
+
+    async def test_no_value_fact_when_top_values_absent(self, ci_store: Store):
+        """Regression guard: tables whose columns were never sampled must
+        not produce spurious DEFINITION facts about values."""
+        model = _model_with_comments()  # no top_values set
+        facts = await analyze_schema_for_facts(model, ci_store)
+        value_facts = [
+            f for f in facts
+            if "values" in f.concept
+            and f.fact_type.value == "definition"
+        ]
+        assert value_facts == []
+
+    async def test_emits_soft_delete_filter_fact(self, ci_store: Store):
+        """Tables with tombstone columns must carry a RULE fact telling the
+        LLM to filter them — otherwise counts silently include deleted rows
+        and disagree with what the application shows users."""
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="users", schema="public", row_count=1000,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {"name": "email", "type": "text"},
+                        {"name": "deleted_at", "type": "timestamptz"},
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        facts = await analyze_schema_for_facts(model, ci_store)
+        soft_delete_facts = [
+            f for f in facts
+            if f.concept == "users soft-delete filter"
+            and f.fact_type.value == "rule"
+        ]
+        assert len(soft_delete_facts) == 1
+        fact = soft_delete_facts[0]
+        assert "deleted_at" in fact.claim
+        assert "WHERE deleted_at IS NULL" in (fact.sql_condition or "")
+
+    async def test_soft_delete_is_boolean_flag(self, ci_store: Store):
+        """``is_deleted = false`` filter, not ``IS NULL``."""
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="rows", schema="public", row_count=500,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {"name": "is_deleted", "type": "boolean"},
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        facts = await analyze_schema_for_facts(model, ci_store)
+        soft = [f for f in facts if f.concept == "rows soft-delete filter"]
+        assert len(soft) == 1
+        assert "is_deleted = false" in (soft[0].sql_condition or "")
+
+    async def test_no_soft_delete_fact_when_absent(self, ci_store: Store):
+        """Regression: tables without tombstone columns must not produce
+        soft-delete facts."""
+        model = _model_with_comments()  # tasks/users don't have deleted_at
+        facts = await analyze_schema_for_facts(model, ci_store)
+        soft = [f for f in facts if "soft-delete" in f.concept]
+        assert soft == []
+
+    async def test_emits_rls_policy_fact(self, ci_store: Store):
+        """Tables with RLS policies must warn the LLM that zero/low results
+        may be permission-filtered rather than actually empty."""
+        tbl = TableInfo(
+            name="private_data", schema="public", row_count=10,
+            columns=[{"name": "id", "type": "uuid"}],
+        )
+        tbl.rls_policies = [
+            {"name": "owner_only", "cmd": "SELECT"},
+            {"name": "admin_all", "cmd": "ALL"},
+        ]
+        model = SystemModel(tables=[tbl], relationships=[])
+        facts = await analyze_schema_for_facts(model, ci_store)
+        rls_facts = [
+            f for f in facts
+            if f.concept == "private_data row-level security"
+        ]
+        assert len(rls_facts) == 1
+        claim = rls_facts[0].claim
+        assert "2 row-level security" in claim
+        assert "owner_only" in claim
+        assert "blocked by RLS" in claim or "permission" in claim.lower()
+
     async def test_facts_persisted_to_store(self, ci_store: Store):
         model = _model_with_comments()
         await analyze_schema_for_facts(model, ci_store)
@@ -201,6 +331,105 @@ class TestSchemaDescriptionWithComments:
         model = _model_with_comments()
         desc = build_app_schema_description(model, max_chars=100_000)
         assert "[Schema truncated" not in desc
+
+    def test_top_values_rendered_in_column_description(self):
+        """The LLM must see actual enum values in the planning prompt, not
+        just ``status (text)`` which forces it to guess ``'completed'``."""
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="extraction_jobs", schema="public", row_count=836,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {
+                            "name": "status", "type": "text",
+                            "top_values": [
+                                {"value": "complete", "count": 796,
+                                 "frequency": 0.952},
+                                {"value": "cancelled", "count": 32,
+                                 "frequency": 0.038},
+                                {"value": "complete_partial", "count": 5,
+                                 "frequency": 0.006},
+                                {"value": "error", "count": 3,
+                                 "frequency": 0.004},
+                            ],
+                            "values_exhaustive": True,
+                        },
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        desc = build_app_schema_description(model)
+        assert "'complete'" in desc
+        assert "'cancelled'" in desc
+        # Exhaustive flag should make it say "values:" not "top values:"
+        assert "values: 'complete'=95%" in desc
+
+    def test_top_values_non_exhaustive_uses_top_values_label(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="requests", schema="public", row_count=50_000,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {
+                            "name": "status", "type": "text",
+                            "top_values": [
+                                {"value": f"code_{i}", "count": 100,
+                                 "frequency": 0.01}
+                                for i in range(20)
+                            ],
+                            "values_exhaustive": False,
+                        },
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        desc = build_app_schema_description(model)
+        assert "top values:" in desc
+
+    def test_soft_delete_annotation_surfaces_in_description(self):
+        """Planning prompt must flag soft-delete columns so the LLM filters
+        them rather than returning inflated counts."""
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        model = SystemModel(
+            tables=[
+                TableInfo(
+                    name="users", schema="public", row_count=1000,
+                    columns=[
+                        {"name": "id", "type": "uuid"},
+                        {"name": "deleted_at", "type": "timestamptz"},
+                    ],
+                ),
+            ],
+            relationships=[],
+        )
+        desc = build_app_schema_description(model)
+        assert "soft-delete" in desc
+        assert "deleted_at" in desc
+
+    def test_rls_annotation_surfaces_in_description(self):
+        from observibot.agent.schema_catalog import build_app_schema_description
+
+        tbl = TableInfo(
+            name="private_data", schema="public", row_count=100,
+            columns=[{"name": "id", "type": "uuid"}],
+        )
+        tbl.rls_policies = [
+            {"name": "p1", "cmd": "SELECT"},
+            {"name": "p2", "cmd": "SELECT"},
+        ]
+        model = SystemModel(tables=[tbl], relationships=[])
+        desc = build_app_schema_description(model)
+        assert "2 RLS policies" in desc
+        assert "permission-filtered" in desc
 
 
 class TestRelevanceRankedSchemaDescription:

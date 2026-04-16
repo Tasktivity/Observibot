@@ -60,6 +60,62 @@ def _analyze_table(table) -> list[SemanticFact]:
         updated_at=datetime.now(UTC),
     ))
 
+    soft_delete_cols = [
+        c.get("name") for c in table.columns
+        if isinstance(c, dict) and (c.get("name") or "").lower()
+        in _SOFT_DELETE_COLUMN_NAMES
+    ]
+    if soft_delete_cols:
+        primary = soft_delete_cols[0]
+        if primary.startswith("is_"):
+            filter_hint = f"WHERE {primary} = false"
+        else:
+            filter_hint = f"WHERE {primary} IS NULL"
+        facts.append(SemanticFact(
+            id=_make_id(),
+            fact_type=FactType.RULE,
+            concept=f"{table.name} soft-delete filter",
+            claim=(
+                f"{table.name} uses soft-deletes via {', '.join(soft_delete_cols)}. "
+                f"COUNT / trend queries must add `{filter_hint}` unless the "
+                f"question is explicitly about deleted or archived rows — "
+                f"otherwise results include tombstones and will disagree with "
+                f"what the application shows."
+            ),
+            tables=[table.name],
+            columns=[f"{table.name}.{c}" for c in soft_delete_cols],
+            sql_condition=filter_hint,
+            source=FactSource.SCHEMA_ANALYSIS,
+            confidence=0.9,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        ))
+
+    rls_policies = getattr(table, "rls_policies", None) or []
+    if rls_policies:
+        policy_names = ", ".join(
+            p.get("name", "?") for p in rls_policies[:8]
+            if isinstance(p, dict)
+        )
+        facts.append(SemanticFact(
+            id=_make_id(),
+            fact_type=FactType.RULE,
+            concept=f"{table.name} row-level security",
+            claim=(
+                f"{table.name} has {len(rls_policies)} row-level security "
+                f"policies ({policy_names}). Non-superuser / non-service-role "
+                f"sessions will see a subset of rows; a zero or low COUNT may "
+                f"mean 'blocked by RLS' rather than 'no data exists'. Do not "
+                f"conclude absence without confirming session role privileges."
+            ),
+            tables=[table.name],
+            columns=[],
+            source=FactSource.SCHEMA_ANALYSIS,
+            confidence=0.95,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        ))
+
     for col in table.columns:
         col_name = col.get("name", "")
         col_type = col.get("type", "")
@@ -108,6 +164,35 @@ def _analyze_table(table) -> list[SemanticFact]:
                 updated_at=datetime.now(UTC),
             ))
 
+        top_values = col.get("top_values") if isinstance(col, dict) else None
+        if top_values:
+            rendered = ", ".join(
+                f"{tv['value']!r} ({tv['frequency']:.0%})"
+                for tv in top_values[:10]
+                if tv.get("value") is not None
+            )
+            if rendered:
+                qualifier = (
+                    "actual values"
+                    if col.get("values_exhaustive")
+                    else "top observed values"
+                )
+                facts.append(SemanticFact(
+                    id=_make_id(),
+                    fact_type=FactType.DEFINITION,
+                    concept=f"{table.name}.{col_name} values",
+                    claim=(
+                        f"{table.name}.{col_name} {qualifier}: {rendered}. "
+                        f"Use these exact strings in WHERE/CASE filters."
+                    ),
+                    tables=[table.name],
+                    columns=[f"{table.name}.{col_name}"],
+                    source=FactSource.SCHEMA_ANALYSIS,
+                    confidence=0.95,
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                ))
+
         if col_name.startswith("is_") or col_name.startswith("has_"):
             concept_name = col_name.replace("is_", "").replace("has_", "")
             facts.append(SemanticFact(
@@ -149,6 +234,14 @@ def _relationship_fact(rel) -> SemanticFact:
 
 
 _AT_SUFFIX = re.compile(r"(.+)_at$")
+
+# Column names that indicate a soft-delete / tombstone pattern. When a table
+# has one of these, queries that don't filter it will silently include
+# deleted rows in counts and trends — reliably wrong in user-facing answers.
+_SOFT_DELETE_COLUMN_NAMES = frozenset({
+    "deleted_at", "archived_at", "removed_at", "canceled_at", "cancelled_at",
+    "is_deleted", "is_archived", "is_removed",
+})
 
 
 def _col_to_concept(col_name: str) -> str:

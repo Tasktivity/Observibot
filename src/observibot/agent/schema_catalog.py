@@ -9,6 +9,13 @@ SENSITIVE_COLUMN_PATTERNS = {
     "openai_api_key", "service_role_key",
 }
 
+# Kept in sync with schema_analyzer._SOFT_DELETE_COLUMN_NAMES so both the
+# planning prompt and the retrieval-time semantic facts flag the same set.
+_SOFT_DELETE_COLUMN_NAMES = frozenset({
+    "deleted_at", "archived_at", "removed_at", "canceled_at", "cancelled_at",
+    "is_deleted", "is_archived", "is_removed",
+})
+
 
 def _is_sensitive_column(col_name: str) -> bool:
     name_lower = col_name.lower()
@@ -19,6 +26,16 @@ def _col_desc(c: dict) -> str:
     base = f"{c['name']} ({c.get('type', '?')})"
     if c.get("comment"):
         base += f' — "{c["comment"]}"'
+    top_values = c.get("top_values")
+    if top_values:
+        rendered = ", ".join(
+            f"{tv['value']!r}={tv['frequency']:.0%}"
+            for tv in top_values[:8]
+            if tv.get("value") is not None
+        )
+        if rendered:
+            label = "values" if c.get("values_exhaustive") else "top values"
+            base += f" [{label}: {rendered}]"
     return base
 
 
@@ -69,8 +86,27 @@ def build_app_schema_description(
         cols = ", ".join(_col_desc(c) for c in safe_cols[:max_columns])
         if len(safe_cols) > max_columns:
             cols += ", ..."
-        row_hint = f" (~{table.row_count} rows)" if table.row_count else ""
-        lines.append(f"  {table.fqn}{row_hint}: {cols}")
+        annotations: list[str] = []
+        if table.row_count is not None:
+            annotations.append(f"~{table.row_count} rows")
+        soft_delete_cols = [
+            c.get("name") for c in table.columns
+            if isinstance(c, dict)
+            and (c.get("name") or "").lower() in _SOFT_DELETE_COLUMN_NAMES
+        ]
+        if soft_delete_cols:
+            annotations.append(
+                f"soft-delete via {soft_delete_cols[0]} — filter unless "
+                f"asking about deleted rows"
+            )
+        rls_policies = getattr(table, "rls_policies", None) or []
+        if rls_policies:
+            annotations.append(
+                f"{len(rls_policies)} RLS policies — zero results may be "
+                f"permission-filtered"
+            )
+        annotation_str = f" ({'; '.join(annotations)})" if annotations else ""
+        lines.append(f"  {table.fqn}{annotation_str}: {cols}")
 
     remaining = [t for t in all_tables if t.name not in detail_names]
     if remaining:
