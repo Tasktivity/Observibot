@@ -82,6 +82,71 @@ async def test_insight_dedup(tmp_store) -> None:
     assert await tmp_store.save_insight(b) is False
 
 
+async def test_insight_anomaly_signature_roundtrips_through_store(tmp_store) -> None:
+    """Step 3.2: the new anomaly_signature column must survive
+    save_insight() → get_recent_insights() unchanged, and the fingerprint
+    must be computed from the signature (not the LLM-text arrays) when
+    present. This exercises the full persistence path for the Step 3.2
+    fingerprint fix.
+    """
+    sig = "a1b2c3d4e5f60708"
+    original = Insight(
+        title="sig roundtrip",
+        summary="s",
+        severity="warning",
+        related_tables=["orders", "line_items"],
+        related_metrics=["order_count"],
+        anomaly_signature=sig,
+    )
+    original.fingerprint = original.compute_fingerprint()
+
+    assert await tmp_store.save_insight(original) is True
+    fetched = await tmp_store.get_recent_insights(limit=5)
+    assert len(fetched) == 1
+    restored = fetched[0]
+
+    assert restored.anomaly_signature == sig
+    assert restored.fingerprint == original.fingerprint
+    assert restored.compute_fingerprint() == original.fingerprint
+
+    # Re-computing on a copy with perturbed LLM-authored arrays must not
+    # change the fingerprint — the point of the Step 3.2 fix.
+    perturbed = Insight(
+        title=restored.title,
+        summary=restored.summary,
+        severity=restored.severity,
+        related_tables=["line_items", "orders", "customers"],  # reordered + added
+        related_metrics=["order_count", "signups"],  # extra
+        anomaly_signature=sig,
+    )
+    assert perturbed.compute_fingerprint() == original.fingerprint
+
+
+async def test_insight_without_signature_falls_back_to_legacy_fingerprint(
+    tmp_store,
+) -> None:
+    """Drift/discovery insights that have no triggering Anomaly must still
+    round-trip: anomaly_signature is empty, and the legacy LLM-text
+    fingerprint is preserved on both sides of the store.
+    """
+    ins = Insight(
+        title="drift insight",
+        summary="s",
+        severity="info",
+        source="drift",
+        related_tables=["alpha", "beta"],
+        related_metrics=["m"],
+    )
+    ins.fingerprint = ins.compute_fingerprint()
+    assert ins.anomaly_signature == ""
+
+    assert await tmp_store.save_insight(ins) is True
+    fetched = await tmp_store.get_recent_insights(limit=5)
+    assert len(fetched) == 1
+    assert fetched[0].anomaly_signature == ""
+    assert fetched[0].fingerprint == ins.fingerprint
+
+
 async def test_change_event_crud(tmp_store) -> None:
     e = ChangeEvent(connector_name="c", event_type="deploy", summary="s")
     await tmp_store.save_change_event(e)

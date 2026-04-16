@@ -4,8 +4,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from observibot.agent.analyzer import Analyzer, summarize_system
+from observibot.agent.analyzer import Analyzer, summarize_anomalies, summarize_system
 from observibot.agent.llm_provider import LLMHardError, LLMSoftError, MockProvider
+from observibot.agent.prompts import ANOMALY_ANALYSIS_PROMPT
 from observibot.core.anomaly import Anomaly
 from observibot.core.models import SystemModel
 
@@ -196,3 +197,50 @@ async def test_analyze_anomalies_soft_failure_returns_unsaved_fallback(
     assert len(insights) == 1
     assert insights[0].source == "anomaly"
     spy_store.save_insight.assert_not_called()
+
+
+def _directed_anomaly(value: float, median: float, direction: str) -> Anomaly:
+    return Anomaly(
+        metric_name="table_row_count",
+        connector_name="c",
+        labels={"table": "t"},
+        value=value,
+        median=median,
+        mad=0.0,
+        modified_z=float("inf"),
+        absolute_diff=abs(value - median),
+        severity="critical",
+        direction=direction,
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+
+
+def test_summarize_anomalies_includes_direction_word() -> None:
+    """A spike must be labeled INCREASE with a positive signed delta so the
+    LLM cannot silently narrate it as data loss.
+    """
+    summary = summarize_anomalies(
+        [_directed_anomaly(value=100.0, median=40.0, direction="spike")]
+    )
+    assert "INCREASE" in summary
+    assert "delta=+60" in summary
+
+
+def test_summarize_anomalies_dip_direction() -> None:
+    """A dip must be labeled DECREASE with a negative signed delta so a drop
+    is never mistaken for a rise.
+    """
+    summary = summarize_anomalies(
+        [_directed_anomaly(value=40.0, median=100.0, direction="dip")]
+    )
+    assert "DECREASE" in summary
+    assert "delta=-60" in summary
+
+
+def test_prompt_contains_direction_guidance() -> None:
+    """The ANOMALY_ANALYSIS_PROMPT must forbid mis-narrating direction."""
+    assert "INCREASE" in ANOMALY_ANALYSIS_PROMPT
+    assert "DECREASE" in ANOMALY_ANALYSIS_PROMPT
+    assert "Do NOT describe an INCREASE as a drop" in ANOMALY_ANALYSIS_PROMPT

@@ -136,6 +136,61 @@ def test_insight_roundtrip() -> None:
     assert restored.recommended_actions == ["do it"]
 
 
+def test_insight_fingerprint_uses_anomaly_signature_when_present() -> None:
+    """When a stable anomaly_signature is supplied, jitter in LLM-authored
+    related_tables/metrics must not change the fingerprint — this is what
+    keeps re-firings of the same anomaly inside the dedup window.
+    """
+    sig = "deadbeefcafef00d"
+    a = Insight(
+        severity="critical",
+        source="llm",
+        related_tables=["public.chunks", "public.courses"],
+        related_metrics=["table_row_count", "sync_completion_rate"],
+        anomaly_signature=sig,
+    )
+    b = Insight(
+        severity="critical",
+        source="llm",
+        # Same underlying anomalies; LLM picked a different neighbor set.
+        related_tables=["public.chunks", "public.ai_sync_log"],
+        related_metrics=["table_row_count", "user_activation_rate"],
+        anomaly_signature=sig,
+    )
+    assert a.fingerprint == b.fingerprint
+
+
+def test_insight_fingerprint_differs_when_signature_differs() -> None:
+    """Different signatures must produce different fingerprints even when
+    severity/source/tables/metrics match, so distinct anomaly sets are not
+    collapsed by the dedup window.
+    """
+    a = Insight(
+        severity="critical",
+        source="llm",
+        related_tables=["public.users"],
+        anomaly_signature="aaaaaaaaaaaaaaaa",
+    )
+    b = Insight(
+        severity="critical",
+        source="llm",
+        related_tables=["public.users"],
+        anomaly_signature="bbbbbbbbbbbbbbbb",
+    )
+    assert a.fingerprint != b.fingerprint
+
+
+def test_insight_signature_roundtrip() -> None:
+    a = Insight(
+        severity="warning",
+        source="llm",
+        anomaly_signature="abc123",
+    )
+    restored = Insight.from_dict(a.to_dict())
+    assert restored.anomaly_signature == "abc123"
+    assert restored.fingerprint == a.fingerprint
+
+
 def test_service_info_roundtrip() -> None:
     s = ServiceInfo(
         name="web",

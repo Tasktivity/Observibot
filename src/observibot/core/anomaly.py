@@ -14,6 +14,8 @@ Severity escalation ladder:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Iterable
@@ -98,6 +100,14 @@ class AnomalyDetector:
             baseline median before it counts as an anomaly. Prevents alerting
             on trivially tiny changes like 1→5 that have huge percentage
             moves but no operational meaning.
+        min_relative_diff: When the baseline is perfectly flat (``mad == 0``),
+            the modified-z gate collapses to ``inf`` for any deviation, so the
+            ``min_absolute_diff`` gate is the only remaining guard. A fixed
+            absolute floor does not scale with the magnitude of the metric: a
+            drift of 10 rows is meaningless on a 20k-row table (0.05%) but
+            fires the same as a meaningful shift on a 40-row table. This
+            gate requires ``absolute_diff >= min_relative_diff * |median|``
+            on top of ``min_absolute_diff`` on the MAD=0 path.
         sustained_intervals_warning: Number of *consecutive* anomalous
             readings required to escalate a metric to ``warning``.
         sustained_intervals_critical: Number of consecutive anomalous readings
@@ -111,6 +121,7 @@ class AnomalyDetector:
 
     mad_threshold: float = 3.0
     min_absolute_diff: float = 10.0
+    min_relative_diff: float = 0.02
     sustained_intervals_warning: int = 2
     sustained_intervals_critical: int = 3
     min_samples: int = 12
@@ -121,6 +132,8 @@ class AnomalyDetector:
             raise ValueError("mad_threshold must be positive")
         if self.min_absolute_diff < 0:
             raise ValueError("min_absolute_diff must be >= 0")
+        if self.min_relative_diff < 0:
+            raise ValueError("min_relative_diff must be >= 0")
         if self.sustained_intervals_warning < 1:
             raise ValueError("sustained_intervals_warning must be >= 1")
         if self.sustained_intervals_critical < self.sustained_intervals_warning:
@@ -129,6 +142,26 @@ class AnomalyDetector:
             )
         if self.min_samples < 2:
             raise ValueError("min_samples must be >= 2")
+
+    def _is_meaningful_diff(
+        self, absolute_diff: float, median: float, mad: float
+    ) -> bool:
+        """Return True when ``absolute_diff`` exceeds the operational floor.
+
+        On a normal (``mad > 0``) bucket, the modified-z gate already scales
+        with spread, so only the absolute floor applies. On the ``mad == 0``
+        path the z-gate is vacuous (any non-zero diff yields ``inf``), so we
+        additionally require the diff to exceed a relative floor tied to the
+        magnitude of the baseline — this keeps the detector quiet when a
+        20k-row metric nudges by a handful of rows.
+        """
+        if absolute_diff < self.min_absolute_diff:
+            return False
+        if mad == 0.0 and self.min_relative_diff > 0.0:
+            floor = self.min_relative_diff * abs(median)
+            if absolute_diff < floor:
+                return False
+        return True
 
     def reset(self, bucket: BucketKey | None = None) -> None:
         """Reset sustained-anomaly counters for one bucket or all buckets."""
@@ -185,7 +218,7 @@ class AnomalyDetector:
                 modified_z = MAD_SCALE * (value - median) / mad
                 is_statistically_anomalous = abs(modified_z) >= self.mad_threshold
 
-            is_meaningful = absolute_diff >= self.min_absolute_diff
+            is_meaningful = self._is_meaningful_diff(absolute_diff, median, mad)
             anomalous = is_statistically_anomalous and is_meaningful
 
             if not anomalous:
@@ -313,7 +346,7 @@ class AnomalyDetector:
 
             if not (
                 is_statistically_anomalous
-                and absolute_diff >= self.min_absolute_diff
+                and self._is_meaningful_diff(absolute_diff, median, mad)
             ):
                 self._consecutive.pop(bucket, None)
                 continue
@@ -416,11 +449,33 @@ class AnomalyDetector:
         return results
 
 
+def compute_anomaly_signature(anomalies: Iterable[Anomaly]) -> str:
+    """Return a stable 16-char hex signature for a set of anomalies.
+
+    The signature is derived from the sorted tuple of
+    ``(metric_name, connector_name, labels, direction)`` — i.e. the parts of
+    an anomaly that identify *which* underlying bucket fired and in which
+    direction. Values, MAD, z-score, and severity escalations are
+    intentionally excluded so that consecutive firings of the same bucket
+    collapse to the same signature.
+    """
+    rows: list[tuple[str, str, str, str]] = []
+    for a in anomalies:
+        labels_key = json.dumps(a.labels, sort_keys=True, default=str)
+        rows.append(
+            (a.metric_name, a.connector_name, labels_key, a.direction)
+        )
+    rows.sort()
+    payload = json.dumps(rows, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 def build_detector_from_config(monitor_cfg: Any) -> AnomalyDetector:
     """Build an :class:`AnomalyDetector` from a :class:`MonitorConfig`."""
     return AnomalyDetector(
         mad_threshold=getattr(monitor_cfg, "mad_threshold", 3.0),
         min_absolute_diff=getattr(monitor_cfg, "min_absolute_diff", 10.0),
+        min_relative_diff=getattr(monitor_cfg, "min_relative_diff", 0.02),
         sustained_intervals_warning=getattr(
             monitor_cfg, "sustained_intervals_warning", 2
         ),

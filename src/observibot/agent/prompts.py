@@ -82,6 +82,21 @@ Schema:
 Detected anomalies:
 {anomalies}
 
+CRITICAL — Direction accuracy:
+Each anomaly line begins with a direction word: INCREASE or DECREASE. The
+signed `delta` field and signed `modified-z` confirm the direction
+(positive = value is above the baseline median, negative = below).
+
+Do NOT describe an INCREASE as a drop, loss, deletion, removal, or
+shortfall. Do NOT describe a DECREASE as a spike, surge, growth, or
+expansion. A near-zero delta with a large `modified-z` means the baseline
+was perfectly flat (MAD=0), not that the metric crashed — call it a
+"small shift from a flat baseline," not "significant change."
+
+When multiple anomalies point in OPPOSITE directions, narrate them
+separately — do not collapse a mixed-direction set into a single
+directional claim.
+
 Historical recurrence (last 30 days):
 {recurrence_history}
 

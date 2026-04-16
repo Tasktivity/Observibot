@@ -86,6 +86,10 @@ insights_table = Table(
     Column("confidence", Float),
     Column("source", String),
     Column("fingerprint", String),
+    # Stable hash of the underlying anomaly bucket set — feeds the
+    # fingerprint so LLM-text jitter does not defeat dedup. Nullable
+    # because non-anomaly insights (drift, correlation) may not have one.
+    Column("anomaly_signature", String),
     Column("created_at", String, nullable=False),
     Column("recurrence_context", Text),
 )
@@ -300,6 +304,25 @@ def _labels_key(labels: dict[str, str]) -> str:
     return json.dumps(labels, sort_keys=True)
 
 
+async def _ensure_sqlite_column(
+    conn: AsyncConnection, table: str, column: str, sql_type: str
+) -> None:
+    """Idempotently add a column to a SQLite table.
+
+    ``metadata.create_all`` is a no-op on existing tables, so new columns
+    added to the ORM definition never reach pre-existing dev databases.
+    PRAGMA table_info is cheap; run it at connect time and ALTER if the
+    column is missing. For PostgreSQL this helper is skipped — Alembic is
+    authoritative there.
+    """
+    result = await conn.execute(sa.text(f"PRAGMA table_info({table})"))
+    existing = {row[1] for row in result.fetchall()}
+    if column not in existing:
+        await conn.execute(
+            sa.text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        )
+
+
 def _dialect_insert(table: Table, engine: AsyncEngine):
     """Return the dialect-specific insert function for upsert support."""
     if "postgresql" in str(engine.url):
@@ -371,6 +394,9 @@ class Store:
                     "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts "
                     "USING fts5(summary, content=events, content_rowid=rowid)"
                 ))
+                await _ensure_sqlite_column(
+                    conn, "insights", "anomaly_signature", "TEXT"
+                )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -592,6 +618,7 @@ class Store:
                     confidence=insight.confidence,
                     source=insight.source,
                     fingerprint=insight.fingerprint,
+                    anomaly_signature=insight.anomaly_signature or None,
                     created_at=insight.created_at.isoformat(),
                     recurrence_context=recurrence_json,
                 )
@@ -608,6 +635,7 @@ class Store:
                         confidence=insight.confidence,
                         source=insight.source,
                         fingerprint=insight.fingerprint,
+                        anomaly_signature=insight.anomaly_signature or None,
                         created_at=insight.created_at.isoformat(),
                         recurrence_context=recurrence_json,
                     ),
@@ -633,6 +661,7 @@ class Store:
                     insights_table.c.fingerprint,
                     insights_table.c.created_at,
                     insights_table.c.recurrence_context,
+                    insights_table.c.anomaly_signature,
                 )
                 .order_by(insights_table.c.created_at.desc())
                 .limit(limit)
@@ -659,6 +688,7 @@ class Store:
                     fingerprint=r[10] or "",
                     created_at=datetime.fromisoformat(r[11]),
                     recurrence_context=recurrence,
+                    anomaly_signature=r[13] or "",
                 )
             )
         return insights

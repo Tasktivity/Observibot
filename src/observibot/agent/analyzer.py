@@ -28,7 +28,7 @@ from observibot.agent.schemas import (
     LLMQueryResponse,
     LLMSystemAnalysis,
 )
-from observibot.core.anomaly import Anomaly
+from observibot.core.anomaly import Anomaly, compute_anomaly_signature
 from observibot.core.models import ChangeEvent, Insight, MetricSnapshot, SystemModel
 from observibot.core.store import Store
 
@@ -65,14 +65,30 @@ def summarize_system(model: SystemModel | None) -> str:
 
 
 def summarize_anomalies(anomalies: Iterable[Anomaly]) -> str:
+    """Render anomalies for the LLM, calling out *direction* explicitly.
+
+    The LLM has been observed to narrate an increase as a "data loss" event
+    when it sees only ``value``/``median`` plus an ``inf`` modified-z from a
+    MAD=0 baseline. Prefixing each line with a direction word (INCREASE or
+    DECREASE) and showing a signed ``delta`` removes the ambiguity without
+    relying on the model to infer direction from two numbers.
+    """
     rows = []
     for a in anomalies:
         labels = ",".join(f"{k}={v}" for k, v in a.labels.items())
+        delta = a.value - a.median
+        if a.direction == "spike":
+            direction_word = "INCREASE"
+        elif a.direction == "dip":
+            direction_word = "DECREASE"
+        else:
+            direction_word = a.direction.upper()
         rows.append(
-            f"- {a.severity.upper()} {a.metric_name} "
+            f"- {a.severity.upper()} {direction_word} {a.metric_name} "
             f"({labels}) value={a.value:.4g} median={a.median:.4g} "
-            f"MAD={a.mad:.4g} modified-z={a.modified_z:.2f} "
-            f"consecutive={a.consecutive_count} dir={a.direction}"
+            f"delta={delta:+.4g} MAD={a.mad:.4g} "
+            f"modified-z={a.modified_z:+.2f} "
+            f"consecutive={a.consecutive_count}"
         )
     return "\n".join(rows) if rows else "(none)"
 
@@ -189,6 +205,11 @@ class Analyzer:
             # count it toward the retry threshold.
             raise LLMSoftError(f"LLM response failed validation: {exc}") from exc
 
+        # All LLM-synthesized insights for this cycle share the same
+        # underlying anomaly set, so they share the same signature — this is
+        # exactly what makes the 1-hour dedup window collapse re-firings
+        # across monitor cycles.
+        signature = compute_anomaly_signature(anomalies)
         results: list[Insight] = []
         for raw in validated.insights:
             insight = Insight(
@@ -204,6 +225,7 @@ class Analyzer:
                 confidence=raw.confidence,
                 uncertainty_reason=raw.uncertainty_reason,
                 source="llm",
+                anomaly_signature=signature,
             )
             insight.fingerprint = insight.compute_fingerprint()
             results.append(insight)
@@ -361,6 +383,7 @@ class Analyzer:
                 "LLM unavailable — fallback insight generated from raw anomaly data."
             ),
             source="anomaly",
+            anomaly_signature=compute_anomaly_signature(anomalies),
         )
         insight.fingerprint = insight.compute_fingerprint()
         return insight

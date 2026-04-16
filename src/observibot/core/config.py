@@ -56,6 +56,7 @@ class MonitorConfig:
     discovery_interval_seconds: int = 3600
     mad_threshold: float = 3.0
     min_absolute_diff: float = 10.0
+    min_relative_diff: float = 0.02
     sustained_intervals_warning: int = 2
     sustained_intervals_critical: int = 3
     baseline_window_hours: int = 24
@@ -338,6 +339,7 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         discovery_interval_seconds=int(mon_raw.get("discovery_interval_seconds", 3600)),
         mad_threshold=float(mon_raw.get("mad_threshold", 3.0)),
         min_absolute_diff=float(mon_raw.get("min_absolute_diff", 10.0)),
+        min_relative_diff=float(mon_raw.get("min_relative_diff", 0.02)),
         sustained_intervals_warning=int(mon_raw.get("sustained_intervals_warning", 2)),
         sustained_intervals_critical=int(mon_raw.get("sustained_intervals_critical", 3)),
         baseline_window_hours=int(mon_raw.get("baseline_window_hours", 24)),

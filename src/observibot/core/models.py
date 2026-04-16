@@ -399,6 +399,12 @@ class Insight:
     uncertainty_reason: str | None = None
     source: str = "llm"  # llm, anomaly, drift, rule, incident
     fingerprint: str = ""  # for de-dup
+    # Stable signature of the underlying anomaly set (if any). Populated by
+    # the analyzer from the triggering :class:`Anomaly` objects so that
+    # re-firings produce the same value even when the LLM narrates the same
+    # finding with different wording. When empty, ``compute_fingerprint``
+    # falls back to the legacy LLM-text fingerprint.
+    anomaly_signature: str = ""
     created_at: datetime = field(default_factory=_utcnow)
     recurrence_context: dict[str, Any] | None = None
 
@@ -418,16 +424,38 @@ class Insight:
         return self.title
 
     def compute_fingerprint(self) -> str:
-        """Stable fingerprint for de-dup — excludes LLM-generated text."""
-        payload = json.dumps(
-            {
-                "severity": self.severity,
-                "source": self.source,
-                "tables": sorted(self.related_tables),
-                "metrics": sorted(self.related_metrics),
-            },
-            sort_keys=True,
-        ).encode("utf-8")
+        """Stable fingerprint for de-dup.
+
+        When :attr:`anomaly_signature` is populated (the normal path for
+        anomaly-driven insights), the fingerprint is derived from it and
+        the severity/source only — explicitly *excluding* the LLM-authored
+        ``related_tables`` and ``related_metrics`` fields, since those vary
+        non-deterministically across LLM calls and would otherwise defeat
+        the 1-hour dedup window in ``save_insight``.
+
+        When no signature is available (e.g. drift/discovery/correlation
+        insights), fall back to hashing the severity + source + LLM-listed
+        tables/metrics — no worse than the legacy behavior.
+        """
+        if self.anomaly_signature:
+            payload = json.dumps(
+                {
+                    "severity": self.severity,
+                    "source": self.source,
+                    "anomaly_signature": self.anomaly_signature,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        else:
+            payload = json.dumps(
+                {
+                    "severity": self.severity,
+                    "source": self.source,
+                    "tables": sorted(self.related_tables),
+                    "metrics": sorted(self.related_metrics),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]
 
     def to_dict(self) -> dict[str, Any]:
@@ -444,6 +472,7 @@ class Insight:
             "uncertainty_reason": self.uncertainty_reason,
             "source": self.source,
             "fingerprint": self.fingerprint,
+            "anomaly_signature": self.anomaly_signature,
             "created_at": _to_iso(self.created_at),
             "recurrence_context": self.recurrence_context,
         }
@@ -463,6 +492,7 @@ class Insight:
             uncertainty_reason=data.get("uncertainty_reason"),
             source=data.get("source", "llm"),
             fingerprint=data.get("fingerprint", ""),
+            anomaly_signature=data.get("anomaly_signature", ""),
             created_at=_from_iso(data.get("created_at")) or _utcnow(),
             recurrence_context=data.get("recurrence_context"),
         )
