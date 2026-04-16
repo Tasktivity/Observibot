@@ -214,3 +214,214 @@ the comprehensive verification plan at `docs/VERIFICATION_PLAN.md`. This
 covers ALL features across all phases — not just the most recent changes.
 It includes 10 sections, ~50 individual checks, and a results template that
 must be filled in with evidence. Any failure blocks further feature work.
+
+
+## Tier 0: Generality Firewall (MANDATORY for pattern-based fixes)
+
+**This standard exists because Observibot is being validated against a
+single live deployment (TaskGator) while being designed as a general
+open-core product for any Postgres/Railway/Supabase application. Every
+fix that looks generic can silently overfit to the patterns that
+TaskGator happens to expose. Tier 0 is the guardrail that catches
+overfitting BEFORE code is written.**
+
+### When Tier 0 Applies
+
+Tier 0 is mandatory whenever a change meets ANY of these conditions:
+
+- Modifies anomaly detection, scoring, gating, or thresholds
+- Modifies insight generation, fingerprinting, dedup, or recurrence logic
+- Modifies prompts that the LLM uses to analyze customer data
+- Adds or changes a schema-discovery heuristic (enum detection, column
+  classification, table allowlist logic, label normalization)
+- Adds or changes a data-quality safeguard (hallucination detector,
+  redaction rules, fact validation)
+- Is triggered by something observed in the live TaskGator deployment
+
+If a change is purely infrastructural (a new connector protocol adapter,
+a storage migration, a refactor that preserves behavior), Tier 0 is
+optional but encouraged.
+
+### The Three-Question Test (must be answered in writing in every CC prompt)
+
+Before writing code, CC must answer each of these in the implementation
+plan. If any answer is "no" or "unclear," the fix is not generic enough
+and must be reconsidered — OR the work must be reclassified as a
+customer-specific operational matter rather than an Observibot change.
+
+1. **Portability:** Would this fix apply identically to a customer whose
+   application has completely different tables, domain terminology,
+   data patterns, and scale? If the fix depends on tables being named
+   "users" or "orders" or on rows having a particular semantic, it is
+   not portable.
+
+2. **Identifier Hygiene:** Is the code free of any literal TaskGator
+   strings — table names, column names, metric names, deployment IDs,
+   domain-specific terminology — anywhere in source, tests, fixtures,
+   or documentation? `grep -rE "(taskgator|task-gator|course|extraction)"`
+   must return zero matches in the diff.
+
+3. **Scale Invariance:** Are constants in the fix expressed as ratios,
+   relative proportions, or pattern matches — not absolute values
+   calibrated to TaskGator's current scale? A 2% threshold is scale-
+   invariant. A "10 rows" threshold or "must have fewer than 200 tables"
+   check is not.
+
+### Synthetic Schema Fixtures (MANDATORY)
+
+For any fix that passes the three-question test, CC must add at least
+ONE test that exercises the fix against a synthetic schema *deliberately
+unlike TaskGator*. This is NOT optional. A test that only uses TaskGator-
+shaped data proves nothing about generality.
+
+Synthetic fixtures live in `tests/fixtures/synthetic_schemas.py`. If the
+file does not exist, create it. Each fixture is a small helper that
+builds `SystemModel`, `MetricSnapshot`, `Anomaly`, or `SemanticFact`
+objects representing a domain completely unrelated to TaskGator's
+educational-content domain.
+
+Maintain at least three reference domains in the fixtures module:
+
+- **`ecommerce_schema()`** — orders, line_items, customers, inventory,
+  shipments, returns. Typical patterns: high-cardinality orders table,
+  soft-delete via archived_at, RLS on customer data, enum on
+  order_status with values like pending/paid/shipped/refunded.
+
+- **`medical_records_schema()`** — patients, encounters, diagnoses,
+  prescriptions, providers. Typical patterns: strict RLS, hard
+  foreign-key integrity, type enum with values like inpatient/
+  outpatient/emergency, soft-delete via deleted_at with audit trail.
+
+- **`event_stream_schema()`** — events, sessions, aggregates_hourly,
+  aggregates_daily. Typical patterns: very high row counts
+  (billions), numeric columns with units in the name (duration_ms,
+  bytes_transferred), no soft-delete, time-partitioned tables,
+  severity enum with values like debug/info/warn/error/fatal.
+
+Every fixture should intentionally use values, sizes, and terminology
+that have no overlap with TaskGator's. When a new pattern-based fix
+is added, at least one of these synthetic domains must be in the test
+suite for that fix.
+
+### Test Structure for Pattern-Based Fixes
+
+Every pattern-based fix must include:
+
+1. A unit test using a TaskGator-shaped fixture (the pattern that
+   surfaced the bug). This confirms the fix addresses the original
+   case.
+
+2. A unit test using at least one synthetic-domain fixture from the
+   reference list above. This confirms the fix is not TaskGator-shaped.
+
+3. A negative test: a scenario where the pattern does NOT match and
+   the fix must not fire. This prevents the fix from becoming over-
+   aggressive.
+
+Example — for the MAD=0 relative-floor gate (Step 3.2):
+
+- Positive/TaskGator: flat-history metric of 20,000 rows, grew by 11;
+  must NOT fire (11/20000 < 2%).
+- Positive/synthetic: flat-history e-commerce orders of 500,000, grew
+  by 100; must NOT fire (100/500000 < 2%).
+- Positive/synthetic: flat-history medical patients of 50, grew by 10;
+  must fire (10/50 = 20% > 2%).
+- Negative: metric with non-zero MAD; relative floor must not apply at
+  all (preserves existing MAD-based behavior).
+
+### CC Prompt Requirements for Pattern-Based Fixes
+
+Every CC implementation prompt for a pattern-based fix must include,
+near the top, a section titled exactly `## Generality Firewall` that:
+
+- States "This change is pattern-based and subject to Tier 0."
+- Answers the three-question test in writing, specifically for this fix.
+- Names which synthetic fixtures the tests will exercise.
+- Includes the forbidden-string grep as part of the completion checklist:
+  `git diff | grep -iE "(taskgator|task-gator|<other-customer-strings>)"`
+  must return zero matches.
+
+A CC prompt that omits the Generality Firewall section is malformed and
+must be rejected before it is sent to the implementer.
+
+### Worked Examples (from recent Step 3.2 fixes)
+
+**Fix A: MAD=0 relative floor** (src/observibot/core/anomaly.py)
+- Three-question test: ✓ portable (any flat-baseline high-magnitude
+  metric), ✓ no customer strings, ✓ scale-invariant (ratio, not count).
+- Synthetic coverage: e-commerce order counts, medical patient counts.
+- Verdict: PASS — this was the standard's first real test case.
+
+**Fix B: Stable anomaly_signature fingerprint** (src/observibot/core/models.py)
+- Three-question test: ✓ portable (LLM non-determinism is universal),
+  ✓ no customer strings, ✓ scale-invariant (hash of structural fields).
+- Synthetic coverage: build two Anomaly sets with identical structural
+  fields but different LLM-authored related_tables arrays; assert
+  identical signatures.
+- Verdict: PASS.
+
+**Fix C: Direction-aware anomaly prompt** (src/observibot/agent/prompts.py)
+- Three-question test: ✓ portable (all metrics can move in either
+  direction), ✓ no customer strings, ✓ scale-invariant (linguistic
+  guidance, no numeric threshold).
+- Synthetic coverage: summarize_anomalies(Anomaly with direction="spike")
+  must include "INCREASE"; Anomaly with direction="dip" must include
+  "DECREASE". Works regardless of metric_name or domain.
+- Verdict: PASS.
+
+**Counter-example — what would FAIL Tier 0:**
+
+Hypothetical fix: "detect soft-delete by looking for a `deleted_at`
+column and adding WHERE `deleted_at IS NULL` to queries."
+- Three-question test:
+  - Portable? Partially — assumes soft-delete is marked by a specific
+    column name. A customer using `removed_on` or `is_deleted` or a
+    separate audit table would not be covered.
+  - Customer strings? None directly, but the column-name list is a
+    TaskGator-shaped assumption.
+  - Scale-invariant? Yes.
+- The fix as stated is narrow. To pass Tier 0 it must either:
+  (a) document the column-name set as an explicit configurable policy
+      (not a hidden heuristic), AND test with synthetic domains that
+      use different soft-delete conventions; OR
+  (b) detect soft-delete via metadata signals (comments, triggers,
+      constraints) rather than column names alone.
+- The current implementation uses (a) with a defined pattern list.
+  Acceptable, but the list must be reviewed whenever a new customer
+  onboards with different conventions.
+
+### Why This Standard Exists
+
+During the Step 3 verification and Step 3.2 detour, three classes of
+bug surfaced that would each have shipped broken for every customer
+except TaskGator if not for direct observation:
+
+1. **Discovery silently overfit to `status/_status` columns.** The
+   fix landed pattern-based, but initial coverage was 1 of 7 enum-
+   candidate columns in the live schema. Generic in intent, narrow in
+   effect — only caught because live verification compared actual
+   DEFINITION fact counts against candidate column counts.
+
+2. **Anomaly detector's MAD=0 path used an absolute 10-row floor.**
+   Correct for TaskGator's 100–1000 row tables. Catastrophically
+   spammy for a customer with 40,000-row tables. Fix: relative floor.
+
+3. **Insight fingerprint hashed LLM-authored fields.** Worked for
+   TaskGator because the LLM's variability was small enough that
+   occasional duplicates were tolerable; would become a flood for
+   any customer whose traffic produces more anomalies. Fix: signature
+   from triggering anomalies.
+
+The common pattern: "looks generic" is not "is generic." Tier 0 makes
+the test explicit so the verdict is rendered before code, not after.
+
+### Tier 0 Completion Checklist (include in every pattern-based CC report)
+
+- [ ] Three-question test answered in writing, all three "yes"
+- [ ] Synthetic fixture for at least one non-TaskGator domain added
+- [ ] Negative test added
+- [ ] `git diff | grep -iE "(taskgator|task-gator)"` returns zero matches
+- [ ] No absolute thresholds that only make sense at TaskGator's scale
+- [ ] If a constant was added, rationale documented as scale-invariant
+  (e.g., "2% relative floor: smallest ratio that suppresses the
+  observed false-positive class while preserving real signals")
