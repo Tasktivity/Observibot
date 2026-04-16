@@ -163,3 +163,37 @@ Semantic modeler auto-accepts; future: interactive walkthrough.
 
 ### LLM Query Optimization Feedback Loop (Unslotted)
 Feed EXPLAIN cost back to LLM for query rewriting when rejected.
+
+
+## P1 — Phase 4.5 Step 3 Follow-ups (discovered during live verification)
+
+### Broaden enum DEFINITION fact coverage
+Step 3 accuracy sprint extended the enum-sampling heuristic in
+postgresql.py beyond `status/_status` to include `state`, `type`, `kind`,
+`role`, `severity`, `level`, `tier`, `phase`, `mode`, `category`.
+Live verification showed only 1 of 7 enum-candidate columns in the
+TaskGator schema produced a DEFINITION fact. Investigate why the
+extension landed in code but did not produce facts for `severity`,
+`role`, `state`, `kind`, etc. Likely causes: the sampling query is
+short-circuiting on column filters it shouldn't, or the schema_analyzer
+path that emits the DEFINITION fact is still gated by the old narrow
+heuristic.
+
+### Hallucination detector: accept derived percentages
+`_find_unsupported_numbers()` in chat_agent.py flags any number in a
+narrative that is not literally present in the tool result rows. This
+produces false positives for derived percentages (e.g. "37% of total"
+when the data contains 18 and 49 separately). Extend the detector: if
+the narrative cites X% and the tool results contain two numbers whose
+ratio is approximately X%, accept. Likewise for simple averages, deltas,
+and sums of visible columns. Keep the detector conservative enough to
+still catch pure hallucinations ("117 jobs" when no 117 appears anywhere).
+
+### Investigate 03:47 metric-count spike and cold-start gate
+During the 2026-04-16 insight cluster investigation, evidence showed
+metric_count jumping from 84 to 195 in one cycle (discovery added ~111
+new metrics). First anomaly fires happened the same cycle. Verify that
+the `min_samples=12` gate in AnomalyDetector is actually being respected
+for newly-discovered metrics, or whether there is a path where a bucket
+with insufficient history can fire.
+
