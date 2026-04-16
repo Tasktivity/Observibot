@@ -251,3 +251,189 @@ async def test_monitor_handles_failing_connector(
     # Should not raise even though `broken` errors
     count = await loop.run_collection_cycle()
     assert count >= 1
+
+
+async def test_run_analysis_cycle_persists_recurrence_context(
+    tmp_store, mock_supabase_connector, mock_llm_provider
+) -> None:
+    """Enrichment must happen BEFORE save_insight so recurrence_context is
+    actually written to the database."""
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.core.anomaly import Anomaly
+    from observibot.core.models import Insight
+
+    anomaly = Anomaly(
+        metric_name="table_inserts",
+        connector_name="mock-supabase",
+        labels={"table": "tasks"},
+        value=500.0,
+        median=10.0,
+        mad=2.0,
+        modified_z=245.0,
+        absolute_diff=490.0,
+        severity="critical",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+
+    recurrence_data = {"count": 5, "common_hours": [14, 15], "last_seen": "2026-04-14"}
+
+    analyzer = Analyzer(provider=mock_llm_provider, store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+
+    with patch.object(
+        loop.store, "get_event_recurrence_summaries",
+        new_callable=AsyncMock,
+        return_value={"table_inserts": recurrence_data},
+    ):
+        insights = await loop.run_analysis_cycle()
+
+    assert len(insights) >= 1
+    import json
+    import sqlalchemy as sa
+    from observibot.core.store import insights_table
+    async with tmp_store.engine.begin() as conn:
+        result = await conn.execute(
+            sa.select(insights_table.c.recurrence_context)
+            .where(insights_table.c.id == insights[0].id)
+        )
+        row = result.fetchone()
+    assert row is not None
+    ctx = json.loads(row[0])
+    assert ctx["count"] == 5
+    assert ctx["common_hours"] == [14, 15]
+
+
+async def test_run_analysis_cycle_single_save_per_insight(
+    tmp_store, mock_supabase_connector, mock_llm_provider
+) -> None:
+    """save_insight must be called exactly once per insight — not inside
+    analyze_anomalies AND again in run_analysis_cycle."""
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.core.anomaly import Anomaly
+
+    anomaly = Anomaly(
+        metric_name="active_connections",
+        connector_name="mock-supabase",
+        labels={},
+        value=100.0,
+        median=5.0,
+        mad=2.0,
+        modified_z=10.0,
+        absolute_diff=95.0,
+        severity="warning",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+
+    analyzer = Analyzer(provider=mock_llm_provider, store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+
+    save_calls = []
+    original_save = tmp_store.save_insight
+
+    async def tracking_save(insight):
+        save_calls.append(insight.id)
+        return await original_save(insight)
+
+    with patch.object(tmp_store, "save_insight", side_effect=tracking_save):
+        insights = await loop.run_analysis_cycle()
+
+    assert len(insights) >= 1
+    assert len(save_calls) == len(insights)
+
+
+async def test_run_analysis_cycle_dedup_skips_emit_and_alert(
+    tmp_store, mock_supabase_connector, mock_llm_provider
+) -> None:
+    """When save_insight returns False (dedup), _emit and alert_manager.dispatch
+    must NOT be called for that insight."""
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.core.anomaly import Anomaly
+
+    anomaly = Anomaly(
+        metric_name="active_connections",
+        connector_name="mock-supabase",
+        labels={},
+        value=100.0,
+        median=5.0,
+        mad=2.0,
+        modified_z=10.0,
+        absolute_diff=95.0,
+        severity="warning",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+
+    analyzer = Analyzer(provider=mock_llm_provider, store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+
+    with patch.object(
+        tmp_store, "save_insight", new_callable=AsyncMock, return_value=False
+    ), patch.object(
+        loop, "_emit", new_callable=AsyncMock
+    ) as mock_emit, patch.object(
+        loop.alert_manager, "dispatch", new_callable=AsyncMock
+    ) as mock_dispatch:
+        insights = await loop.run_analysis_cycle()
+
+    assert insights == []
+    mock_emit.assert_not_called()
+    mock_dispatch.assert_not_called()

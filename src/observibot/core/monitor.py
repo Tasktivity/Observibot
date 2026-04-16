@@ -842,9 +842,8 @@ class MonitorLoop:
             self.circuit_breaker.record_soft_failure()
             return []
 
+        saved_insights: list[Insight] = []
         for insight in insights:
-            # Attach a matching recurrence entry so it gets persisted by
-            # save_insight(). Prefer the first related metric with recurrence.
             if recurrence_map:
                 for metric in insight.related_metrics:
                     rec = recurrence_map.get(metric)
@@ -852,6 +851,11 @@ class MonitorLoop:
                         insight.recurrence_context = rec
                         break
 
+            stored = await self.store.save_insight(insight)
+            if not stored:
+                continue
+
+            saved_insights.append(insight)
             await self._emit(
                 "insight",
                 insight.related_metrics[0] if insight.related_metrics else "system",
@@ -859,7 +863,7 @@ class MonitorLoop:
                 severity=insight.severity, summary=insight.title,
             )
             await self.alert_manager.dispatch(insight)
-        return insights
+        return saved_insights
 
     async def trigger_analysis(self, anomalies: list[Anomaly]) -> list[Insight]:
         """Force an analysis pass with the supplied anomalies."""
