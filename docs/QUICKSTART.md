@@ -1,6 +1,11 @@
 # Observibot Quickstart
 
-Get Observibot watching your stack in five minutes.
+Get Observibot connected to your systems and the first agent running in
+five minutes.
+
+> New here? [VISION.md](VISION.md) explains what Observibot is at a
+> conceptual level. This doc gets you running the SRE agent (the first
+> agent shipped with the platform).
 
 ## 1. Prerequisites
 
@@ -18,6 +23,10 @@ combo is Supabase + Railway:
 | `ANTHROPIC_API_KEY` *(or `OPENAI_API_KEY`)* | https://console.anthropic.com/ — required only if you want LLM-powered insights. |
 | `NTFY_TOPIC_URL` *(optional)* | A unique ntfy topic, e.g. `https://ntfy.sh/your-private-topic`. |
 | `SLACK_WEBHOOK_URL` *(optional)* | A Slack incoming webhook URL. |
+
+Support for additional platforms (AWS, GCP, Azure, GitLab, Fly.io,
+Render, and others) is planned — see
+[phases/ROADMAP.md](phases/ROADMAP.md).
 
 ## 2. Install
 
@@ -100,12 +109,12 @@ Observibot will:
 - Run an initial discovery + collection
 - Schedule collection every 5 minutes, analysis every 30 minutes, discovery every hour
 - Expose `http://localhost:8080/health` for orchestrators
-- Detect anomalies using MAD-based statistics (no z-score false positives)
-- Aggregate burst incidents into a single alert (no Slack spam)
+- Detect anomalies using time-aware MAD-based statistics
+- Aggregate burst incidents into a single alert
 - Fall back to deterministic alerts if the LLM is unavailable
 
 Stop with `Ctrl-C`. The daemon handles `SIGTERM` cleanly so it's safe to run
-under systemd, Docker, or Railway.
+under systemd, Docker, or other process supervisors.
 
 ## 9. Optional: Enable agentic chat queries against your database
 
@@ -123,7 +132,7 @@ platform-specific setup.
 
 ## 10. Optional: ntfy push notifications
 
-ntfy.sh is the cheapest way to get push notifications on your phone for free.
+ntfy.sh is a convenient way to get push notifications on your phone for free.
 
 1. Install the ntfy app on your phone (iOS/Android).
 2. Subscribe to a unique topic name like `obs-yourname-prod-q3a2`.
@@ -139,6 +148,8 @@ ntfy.sh is the cheapest way to get push notifications on your phone for free.
 ## Next steps
 
 - Read [`CONFIGURATION.md`](CONFIGURATION.md) for the full list of tunables.
-- Read [`DEPLOYMENT.md`](DEPLOYMENT.md) for Railway / Docker production setup.
-- Read [`architecture/CONNECTORS.md`](architecture/CONNECTORS.md) for connector
-  permission requirements.
+- Read [`DEPLOYMENT.md`](DEPLOYMENT.md) for Docker / production setup.
+- Read [`architecture/CONNECTORS.md`](architecture/CONNECTORS.md) for
+  connector permission requirements.
+- Read [`VISION.md`](VISION.md) for where the platform is heading beyond
+  the first SRE agent.

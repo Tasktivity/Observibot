@@ -7,6 +7,10 @@ How to run Observibot in production. Three options, in increasing order of
 2. **Docker / Docker Compose** — best for self-hosted servers.
 3. **Railway** — best for "I just want it to run forever and update itself."
 
+Additional deployment targets (AWS, GCP, Azure, other PaaS) will be
+documented here as connector support and deployment tooling for those
+platforms ships — see [phases/ROADMAP.md](phases/ROADMAP.md).
+
 ---
 
 ## 1. Local Python
@@ -30,7 +34,7 @@ systemd unit:
 ```ini
 # /etc/systemd/system/observibot.service
 [Unit]
-Description=Observibot SRE Agent
+Description=Observibot Platform
 After=network.target
 
 [Service]

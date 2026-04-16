@@ -1,69 +1,107 @@
 # Observibot
 
-**Autonomous AI SRE agent for indie developers and small teams on PaaS stacks.**
+**A live model of your production system, kept continuously current, so
+specialized agents can reason about it.**
 
-Observibot connects to your database and infrastructure, autonomously discovers
-your application architecture, continuously monitors everything that matters,
-and lets you interrogate your system through an intelligent chat interface — so
-you can focus on building your product instead of configuring dashboards.
+Modern production systems span source code, databases, deployment
+platforms, and cloud infrastructure. Understanding what a system *is* —
+how it's structured, what the tables mean, how the services fit
+together, how it changes over time — usually means a human stitching
+information together across a dozen dashboards and a lot of code.
 
-## What It Does
+Observibot automates that stitching. It connects to each layer of your
+system, builds a structured model of what it finds, and keeps that model
+current as the system evolves. Specialized agents then reason about the
+model through different lenses — monitoring, security, cost, and others
+as the project grows.
 
-- **Self-discovers** your database schema, service topology, and infrastructure
-  layout — no manual configuration required
-- **Analyzes your source code** via GitHub to extract business logic, workflows,
-  and domain-specific facts — then uses that knowledge when answering questions
-- **Continuously monitors** business data, platform health, and infrastructure
-  performance using MAD-based anomaly detection
-- **Surfaces insights** through a three-zone web dashboard:
-  - **Dynamic Discovery Feed** — real-time, LLM-generated findings with
-    severity badges, confidence scores, and recurrence annotations
-  - **Static Dashboard** — persistent, user-curated widgets promoted from
-    the Discovery Feed or Chat
-  - **System Intelligence Chat** — multi-turn conversational interface across
-    three domains (observability, application data, infrastructure) with
-    session memory and reference resolution
-- **Agent Memory Inspector** — view, edit, deactivate, or delete what the
-  agent has learned from your codebase. Changes take effect on the next query.
-- **Correlates across layers** — links business anomalies to infrastructure
-  causes using a two-call agentic LLM pipeline
-- **Proactively alerts** via Slack, ntfy push notifications, or webhooks
-- **Adapts automatically** when your system changes (new tables, new services,
-  schema migrations, deploys)
+The core product is the model and the layer that builds it. The agents
+are consumers of it.
+
+## What You Can Do With It Today
+
+Observibot ships with its first agent: an autonomous SRE that monitors
+your system for anomalies, correlates business metrics with
+infrastructure events, and surfaces insights through a web dashboard
+and chat interface.
+
+- **Self-discovery.** Connects to your source code, database, and
+  deployment platform, then builds a structured model of your
+  application — schema, services, relationships, metrics, and
+  change history — with no manual configuration.
+- **Continuous monitoring.** Collects metrics across every connected
+  system on a 5-minute cycle, detects anomalies with time-aware
+  baselines, and correlates anomalies to recent changes.
+- **Autonomous investigation.** When an anomaly fires, the agent
+  generates diagnostic queries, runs them through a sandboxed SQL
+  interface, and attaches the actual results as evidence on the
+  insight — so you see confirmed findings, not speculation.
+- **Agentic chat.** Ask questions about your system in natural
+  language. The agent plans which tools to call, executes queries
+  through a security sandbox, and synthesizes answers with optional
+  visualizations. Multi-turn sessions track context naturally.
+- **Learned knowledge.** Observibot extracts semantic facts from your
+  source code — business logic, workflows, domain definitions — and
+  uses them when answering questions. You can review, correct, or
+  retract anything it has learned through an Agent Memory Inspector.
+- **Alerting.** Routes insights to ntfy, Slack, or any webhook.
 
 ## Who It's For
 
-Anyone running production apps on PaaS stacks — Supabase + Railway, Neon +
-Fly.io, PlanetScale + Render, and similar combinations. Solo developers, small
-teams, and larger orgs that want autonomous, context-aware monitoring without
-enterprise pricing or configuration overhead.
+**Today:** Indie developers and small teams running production apps on
+PaaS stacks — Supabase + Railway, Neon + Fly, PlanetScale + Render, and
+similar combinations. The SRE agent works well here because these
+stacks are small enough to understand end-to-end, the target users are
+underserved by enterprise tools, and they adopt new developer
+infrastructure fast.
 
-## How It Works
+**Where we're going:** Any team running production software on any
+major cloud, with source code on any major code host. Indie teams use
+AWS and GCP too; small teams grow; mid-sized teams want more than
+monitoring. The architecture is built so connector coverage and agent
+capability can both expand without rearchitecting the core.
 
-Observibot is a Python application that runs as a long-lived daemon. It uses
-an LLM (Claude, GPT, or local models via Ollama) as its reasoning engine and
-connects to your systems via read-only credentials. The web dashboard runs on
-the same process at `localhost:8080`.
+See [VISION.md](docs/VISION.md) for the full framing.
 
-**Agentic Chat Pipeline:** The LLM first plans which tools to call (query
-monitoring data, production database, or infrastructure platform), executes
-queries through a 5-layer security sandbox, then interprets results into a
-narrative answer with optional visualizations. Multi-turn sessions track
-entities across exchanges so follow-up questions resolve naturally.
+## How It's Built
 
-**5-Layer SQL Sandbox:** All production database queries go through: (1)
-SELECT-only enforcement via AST parsing, (2) table allowlisting against
-discovered schema, (3) LIMIT injection/enforcement, (4) EXPLAIN cost gating
-to reject expensive queries before execution, and (5) statement_timeout as
-the last line of defense. Schema-qualified names are validated to prevent
-cross-schema access.
+Observibot has three layers, designed to be separable:
 
-**Code Intelligence:** Observibot analyzes your GitHub repository to extract
-semantic facts — business logic definitions, workflows, entity relationships,
-and domain-specific rules. These facts are automatically injected into LLM
-prompts so the agent understands your application's domain, not just its schema.
+**Connectors.** Each external system — source code host, database,
+deployment platform, cloud provider — has a connector implementing a
+common interface. Connectors are shared infrastructure, usable by any
+agent built on the platform. More connectors mean more of your
+system is understood.
 
-See [docs/architecture/](docs/architecture/) for full technical details.
+**System model.** A structured representation of your running system,
+built from connector output and interpreted into meaning. Not raw
+schema metadata but *semantics* — this table holds orders, this column
+is sensitive, this metric is a counter, this service depends on that
+one. Continuously updated as the system changes.
+
+**Agents.** Specialized reasoners that consume the system model. Each
+agent brings its own analysis logic, chat tools, and severity taxonomy,
+but all share the same connectors, store, and dashboard. The first
+agent is SRE. Others will follow.
+
+## Principles
+
+- **Read-only, always.** Observibot observes. It never writes to your
+  production systems.
+- **Local-first.** All collected data stays on your infrastructure.
+  No telemetry, no phone-home.
+- **Autonomous discovery.** No manual configuration files for business
+  context. The platform learns through automated analysis and
+  conversational corrections.
+- **Semantic fidelity over raw coverage.** Better understanding beats
+  more metrics.
+- **Every platform, eventually.** Connectors are architected to
+  generalize. We ship the ones that prove the pattern; the community
+  will extend them.
+- **Agents are first-class citizens in three modes.** Core agents
+  (shipped), community agents (contributed), and private agents (built
+  for a single team's use only) are all first-class consumers of the
+  platform.
 
 ## Quick Start
 
@@ -87,73 +125,81 @@ observibot run
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the full setup guide.
 
-## Project Status
+## Current State
 
-**Phase 4.5 — Experiential Memory** (in progress)
+**Connectors**
 
-| Phase | Name | Status |
-|-------|------|--------|
-| 0 | Foundation & Discovery | ✅ Complete |
-| 1 | Monitor Loop & Alerting | ✅ Complete |
-| 2 | Hardening & Deployment | ✅ Complete |
-| 3 | Web Dashboard & Agentic Chat | ✅ Complete |
-| 4 | Deep Application Intelligence | ✅ Complete |
-| 4.5 | Experiential Memory | 🟡 In Progress |
-| 5 | Reporting & Analytics Maturity | Future |
-| 6 | Generalization & Community | Future |
+- Supabase (PostgreSQL pg_stat + Prometheus Metrics API)
+- Railway (GraphQL topology + resource metrics)
+- Generic PostgreSQL
+- GitHub source code
 
-Phase 4.5 adds experiential memory — the ability to learn from accumulated
-observations like a seasoned SRE. Steps completed: monitor run tracking,
-insight feedback, events envelope, session memory with multi-turn resolution,
-Agent Memory Inspector tab, and comprehensive pipeline quality improvements.
-518 tests passing.
+**Agents**
 
-Each phase has explicit exit criteria. See
-[docs/phases/ROADMAP.md](docs/phases/ROADMAP.md) for the full roadmap.
+- SRE agent (active): anomaly detection, change correlation, agentic
+  chat, learned knowledge from source code and conversations.
 
-## Current Capabilities
+**Security & trust**
 
-- **Connectors:** Supabase (PostgreSQL pg_stat + Prometheus metrics), Railway
-  (GraphQL topology + resource metrics), Generic PostgreSQL
-- **Metrics:** 187+ per collection cycle (row counts, connection stats, cache
-  hit ratios, CPU, memory, network, deploy events, and more)
-- **Anomaly Detection:** MAD-based (Median Absolute Deviation) with sustained-
-  interval escalation and configurable thresholds
-- **Code Intelligence:** GitHub source code analysis extracts 1,000+ semantic
-  facts (business logic, workflows, domain definitions) that enhance LLM context
-- **Web Dashboard:** Three-zone layout with real-time insight polling, multi-turn
-  agentic chat with session memory, and an Agent Memory Inspector for reviewing
-  and editing learned knowledge
-- **Events System:** Unified observation journal tracking anomalies, insights,
-  deploys, drift, investigations, and feedback with full-text search
-- **SQL Sandbox:** 5-layer security for LLM-generated queries (SELECT-only,
-  table allowlist, LIMIT injection, EXPLAIN cost gating, statement_timeout)
-- **Alert Channels:** ntfy.sh (push notifications), Slack, generic webhook
-- **LLM Providers:** Anthropic (Claude), OpenAI, Mock (for testing)
-- **Security:** Read-only credentials, schema-qualified table validation,
-  sensitive column filtering, admin-gated knowledge mutations, JWT auth
+- Read-only credentials required. Observibot has no write path to
+  production.
+- 5-layer SQL sandbox on every LLM-generated query: SELECT-only AST
+  parsing, table allowlisting against the discovered schema, LIMIT
+  enforcement, EXPLAIN cost gating, and statement_timeout.
+- Sensitive columns (patterns like `password`, `token`, `secret`,
+  `api_key`) are redacted from LLM prompts and from query results.
+- API keys in environment variables only. Never in config files.
+- JWT auth on the web UI. httpOnly cookies. bcrypt password hashing.
+
+## Roadmap
+
+Phase-by-phase roadmap with exit criteria:
+[docs/phases/ROADMAP.md](docs/phases/ROADMAP.md). We're currently in
+Phase 4.5, focused on experiential memory and diagnostic accuracy.
+
+Open work items are tracked as [GitHub Issues](https://github.com/YOUR_USERNAME/Observibot/issues).
+
+## Contributing
+
+Observibot is open-core and designed to grow through community
+contribution. The contribution surfaces are connectors and agents —
+both are architected for extension.
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — getting started as a
+  contributor
+- **[docs/contributing/CONNECTORS.md](docs/contributing/CONNECTORS.md)**
+  — how connectors work, what they must honor, and when the core team
+  is ready to accept community-contributed connectors
+- **[docs/contributing/AGENTS.md](docs/contributing/AGENTS.md)** — how
+  agents work, what they must honor, and the current status of the
+  agent extension API
+
+The connector and agent contribution guides are evolving. The core
+team is shipping enough connectors and a second agent before opening
+community contribution broadly — this is to make sure the patterns
+are real before others build on them.
+
+## Commercial Intent
+
+Observibot is Apache 2.0, open-core. The full platform — every
+connector, every agent, every API — lives in this repository. We
+plan to offer managed hosting for teams who don't want to run it
+themselves, which is how we intend to sustain long-term development.
+The open-source tier is not a trial or a crippled version; it's the
+same codebase we run in production.
 
 ## Documentation
 
-- [QUICKSTART.md](docs/QUICKSTART.md) — 5-minute setup guide
-- [CONFIGURATION.md](docs/CONFIGURATION.md) — All config options
-- [DEPLOYMENT.md](docs/DEPLOYMENT.md) — Docker and production deployment
-- [ROADMAP.md](docs/phases/ROADMAP.md) — Phased roadmap with exit criteria
-- [BACKLOG.md](docs/BACKLOG.md) — Prioritized bugs and feature backlog
-- [Architecture docs](docs/architecture/) — System design, connectors, data store
-- [Testing Standards](docs/TESTING_STANDARDS.md) — Three-tier testing requirements
-
-## Vision
-
-Observibot is evolving from a single SRE agent into a platform for multiple
-specialized agents that analyze the same system from different perspectives.
-The SRE agent monitors performance and detects anomalies. Future agents —
-security, cost optimization, compliance — will plug into the same ecosystem,
-sharing connectors, data, and the web dashboard while bringing their own
-domain expertise.
-
-See the [architecture docs](docs/architecture/ARCHITECTURE.md) for details
-on the agent ecosystem design.
+- **[VISION.md](docs/VISION.md)** — the project's north star
+- [QUICKSTART.md](docs/QUICKSTART.md) — 5-minute setup
+- [CONFIGURATION.md](docs/CONFIGURATION.md) — all config options
+- [DEPLOYMENT.md](docs/DEPLOYMENT.md) — Docker and production
+- [ROADMAP.md](docs/phases/ROADMAP.md) — phased roadmap with exit
+  criteria
+- [Architecture](docs/architecture/) — system design, connectors,
+  data store
+- [TESTING_STANDARDS.md](docs/TESTING_STANDARDS.md) — three-tier
+  testing requirements
 
 ## License
 

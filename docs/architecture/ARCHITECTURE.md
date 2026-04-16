@@ -1,23 +1,86 @@
 # Observibot — System Architecture
 
-## Design Philosophy
+> See [VISION.md](../VISION.md) for the project's north star. This
+> document covers how the system is structured to serve that vision.
 
-Observibot is built on four principles:
+## Design Principles
 
-1. **Read-only everywhere.** Observibot never writes to your production
-   systems. It connects with read-only credentials and observes.
+These are invariants. Every architectural decision is checked against
+these. If a principle and a proposed feature conflict, the principle
+wins.
 
-2. **LLM as reasoning engine, not as database.** The LLM interprets,
-   correlates, and generates insights. All raw data stays in structured
-   storage (SQLite/PostgreSQL).
+1. **Autonomous discovery.** Never require manual configuration to
+   understand a system. If the platform can infer something from
+   source code, schema, metrics, or topology, it infers it. Users
+   correct mistakes through conversation, not by editing YAML.
 
-3. **Connector-based extensibility.** Each external system is a connector
-   module with a standard interface. Adding a new platform means writing
-   one connector.
+2. **Semantic fidelity over raw coverage.** A table isn't just
+   columns; it's meaning. The platform's value to agents scales with
+   the quality of its interpretation, not the volume of raw data it
+   surfaces.
 
-4. **Local-first data storage.** All collected data, insights, and
-   configuration stays on your infrastructure. No telemetry, no cloud
-   dependency.
+3. **Read-only, always.** Observibot observes. It never writes to
+   production systems. This is non-negotiable and enables every other
+   use case.
+
+4. **Local-first.** All collected data stays on the operator's
+   infrastructure. No telemetry, no phone-home. A fully-offline
+   deployment behind a corporate firewall works exactly the same as
+   a public-cloud deployment.
+
+5. **Connector-based extensibility.** Each external system is a
+   connector module with a standard interface. Adding a new platform
+   means writing one connector. Connectors are shared infrastructure,
+   usable by any agent built on the platform.
+
+6. **Agents are first-class citizens in three modes.** Core agents
+   (shipped with the platform), community agents (contributed
+   upstream), and private agents (built and run by a single team) are
+   all architectural constraints on the core API, not side-use-cases.
+
+7. **Ground truth is versioned and attributable.** Every semantic
+   claim the platform makes can be traced (where did this come
+   from?), corrected (this is wrong, here's the right answer), and
+   versioned (what did the platform believe when this insight fired?).
+
+8. **LLMs are reasoning engines, not databases.** LLMs interpret,
+   correlate, and generate insights. All raw data stays in structured
+   storage (SQLite / PostgreSQL) and all LLM output is validated
+   against schemas before persistence.
+
+---
+
+## The System Model
+
+The system model is the product's core. Every other component either
+contributes to building it (connectors, discovery engine, semantic
+modeler) or consumes it (agents, dashboard, chat). It represents a
+running production system in a form agents can reason about.
+
+What the model contains:
+
+- **Structural metadata** — tables and their columns, relationships,
+  services and their dependencies, metrics endpoints, deployment
+  topology.
+- **Semantic interpretation** — what a table holds ("orders"), how a
+  column is used ("sensitive", "soft-delete flag", "enum with values
+  X/Y/Z"), what a metric measures ("counter of completed requests",
+  "gauge of live connections").
+- **Runtime state** — current metric values, recent changes, time-
+  aware baselines, anomalies detected.
+- **Provenance** — where every claim came from (schema introspection,
+  source code extraction, user correction), when it was last
+  verified, and how confident we are in it.
+
+The model is continuously updated as the system it describes evolves —
+new tables appear, schemas migrate, services deploy, metrics shift.
+Drift detection compares fingerprints across discovery cycles and
+surfaces structural change as first-class events.
+
+Agents consume the model through a stable interface. They don't query
+the store directly and they don't call connectors directly. This
+separation is what allows the connector layer and the agent layer to
+evolve independently.
 
 ---
 
@@ -40,35 +103,32 @@ Observibot is built on four principles:
 ├────────────────────────────┼────────────────────────────────────┤
 │                    OBSERVIBOT CORE                              │
 │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
-│  │ Supabase  │  │ Railway   │  │ Generic   │  │ Future    │     │
-│  │ Connector │  │ Connector │  │ PG Conn.  │  │ Connectors│     │
+│  │ Supabase  │  │ Railway   │  │ GitHub    │  │  Future   │     │
+│  │ Connector │  │ Connector │  │ Connector │  │ Connectors│     │
 │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘     │
 │        └──────────────┼──────────────┼──────────────┘           │
 │                       ▼                                         │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                   DISCOVERY ENGINE                      │    │
 │  │  Schema Crawler → Relationship Mapper → Topology Builder│    │
-│  │  Output: SystemModel (JSON graph)                       │    │
+│  │  Output: SystemModel (structured graph)                 │    │
 │  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                   SEMANTIC MODELER                      │    │
-│  │  LLM interprets raw SystemModel into business context   │    │
+│  │  Interprets raw SystemModel into meaning agents can use │    │
 │  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    MONITOR LOOP                         │    │
-│  │  1. Collect metrics from all connectors (every 5m)      │    │
-│  │  2. Store in local time-series store                    │    │
-│  │  3. MAD-based anomaly detection                         │    │
-│  │  4. LLM analysis of anomalies + recent changes          │    │
-│  │  5. Route insights to alerting + Discovery Feed         │    │
-│  │  6. Periodic re-discovery for drift detection (hourly)  │    │
+│  │                    AGENT LOOP(s)                        │    │
+│  │  Per-agent: collect → detect → analyze → emit insights  │    │
+│  │  Current: SRE agent (monitoring + diagnostics)          │    │
+│  │  Planned: Security threat-modeling agent (Phase 7)      │    │
 │  └─────────────────────────┬───────────────────────────────┘    │
 │                            ▼                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │              AGENTIC CHAT PIPELINE                      │    │
-│  │  Two-call LLM pipeline: plan → execute → interpret      │    │
+│  │  Two-call LLM: plan → execute → interpret               │    │
 │  │  Tools: observability │ application (sandboxed) │ infra │    │
 │  │  sqlglot SQL sandbox │ Sensitive column filtering       │    │
 │  └─────────────────────────┬───────────────────────────────┘    │
@@ -80,8 +140,8 @@ Observibot is built on four principles:
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │              DATA STORE (SQLite / PostgreSQL)           │    │
 │  │  system_snapshots │ metric_snapshots │ change_events    │    │
-│  │  insights │ alert_history │ business_context            │    │
-│  │  llm_usage │ metric_baselines │ users │ widgets         │    │
+│  │  insights │ events │ semantic_facts │ widgets           │    │
+│  │  llm_usage │ seasonal_baselines │ users │ sessions      │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -92,100 +152,132 @@ Observibot is built on four principles:
 
 ### 1. Connectors
 
-Each connector implements the `BaseConnector` interface with four methods:
-- `discover() -> SystemFragment` — crawl schema/topology/config
+Each connector implements the `BaseConnector` interface with four
+methods:
+- `discover() -> SystemFragment` — crawl schema / topology / config
 - `collect_metrics() -> MetricSnapshot` — collect current metric values
-- `get_recent_changes(since) -> list[ChangeEvent]` — deployments, migrations
+- `get_recent_changes(since) -> list[ChangeEvent]` — deploys, migrations
 - `health_check() -> HealthStatus` — connectivity and permission verification
 
-Current connectors: Supabase (PostgreSQL), Railway (GraphQL), Generic PostgreSQL.
-Future (Phase 4): GitHub source code connector. Future (Phase 6): Neon, Fly.io,
-Render, Vercel, PlanetScale, Prometheus, OpenTelemetry.
+**Current connectors:** Supabase (PostgreSQL pg_stat + Prometheus
+Metrics API), Railway (GraphQL topology + resource metrics), Generic
+PostgreSQL, GitHub (source code).
 
-See [CONNECTORS.md](CONNECTORS.md) for full details and permission requirements.
+**Planned connectors** are tracked in the roadmap's Phase 6 section
+(connector ecosystem expansion) rather than listed here — the list
+changes frequently enough that the roadmap is the canonical source.
+
+See [CONNECTORS.md](CONNECTORS.md) for the full interface spec,
+database role requirements, and platform-specific setup instructions.
 
 ### 2. Discovery Engine
 
-Orchestrates connectors to build a unified SystemModel containing tables,
-relationships, services, metrics endpoints, and topology. Computes SHA256
-fingerprint for drift detection. Runs on startup, periodically (hourly),
-and on-demand.
+Orchestrates connectors to build a unified SystemModel: tables,
+relationships, services, metrics endpoints, topology. Computes a
+SHA256 fingerprint of the structural portion for drift detection.
+Runs on startup, periodically (hourly), and on-demand via
+`observibot discover`.
 
 ### 3. Semantic Modeler
 
-LLM interprets raw SystemModel into business context: app type, core entities,
-critical metrics, cross-layer correlation rules. Auto-identifies application
-type from schema patterns without user intervention.
+Interprets the raw SystemModel into meaning agents can use. App-type
+identification from schema patterns, soft-delete detection, enum
+value sampling, sensitive-column classification, relationship
+semantics. Some interpretation is deterministic (pattern matching);
+some is LLM-assisted (classification, naming). All semantic claims
+are stored with provenance so they can be traced and corrected.
 
-### 4. Monitor Loop
+### 4. Agent Loop
 
-Collection cycle (every 5m): pull metrics → store → anomaly detect → trigger
-LLM if needed. Discovery cycle (every 1h): re-discover → diff fingerprint →
-alert on drift. Analysis (every 30m or on anomaly): build context → LLM
-analyze → generate insights → alert. Uses MAD-based anomaly detection with
-configurable thresholds and sustained-interval escalation.
+Each agent runs a collect → detect → analyze → emit cycle on its own
+schedule. The currently-shipped SRE agent:
+
+1. Collects metrics from all connectors (every 5m)
+2. Stores snapshots in the local time-series store
+3. MAD-based anomaly detection with seasonal (hour-of-week) baselines
+4. LLM analysis of anomalies + recent changes with structured
+   diagnostic evidence
+5. Routes insights to alerting channels and the Discovery Feed
+6. Periodic re-discovery for drift detection
+
+Future agents will register their own loops against the same
+SystemModel. The `BaseAgent` ABC that formalizes this contract lands
+in Phase 7 — see the roadmap.
 
 ### 5. Agentic Chat Pipeline
 
-Two-call LLM pipeline: the first call plans which tools to invoke (with
-generated SQL or infrastructure queries), the second call interprets the
-results into a narrative answer with optional widget configurations. Three
-domain tools: query_observability (internal metrics), query_application
-(production DB via sandboxed pool), query_infrastructure (Railway services
-and deploys). All SQL goes through a 5-layer sqlglot sandbox.
+Two-call LLM pipeline: the first call plans which tools to invoke
+(with generated SQL or infrastructure queries), the second call
+interprets the results into a narrative answer with optional widget
+configurations. Three domain tools: `query_observability` (internal
+metrics and events), `query_application` (production DB via
+sandboxed pool), `query_infrastructure` (platform services and
+deploys). All SQL goes through a 5-layer sqlglot sandbox.
+
+Chat is currently global (one chat tool surface). Phase 7 introduces
+per-agent chat tool registration so security, cost, and other agents
+expose their own tools into the same chat interface.
 
 ### 6. Web Dashboard
 
 Three-zone layout served by FastAPI at `:8080`:
-- **Dynamic Discovery Feed** (Zone 1): Real-time, ephemeral insights from the
-  monitoring loop with severity badges, confidence scores, and lifecycle
-  actions (Acknowledge, Pin, Promote to Dashboard, Investigate).
-- **Static Dashboard** (Zone 2): Persistent, user-curated widgets promoted
-  from the Discovery Feed or Chat. Six widget types: KPI, time series,
-  categorical bar, table, status, and text summary.
-- **System Intelligence Chat** (Zone 3): Natural language interface for
-  querying across all three domains with domain badges and inline widgets.
+
+- **Dynamic Discovery Feed** (Zone 1) — real-time, ephemeral insights
+  from all active agents with severity badges, confidence scores, and
+  lifecycle actions. Future: agent-source filtering.
+- **Static Dashboard** (Zone 2) — persistent, user-curated widgets
+  promoted from the Discovery Feed or Chat.
+- **System Intelligence Chat** (Zone 3) — natural-language interface
+  across observability, application, and infrastructure domains.
 
 ### 7. Alerting
 
 Structured Insight objects with severity, evidence, correlation, and
-recommended actions. Delivered via ntfy.sh (push notifications), Slack
+recommended actions. Delivered via ntfy.sh push notifications, Slack
 webhook, or generic webhook. Alert aggregation prevents storms; rate
-limiting and per-fingerprint cooldown prevent duplicates.
+limiting and per-fingerprint cooldown prevent duplicates. Insight
+fingerprints are derived from triggering anomaly signatures (stable
+across LLM text variance).
 
 ### 8. Data Store
 
-SQLAlchemy 2.x with dynamic engine selection (SQLite for dev/demo, PostgreSQL
-for production). Alembic migrations. Retention scheduling trims old data
-automatically. Tables: system_snapshots, metric_snapshots, change_events,
-insights, alert_history, business_context, llm_usage, metric_baselines,
-users, widgets.
+SQLAlchemy 2.x with dynamic engine selection (SQLite for dev/demo,
+PostgreSQL for production). Alembic migrations. Retention scheduling
+trims old data automatically. Core tables: `system_snapshots`,
+`metric_snapshots`, `change_events`, `insights`, `events`,
+`semantic_facts`, `seasonal_baselines`, `llm_usage`, `users`,
+`widgets`, `sessions`, `alert_history`.
 
 ---
 
-## Planned: Experiential Memory (Phase 4.5)
+## Experiential Memory (Phase 4.5, In Progress)
 
-The agent currently has no memory across monitoring cycles — each 5-minute
-analysis is stateless. Phase 4.5 introduces three-tier experiential memory:
+A senior SRE builds institutional knowledge over months: which alerts
+are noise, what patterns recur weekly, which deploys cause which
+symptoms. Phase 4.5 gives the platform that capability — not as an
+add-on but as a first-class layer that every agent can consume.
 
-- **Tier 1 (Observation Journal):** Append-only event log via a lightweight
-  `events` envelope table referencing existing tables. Records what happened,
+Three tiers:
+
+- **Tier 1 (Observation Journal)** ✅ shipped — append-only event log
+  via a lightweight `events` envelope table. Records what happened,
   when, and what the outcome was.
-- **Tier 2 (Synthesized Knowledge):** Higher-order patterns distilled from
-  accumulated observations via deterministic clustering + LLM interpretation.
-  Patterns have machine-readable signatures, Bayesian confidence scores, and
-  temporal metadata.
-- **Tier 3 (Working Memory):** Server-side session context for multi-turn chat.
-  Structured state + compressed turns, ~1k token budget.
+- **Tier 2 (Synthesized Knowledge)** 🟡 in progress — higher-order
+  patterns distilled from accumulated observations via deterministic
+  clustering plus LLM interpretation. Patterns carry machine-readable
+  signatures, Bayesian confidence scores, and temporal metadata.
+- **Tier 3 (Working Memory)** ✅ shipped — server-side session context
+  for multi-turn chat.
 
-Key architectural principles:
-- Memory and policy are separate records (pattern ≠ suppression rule)
-- Deterministic pre-processing before any LLM synthesis
-- Seasonal MAD baselines (168 hour-of-week buckets) for time-aware anomaly detection
-- Advisory-only mode before any alert behavior changes
-- Bespoke on SQLite/Postgres — no external memory frameworks
-
-See `docs/PHASE45_DECISIONS.md` for full architecture decisions.
+Key architectural principles for memory:
+- Memory and policy are separate records — a pattern is descriptive;
+  a suppression rule is a policy requiring user confirmation.
+- Deterministic pre-processing before any LLM synthesis.
+- Seasonal MAD baselines (168 hour-of-week buckets) for time-aware
+  anomaly detection.
+- Advisory-only before any alert behavior changes — patterns surface
+  as UI recommendations before they can modify alerting.
+- Bespoke on SQLite/Postgres. No external memory frameworks.
 
 ---
 
@@ -203,7 +295,7 @@ See `docs/PHASE45_DECISIONS.md` for full architecture decisions.
 | HTTP Client | httpx | Async, connection pooling |
 | Scheduling | APScheduler | Lightweight, in-process |
 | CLI | typer + rich | Clean CLI with formatting |
-| Anomaly Detection | MAD (custom) | No scipy dependency, robust to outliers |
+| Anomaly Detection | MAD (custom) | Robust to outliers, no heavy dependency |
 | Auth | python-jose + bcrypt | JWT in httpOnly cookies |
 | Charts | Vega-Lite + vega-embed | Declarative, LLM-generatable specs |
 | Config | YAML + env vars | Human-readable, secrets via environment |
@@ -212,56 +304,106 @@ See `docs/PHASE45_DECISIONS.md` for full architecture decisions.
 
 ## Security Model
 
-1. **Read-only credentials only** — SELECT on information_schema, pg_stat_*,
-   and application tables. Never writes to production.
-2. **SQL sandbox** — All LLM-generated SQL goes through sqlglot AST parsing:
-   SELECT-only enforcement, table allowlisting, row limits, EXPLAIN cost gating.
-3. **Sensitive column filtering** — Columns matching patterns like `password`,
-   `token`, `secret`, `api_key` are excluded from LLM prompts and redacted
-   from query results.
+1. **Read-only credentials only** — SELECT on information_schema,
+   pg_stat_*, and application tables. The platform has no write path
+   to production systems.
+2. **SQL sandbox** — All LLM-generated SQL goes through sqlglot AST
+   parsing: SELECT-only enforcement, table allowlisting, row limits,
+   EXPLAIN cost gating, statement_timeout.
+3. **Sensitive column filtering** — Columns matching patterns like
+   `password`, `token`, `secret`, `api_key` are excluded from LLM
+   prompts and redacted from query results.
 4. **API keys in environment** — Never in config files, never logged.
-5. **JWT auth** — httpOnly cookies, bcrypt password hashing, session management.
-6. **Local-first** — All data stays on your infrastructure. No telemetry,
-   no cloud dependency, no phone-home.
+5. **JWT auth** — httpOnly cookies, bcrypt password hashing.
+6. **Local-first** — All data stays on the operator's infrastructure.
+   No telemetry, no phone-home.
 
 ---
 
-## Future: Agent Ecosystem
+## The Agent Ecosystem
 
-Observibot is designed to evolve beyond a single SRE agent into a platform
-that hosts multiple specialized agents, each analyzing the same system from
-a different perspective. For example:
+Observibot is a platform for specialized agents, not a single agent.
+This is a present-tense architectural commitment, not a future
+aspiration — every design decision we make is constrained by it.
 
-- **SRE Agent** (current) — monitors performance, detects anomalies, correlates
-  business metrics with infrastructure events
-- **Security Agent** (future) — traces auth flows across code, database
-  permissions, API routes, and infrastructure config to find cross-layer
-  vulnerabilities that aren't visible from any single layer
-- **Cost Agent** (future) — tracks resource utilization, identifies waste,
-  and correlates spending with business value
+### Agent categories
+
+**Core agents** — shipped with the platform, maintained by the core
+team. Active: the SRE agent (monitoring, anomaly detection,
+diagnostic evidence, agentic chat). Planned: a security threat-
+modeling agent in Phase 7.
+
+**Community agents** — contributed upstream by external developers
+and bundled into the platform after review. The contribution path is
+intentionally not open yet; see the roadmap and
+`docs/contributing/AGENTS.md` for the timeline.
+
+**Private agents** — built by a single team and run only in their own
+deployment. Never shared, never reviewed, not part of the public
+repo. Use cases include encoding team-specific compliance rules,
+proprietary operational knowledge, or domain-specific analysis the
+team doesn't want to open-source.
+
+All three categories must be first-class consumers of the platform.
+They consume the same SystemModel, use the same store, emit the
+same Insight shape, and register tools into the same chat interface.
 
 ### What's shared across agents
-All agents consume the same foundational infrastructure:
-- **Connectors** provide raw data (schema, topology, metrics, source code)
-- **SystemModel** describes the monitored system in an agent-agnostic way
-- **Store** holds metrics, insights, and business context accessible to all agents
-- **Insight model** is generic (severity, title, summary, related entities, source)
-- **Web dashboard** presents all agents' outputs in the same three-zone layout
 
-### What's agent-specific
-Each agent brings its own:
-- **Analysis loop** with its own schedule and detection logic
-- **Tool set** for the System Intelligence Chat (e.g., security tools differ
-  from SRE tools)
-- **Prompt templates** tuned to the agent's domain expertise
-- **Severity taxonomy** appropriate to the domain (vulnerability vs. anomaly)
+- **Connectors** — shared infrastructure. Agents never call connectors
+  directly; they read from the SystemModel and the store.
+- **SystemModel** — agent-agnostic representation of the monitored
+  system. An agent that only looks at database schema and an agent
+  that only looks at deployment topology both read the same model.
+- **Store** — metrics, insights, events, semantic facts, baselines.
+  Agents read what they need; writes go through typed interfaces.
+- **Insight shape** — `severity`, `title`, `summary`, `related
+  entities`, `source`, `evidence`. The `source` field identifies
+  which agent produced the insight. The `evidence` field carries
+  structured backing data specific to the insight type.
+- **Web dashboard** — all agents' output flows through the same
+  three-zone layout with source filtering (future).
 
-### Architecture principles for multi-agent support
-These decisions apply now to keep the door open:
-1. The Insight `source` field must identify which agent generated the finding
-2. Connectors (including the GitHub source code connector) are shared
-   infrastructure, not coupled to any single agent
-3. Chat tool registration should be dynamic, not hard-coded in prompt strings
-4. The Discovery Feed should support filtering by agent source
-5. The `BaseAgent` ABC (to be designed) will define the contract: tools,
-   analysis loop, prompts, and severity taxonomy
+### What each agent brings
+
+- **Analysis loop** — collection/detection logic and schedule.
+- **Chat tool set** — domain-specific tools registered into the
+  System Intelligence Chat interface.
+- **Prompt templates** — tuned to the agent's domain expertise.
+- **Severity taxonomy** — appropriate to the domain. SRE uses
+  info/warning/critical. Security will use CVSS-style scoring. Cost
+  will use quantitative impact.
+
+### Architectural constraints that protect the ecosystem
+
+These decisions apply now, across every phase, to keep the three-mode
+ecosystem possible:
+
+1. `Insight.source` identifies which agent generated the finding —
+   no agent produces insights anonymously.
+2. Connectors are shared infrastructure, never coupled to a specific
+   agent. An agent cannot declare "this connector belongs to me."
+3. Chat tool registration is dynamic, not hard-coded. When Phase 7
+   lands, agents register their own tools through a stable API.
+4. The Discovery Feed supports filtering by agent source.
+5. The `BaseAgent` ABC (to be designed in Phase 7) defines the
+   contract: tools, analysis loop, prompts, severity taxonomy,
+   lifecycle. External agents implement this contract without
+   modifying core code.
+6. The agent API is narrow and read-mostly. Agents consume the
+   SystemModel, consume metrics, emit insights, register chat
+   tools — that's it. Deep coupling to core internals is rejected.
+
+### What's deliberately deferred
+
+- **Agent distribution model** (process boundary vs plugin class vs
+  config-only). This decision is deferred until we've built the
+  second core agent. Building the second agent will surface the
+  real constraints; deciding before then would be guessing.
+- **Agent registry / marketplace infrastructure.** Candidate Phase 8+
+  territory. Premature before the three-mode ecosystem is working
+  with even a handful of real agents.
+- **Cross-agent coordination protocols.** Agents are currently
+  independent. If two agents emit conflicting insights about the
+  same subject, the UI surfaces both. Coordination (one agent
+  suppressing another) is not on the roadmap.

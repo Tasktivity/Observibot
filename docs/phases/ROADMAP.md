@@ -1,7 +1,27 @@
 # Observibot — Implementation Roadmap
 
-Each phase has explicit exit criteria that define "done." The deliverable
-lists document what was built; the exit criteria document what must be true.
+> **How this roadmap relates to the vision.** Observibot is building a
+> platform: a layer that turns running production systems into live,
+> structured models specialized agents can reason about. See
+> [VISION.md](../VISION.md) for the full framing. This roadmap documents
+> the path we're taking to build that platform — starting with the first
+> agent (SRE) against a narrow set of connectors (GitHub, Supabase,
+> Railway), then generalizing outward on both axes.
+>
+> **Two things to keep in mind when reading it:**
+>
+> 1. The early phases use a narrow stack (indie/PaaS) as a *validation
+>    wedge*, not as a product scope. The architecture is built so
+>    connector and agent surfaces can grow without rearchitecting.
+>
+> 2. "Phase 6" and later — the phases titled "Ecosystem Expansion" and
+>    "Second Agent" — are not "future work we'll get to eventually."
+>    They're the phases where the platform thesis actually plays out.
+>    Everything before them is foundation.
+>
+> Each phase has explicit exit criteria that define "done." The
+> deliverable lists document what was built; the exit criteria document
+> what must be true.
 
 ---
 
@@ -95,10 +115,7 @@ applied. 190+ tests pass, ruff clean, frontend builds.
 - React + TypeScript + Vite + Tailwind frontend (three-zone layout)
 - Zone 1: Dynamic Discovery Feed with real-time polling, severity badges
 - Zone 2: Static Dashboard with 6 widget types (KPI, time series, bar, table, status, text summary)
-- Zone 3: System Intelligence Chat with multi-domain tool calling:
-  - Tool 1: query_observability (8 internal tables)
-  - Tool 2: query_application (production DB, opt-in, sandboxed)
-  - Tool 3: query_infrastructure (Railway services/deploys from snapshots)
+- Zone 3: System Intelligence Chat with multi-domain tool calling
 - Two-call LLM pipeline: plan→execute→interpret (narrative answers)
 - sqlglot SQL sandbox (5-layer: AST parse, SELECT-only, table allowlist, LIMIT, EXPLAIN cost gating)
 - AppDatabasePool for production DB queries (separate read-only pool)
@@ -107,45 +124,16 @@ applied. 190+ tests pass, ruff clean, frontend builds.
 - Vega-Lite chart generation via vega-embed
 
 ### Exit Criteria
-1. **Layout works as designed:** Three zones (Dynamic Discovery Feed, Static
-   Dashboard, System Intelligence Chat) are simultaneously visible and scroll
-   independently. No zone pushes another off-screen regardless of content volume.
-2. **Chat produces correct answers for schema-answerable questions:** "How many
-   users are there?" returns the actual count. The agent routes to the correct
-   domain and the narrative is factual. (Questions requiring business logic
-   understanding are Phase 4 territory.)
-3. **Dynamic Discovery Feed has a usable lifecycle:** Each insight card offers
-   four actions:
-   - **Acknowledge** — removes from active view; retained in backend so the
-     agent detects recurrence of the same condition
-   - **Pin** — keeps the insight pinned to the top of the Discovery Feed
-   - **Promote to Dashboard** — moves the insight into a persistent Static
-     Dashboard widget
-   - **Investigate** — pre-populates the System Intelligence Chat with the
-     insight context and initiates a deeper analysis conversation
-   Duplicate insights from consecutive cycles do not accumulate.
-4. **Data is human-readable:** Numbers formatted (percentages, relative
-   timestamps, Title Case headers). No raw database output visible.
-5. **Charts render without errors:** Vega-Lite specs produce visible charts
-   with no console errors. (Chart refinement and advanced visualizations
-   deferred to Phase 5 — the system needs time to accumulate historical data.)
-6. **Pin-to-dashboard works end-to-end:** Promoting from either the Discovery
-   Feed or Chat creates a widget that renders with data, not an empty shell.
-7. **No silent failures:** API errors surface as user-visible messages. Browser
-   console is clean during normal operation.
-8. **Auth works:** Login, logout, session persistence, first-run registration.
-
-### Phase 3 Issues (All Resolved)
-- ~~P0: Layout overflow~~ ✅ FIXED — `h-screen` on outer container
-- ~~P0: User count returns 0~~ ✅ FIXED — Supabase RLS policy
-- ~~P1: Discovery Feed lifecycle~~ ✅ FIXED — Acknowledge/Pin/Promote/Investigate
-- ~~P1: Semantic understanding limited~~ → Moved to Phase 4
-- ~~P1: Insight deduplication~~ ✅ FIXED — fingerprint excludes LLM text
-- ~~P1: Number formatting~~ ✅ FIXED — relative timestamps, formatted values
-- ~~P1: Pinned widget data~~ → Moved to Phase 5
-- ~~P2: JavaScript exceptions~~ ✅ FIXED
-- P1: Vega-Lite chart rendering → Moved to Phase 5
-- P2: gridstack.js → Moved to Phase 5
+1. **Layout works as designed:** Three zones simultaneously visible, scroll
+   independently.
+2. **Chat produces correct answers for schema-answerable questions.**
+3. **Dynamic Discovery Feed has a usable lifecycle** (Acknowledge, Pin,
+   Promote, Investigate). Duplicates do not accumulate.
+4. **Data is human-readable.** Numbers formatted, relative timestamps.
+5. **Charts render without errors.**
+6. **Pin-to-dashboard works end-to-end.**
+7. **No silent failures.**
+8. **Auth works.**
 
 ---
 
@@ -164,141 +152,35 @@ analysis) powering business-logic chat queries against the monitored app.
 - **Shared `core/code_intelligence/`** — not in `agent/`, reusable by future agents
 - **Tree-sitter structural foundation** — `CodeIndex` interface with
   `TreeSitterIndex` implementation; symbol density ranking for file selection
-- **FTS5 retrieval** — SQLite full-text search over semantic facts, not keyword
-  prompt stuffing
-- **Question classifier** — deterministic gating of business context injection;
-  simple schema queries skip it to prevent regressions
+- **FTS5 retrieval** — SQLite full-text search over semantic facts
+- **Question classifier** — deterministic gating of business context injection
 - **Deterministic secret scanning** — 13 regex patterns before any cloud LLM
-  submission; explicit `cloud_extraction` opt-in config flag
+  submission
 - **5-minute correlation checks** — cheap deterministic proximity detection
   every monitoring cycle, LLM escalation only on high-confidence overlaps
 
-### Deliverables
-
-#### Shared Knowledge Layer (`core/code_intelligence/`)
-- `SemanticFact` Pydantic model with provenance fields (evidence path, commit
-  SHA, line range, confidence, source, tables, columns, sql_condition)
-- `CodeKnowledgeService` — question classifier, FTS5 context retrieval,
-  token-budgeted prompt formatting, freshness tracking, correction storage
-- `semantic_facts` table + `semantic_facts_fts` FTS5 virtual table
-- `code_intelligence_meta` table for freshness tracking (last_indexed_commit,
-  last_index_time)
-- Alembic migration for new tables
-
-#### Schema-Derived Semantic Facts
-- `pg_description` column comments extracted during discovery and stored as
-  DEFINITION facts with 0.95 confidence
-- Naming pattern inference: `*_at` → timestamp transitions, `status` → state
-  machines, `is_*` → boolean flags
-- FK relationship mapping: generates MAPPING facts linking related tables
-- Deduplication: upserts by concept+source+fact_type, prevents duplicates
-  across discovery cycles
-
-#### GitHub Source Code Connector
-- `GitHubConnector(BaseConnector)` with DISCOVERY, CHANGES, HEALTH,
-  CODE_ACCESS, CODE_CHANGES capabilities
-- Fine-grained PAT, read-only, scoped to specific repos
-- ETag conditional requests, rate-limit backoff (Retry-After), 10s timeout,
-  circuit breaker (3 failures → 1hr backoff)
-- Strictly optional — system boots cleanly without GitHub config
-- Wired into `_instantiate_connectors()` when `github.enabled` is true
-
-#### Tree-Sitter Structural Analysis
-- `CodeIndex` ABC — interface for structural code analysis backends
-- `TreeSitterIndex` implementation — Python tree-sitter parsing with regex
-  fallback for JS/TS
-- Universal file selection: 50KB size cap, generated-file exclusion, binary
-  skip, symbol density ranking (not framework-specific heuristics)
-- Top 30 files by score, 100KB total code cap for LLM submission
-
-#### Semantic Extraction Pipeline
-- `SemanticExtractor` — tree-sitter chunks + LLM extraction with Pydantic
-  validation
-- Per-chunk extraction prompt demands PostgreSQL table/column mapping
-- Deterministic validation: facts referencing unknown tables get confidence
-  capped at 0.3
-- Secret scanner: 13 regex patterns, redaction before LLM submission
-- Cloud extraction opt-in: `github.cloud_extraction` config flag
-- Incremental save: facts persist after each chunk (survives timeout)
-
-#### Automated Semantic Refresh
-- Polling-based: 15-minute poll interval via GitHub API (configurable)
-- Commit SHA tracking in `code_intelligence_meta`
-- Incremental re-analysis: `git diff` to find changed files, extract only those
-- Full extraction on first discovery cycle, incremental on subsequent cycles
-- 120-second timeout with `asyncio.wait_for()` — never blocks monitor loop
-
-#### Change-to-Performance Correlation
-- `CorrelationDetector` — deterministic temporal proximity scoring every
-  monitoring cycle (5-minute)
-- Severity score: severity_weight × proximity_weight × z_weight
-- LLM escalation only when `severity_score > threshold`
-- Deterministic fallback insight when LLM unavailable
-- Correlation prompt includes change details, metric anomalies, system topology
-
-#### Enhanced Self-Discovery
-- `pg_description` column comments flow through discovery → schema catalog →
-  semantic facts → chat planning prompt
-- Schema pattern inference via `schema_analyzer.py`
-- Conversational correction detection: 4 regex patterns in chat pipeline
-- Corrections stored as CORRECTION facts with confidence 1.0 (highest priority)
-- `/api/system/code-intelligence-status` endpoint for freshness monitoring
-
-#### Business Context in Chat Pipeline
-- `CodeKnowledgeService.should_inject_context()` — deterministic question
-  classifier gates injection
-- `CodeKnowledgeService.get_context_for_question()` — FTS5 retrieval ranked
-  by source priority (user corrections > code extraction > schema analysis)
-- Token-budgeted formatting: compact one-line-per-fact with sql_condition
-- Freshness warnings when semantic model is stale
-- Business context section added to `PLANNING_PROMPT` only when relevant
-
 ### Exit Criteria
-1. **Source code semantic understanding:** ✅ Observibot connects to GitHub,
-   indexes 77 files via tree-sitter, extracts 376 code-derived facts covering
-   access control, business rules, workflows, entity definitions, and domain
-   mappings. Chat uses these facts for business-logic answers (e.g., "How many
-   bug reports are feature requests?" → 3, using `category = 'feature_request'`
-   from code-extracted fact).
-2. **Automated refresh:** ✅ Polling-based (15-min). Commit SHA tracked
-   (`b09194e5`). Incremental extraction on changed files via git diff.
-3. **Change-to-performance correlation:** ✅ `CorrelationDetector` runs every
-   monitoring cycle. Cheap deterministic check with LLM escalation on
-   high-confidence overlaps.
-4. **Self-improving understanding:** ✅ Two mechanisms: automated code
-   extraction (376 facts) + conversational correction detection (4 regex
-   patterns, stored as priority-1.0 facts).
-
-### Phase 4 Known Polish Items
-- Tree-sitter test gaps: route handler, entrypoint, and docstring detection
-  tests fail (tree-sitter implementation, not architecture)
-- Question classifier over-matches: "How many users?" triggers context
-  injection via word overlap with concept terms (no regression, token waste)
-- First-run extraction timeout: 120s limit processes ~21 of 30 files;
-  incremental save mitigates, batching across cycles would fix
-- Minified JS noise: sub-50KB compiled files produce low-value facts;
-  line-length heuristic would filter
-- CLI `ask` command uses different code path from web chat, bypasses
-  business context pipeline
+1. **Source code semantic understanding** ✅
+2. **Automated refresh** ✅
+3. **Change-to-performance correlation** ✅
+4. **Self-improving understanding** ✅ (code extraction + conversational
+   correction)
 
 ---
 
-## Phase 4.5: Experiential Memory & Connector Enrichment (In Progress)
+## Phase 4.5: Experiential Memory & Foundational Work (In Progress)
 
 Observibot currently has no memory across monitoring cycles — every 5-minute
-analysis is stateless. A senior SRE builds institutional knowledge over months:
-which alerts are noise, what patterns recur weekly, which deploys cause which
-symptoms. This phase gives the agent that capability.
+analysis is stateless. A senior SRE builds institutional knowledge over
+months: which alerts are noise, what patterns recur weekly, which deploys
+cause which symptoms. This phase gives the agent that capability.
 
-Additionally, both Supabase and Railway expose far more metrics than the
-connectors currently collect. Supabase has a Prometheus-compatible Metrics API
-with ~200 metrics (CPU, IO, WAL, memory, disk, replication, auth). Railway's
-GraphQL API exposes CPU/memory/disk/network per service. Enriching the metric
-pipeline before building memory ensures the experiential system learns from
-the full picture from day one.
+This phase also contains the **foundational work that unlocks Phase 5's
+architecture view**. Multi-repo awareness and typed entity IDs on insights
+are landing here rather than being retrofitted later, because changing the
+shape of semantic facts and insights after they've accumulated is painful.
 
 Architecture reviewed by 3 external reviewers (Gemini, ChatGPT, Perplexity).
-All critical feedback incorporated into the design.
 
 ### Architecture Decisions (from 3-reviewer consensus)
 - **Three-tier experiential memory** — Observation Journal (episodic log),
@@ -310,160 +192,486 @@ All critical feedback incorporated into the design.
 - **Seasonal MAD baselines** — hour-of-week bucketing (168 buckets) for
   time-aware anomaly detection, eliminating known-pattern false positives
 - **Bayesian confidence** — Beta distribution updated by user feedback
-  (noise/actionable); no full RL infrastructure needed
 - **Bespoke on SQLite/Postgres** — rejected Mem0, Zep, Letta, Cognee due to
   deployment friction; borrow patterns from ExpeL, Hindsight, MemRL
 - **Shared Prometheus parser** — reusable utility for Supabase Metrics API +
-  Railway Prometheus exporter + future Phase 6 generic connectors
+  Railway Prometheus exporter + future generic connectors
 - **Advisory-only before suppression** — synthesized patterns surface in UI
   as recommendations before any alert behavior changes
 
-### Step 0 Deliverables (Prerequisites) ✅ COMPLETE
-Completed April 13, 2026. 361 tests passing (65 new total), ruff clean,
-frontend builds clean. Two external code reviews completed — all critical
-and important issues fixed across two hotfix passes.
+### Step Summaries
 
-- `monitor_runs` table — anchors each monitoring cycle with a run ID
-- `insight_feedback` table + API + UI buttons — Noise/Actionable/Investigating/Resolved
-- Chat session ID support — server-side session store (30min TTL, 5 turn max)
-- Shared Prometheus text parser utility (`connectors/prometheus_parser.py`)
-- Supabase Metrics API scraping — ~200 metrics (CPU, IO, WAL, memory, disk, replication, auth, pooler)
-- Railway GraphQL resource metrics (CPU, memory, disk, network) + optional Prometheus exporter
+**Step 0 (Prerequisites) ✅ COMPLETE** — April 13, 2026. monitor_runs
+anchoring, insight feedback buttons, chat session support, shared Prometheus
+parser, Supabase/Railway metrics enrichment.
 
-### Step 1 Deliverables (Events Envelope — Tier 1) ✅ COMPLETE
-Completed April 13, 2026. 387 tests passing (26 new), ruff clean, frontend
-builds clean. Unified episodic timeline operational from first monitoring cycle.
+**Step 1 (Events Envelope) ✅ COMPLETE** — April 13, 2026. Unified episodic
+timeline. Events table, FTS5 narrative search, 5 API endpoints, Discovery
+Feed recurrence annotations.
 
-- `events` table — lightweight envelope referencing existing tables (5 indexes)
-- FTS5 virtual table (SQLite) / GIN tsvector index (PostgreSQL) for narrative search
-- 7 store methods for event emission, querying, search, and recurrence stats
-- Event emission wired into all code paths (monitor loop, chat, feedback)
-- Events API — 5 endpoints (list, subject, recurrence, search, timeline)
-- Discovery Feed recurrence annotations ("Seen N times in last 30 days")
+**Step 2 (Session Memory) ✅ COMPLETE** — April 14, 2026. EXPLAIN cost
+gating, multi-turn resolution, Agent Memory Inspector tab with 6 API
+endpoints, contract tests for Railway/Supabase.
 
-### Step 2 Deliverables (Session Memory — Tier 3) ✅ COMPLETE
-Completed April 14, 2026. 478 tests passing (59 new), ruff clean, frontend
-builds clean. Browser-verified via Chrome DevTools MCP.
+**Step 3 (Deterministic Experiential Retrieval) ✅ COMPLETE** — Seasonal MAD
+baselines with hour-of-week bucketing, recurrence annotations on insights.
 
-- EXPLAIN cost gating + query timeouts (Layers 4-5 of 5-layer SQL sandbox)
-- Structured session turns with entity extraction (table, metric, domain, timeframe)
-- Token-budget-aware context building (~1k token cap, word-boundary truncation)
-- Multi-turn resolution instructions in PLANNING_PROMPT + conversation state block
-- Agent Memory Inspector tab: facts CRUD, knowledge stats, feedback summary,
-  events timeline, business context viewer
-- 6 API endpoints under /api/knowledge/*
-- Contract tests for Railway GraphQL and Supabase Metrics API response shapes
+**Step 3.1 (Insight Persistence Fix) ✅ COMPLETE** — Recurrence context now
+persisted correctly on live pipeline insights.
 
-### Step 3 Deliverables (Deterministic Experiential Retrieval)
-- Seasonal MAD baselines (hour-of-week bucketing)
-- Deterministic lookbacks during anomaly analysis ("seen N times in 30 days")
-- Recurrence annotations on Discovery Feed insights
+**Step 3.2 (Generic Detector/Insight Bugs) ✅ COMPLETE** — MAD=0 relative
+floor, stable anomaly_signature, direction-aware prompt.
 
-### Step 4 Deliverables (Synthesis Agent — Tier 2, Advisory Mode)
-- Deterministic pre-clustering of observations
-- LLM synthesis to label and summarize clusters
-- `SynthesizedKnowledge` with pattern_signature + prior/posterior split
-- UI for viewing, confirming, and rejecting learned patterns
-- Advisory-only: patterns displayed but no behavior changes
+**Step 3.3 (Shared Evidence Infrastructure) ✅ COMPLETE** — EvidenceBundle
+dataclass, Insight.evidence field, DiagnosticsConfig stub, prompt_utils
+extraction, synthetic schema fixtures (first Tier 0 compliance).
 
-### Step 5 Deliverables (Policy Layer + Alert Suppression)
-- Separate `suppression_policies` table (memory ≠ policy)
-- Auto-created policies with strict guardrails (never suppress > warning)
-- User-confirmed policies via one-click from UI
-- Bayesian posterior updates from insight feedback
+**Step 3.4 (Hypothesis-Test Loop)** — In progress. Autonomous diagnostic
+SQL against the application DB with fail-closed EXPLAIN, cooldown cache,
+diagnostic evidence rendered in the UI.
 
-### Step 6 Deliverables (Correction Detection Upgrade)
-- Teaching-intent detection integrated into planning call structured output
-- Structured `/api/feedback` endpoint for UI-driven corrections
-- Retire hardcoded regex patterns
+**Step 4 (Synthesis Agent — Advisory Mode)** — Deterministic pre-clustering
+of observations, LLM synthesis to label clusters, SynthesizedKnowledge with
+pattern_signature and Bayesian confidence, UI for viewing/confirming/
+rejecting learned patterns.
+
+**Step 5 (Policy Layer + Alert Suppression)** — Separate
+suppression_policies table, user-confirmed policies via one-click from UI,
+strict guardrails (never suppress > warning).
+
+**Step 6 (Correction Detection Upgrade)** — Teaching-intent detection in
+planning structured output, structured /api/feedback endpoint, retire
+hardcoded regex patterns.
+
+**Step 7 (Architecture View Foundations)** — Low-risk data additions that
+unlock the Phase 5 architecture view without committing to its UI yet.
+These land in Phase 4.5 rather than Phase 5 because retrofitting the
+shape of stored data later is painful.
+
+- **Multi-repo GitHub connector.** Allow a list of repos on a single
+  `GithubConnector` config instance (not yet multi-platform — GitLab /
+  Bitbucket are Phase 6). Connector emits fragments tagged with repo
+  identity. `SemanticFact` gains a `repo` field. Existing single-repo
+  deployments keep working unchanged; multi-repo is opt-in.
+- **Typed entity IDs on insights.** Replace freeform
+  `related_entities` strings with structured references of the form
+  `{type: "table" | "service" | "file" | "function" | "repo", id: "..."}`.
+  The insight pipeline (anomaly detector, analyzer, chat) populates
+  these as it runs. One-release migration window for backwards
+  compatibility with the string form.
+- **Per-repo SystemFragment merging.** The discovery engine already
+  merges fragments from multiple connectors; this extends the merge
+  to keep repo identity distinct inside the resulting `SystemModel`.
+
+These additions are worth doing now specifically because our live test
+case already has two git repos, so we can exercise multi-repo end-to-end
+before it's committed to a UI feature.
 
 ### Exit Criteria
-1. **Monitoring cycles are anchored:** Every cycle creates a `monitor_runs`
-   record linking anomalies, insights, and metrics collected in that cycle.
-2. **User feedback is captured:** Insight cards offer Noise/Actionable/
-   Investigating/Resolved buttons that persist feedback to the database.
-3. **Multi-turn chat works:** "How many users?" followed by "Break that down
-   by month" resolves correctly within a session.
-4. **Supabase metrics are comprehensive:** Connector collects CPU, memory,
-   disk IO, WAL, and connection pooler metrics via the Metrics API (~200 series)
-   in addition to existing pg_stat metrics.
-5. **Railway resource metrics are collected:** CPU, memory, disk, and network
-   per service via GraphQL (and/or Prometheus exporter).
-6. **Experiential retrieval works:** Anomaly insights show recurrence context
-   ("Seen 4 times in 30 days — usually self-resolves in ~20 minutes").
-7. **Synthesized patterns are surfaced:** Learned patterns appear in the UI
-   as advisory recommendations with confidence scores and evidence counts.
-8. **Alert suppression is safe:** Only high-confidence patterns with user
-   confirmation or strict guardrails can suppress alerts. No silent suppression
-   of severity > warning.
-9. **Seasonal baselines reduce false positives:** Known weekly/daily patterns
-   are absorbed into time-bucketed baselines, reducing noise alerts.
+1. **Monitoring cycles are anchored.**
+2. **User feedback is captured.**
+3. **Multi-turn chat works.**
+4. **Supabase metrics are comprehensive.**
+5. **Railway resource metrics are collected.**
+6. **Experiential retrieval works.**
+7. **Evidence-backed insights:** Critical anomalies produce insights with
+   attached diagnostic evidence — actual query results, viewable in the UI.
+8. **Synthesized patterns are surfaced.**
+9. **Alert suppression is safe.**
+10. **Seasonal baselines reduce false positives.**
+11. **Multi-repo support works end-to-end:** A single deployment monitors
+    two git repos; semantic facts, insights, and chat all correctly
+    attribute code-derived context to the right repo.
+12. **Insights carry typed entity IDs** resolvable to SystemModel
+    nodes, positioning Phase 5 to build the architecture view on top.
 
 ---
 
-## Phase 5: Reporting & Analytics Maturity (Future)
+## Phase 5: Reporting, Analytics Maturity & System Architecture View
 
-By this phase the system has accumulated substantial historical data. This phase
-focuses on making the output polished and the analytics genuinely useful.
+By this phase the system has accumulated substantial historical data.
+Phase 5 has two focus areas:
 
-### Deliverables
+1. **Analytics polish** — charts, reporting, business KPI caching, metric
+   registry. The work originally scoped for this phase.
+
+2. **System Architecture View** — a new top-level dashboard tab that
+   renders the entire monitored system end-to-end as an interactive,
+   zoomable diagram. This is new in the current roadmap revision and
+   becomes the visual anchor the Phase 7 agent overlays will extend.
+
+### 5A — Analytics Maturity
+
+**Deliverables:**
 - Chart and visualization refinement (time series, categorical, heatmaps)
 - Advanced reporting (trend analysis, comparative periods, SLA tracking)
-- Business KPI promotion (key app health metrics collected as first-class metrics)
-- Metric registry (display names, units, thresholds, healthy ranges, synonyms)
+- Business KPI promotion (key app health metrics collected as first-class
+  metrics)
+- Metric registry (display names, units, thresholds, healthy ranges,
+  synonyms)
 - Schema RAG for 500+ table schemas
 - gridstack.js drag-and-drop dashboard layout
 
-### Exit Criteria
-1. **Charts are informative:** Time series, bar, and status charts render
-   correctly with historical data. Charts include context (thresholds, healthy
-   ranges, trend indicators) that make them actionable without explanation.
-2. **Business KPIs answer from cache:** Core health questions (user count, error
-   rates, latency) answer from Observibot's own store (fast, cached) rather than
-   requiring live production DB queries.
-3. **Dashboard is customizable:** Users can arrange, resize, and organize widgets
-   via drag-and-drop.
+**Exit Criteria:**
+1. Charts are informative, with context (thresholds, healthy ranges, trend
+   indicators) that makes them actionable without explanation.
+2. Business KPIs answer from Observibot's own store, not live production
+   DB queries.
+3. Dashboard is customizable (drag-and-drop widgets).
+
+### 5B — System Architecture View (Static)
+
+A new top-level tab in the dashboard that renders the entire monitored
+system as a single interactive diagram. Scope for Phase 5 is
+**static-only**: the diagram shows structure, not live state. Agent-
+driven overlays (live status, blast radius) are Phase 7 and will extend
+what Phase 5 ships here.
+
+**What the view shows:**
+- **Source code structure** for each connected repo — files, modules,
+  major functions, entry points, workers, route handlers — clustered
+  by repo.
+- **Backend components** — databases, services, deployment platforms —
+  discovered through existing connectors.
+- **Cross-layer connections** — source code that reads from or writes to
+  specific database tables, API routes that invoke specific services,
+  workers that subscribe to specific queues. Backend-to-backend edges
+  (table foreign keys, service dependencies) render separately from
+  code-to-backend edges so both kinds of structure are visible.
+- **Multi-repo layout** — each repo rendered as its own collapsible
+  cluster with cross-repo code references called out explicitly. Our
+  live test case has two repos, so this is exercised end-to-end from
+  day one.
+
+**What the view does NOT show in Phase 5:**
+- Live monitoring state (green/yellow/red nodes) — Phase 7.
+- Blast-radius highlighting — Phase 7.
+- Agent-specific overlays — Phase 7.
+
+**Non-negotiable UX requirements** (carrying these into the research
+brief to avoid settling for "good enough"):
+- Sharp, clean visual language. No dated-looking defaults.
+- Fast and responsive even for large graphs. Pan and zoom must be
+  smooth. Click-to-expand clusters must be instant.
+- Intuitive interactions. A developer seeing this for the first time
+  should understand what they're looking at within seconds.
+- Accessible at the keyboard level, not just mouse.
+- Works on the same color palette and font stack as the rest of the
+  dashboard (no iframe'd third-party widget that looks alien).
+
+**Research deliverables — complete before implementation begins:**
+
+1. **Graph rendering library evaluation.** Build a small prototype
+   with the top 2–3 candidates from the research list, loading a
+   representative TaskGator-sized graph (~150 nodes, ~300 edges across
+   2 repos plus backend components). Candidates to evaluate include,
+   at minimum:
+   - Cytoscape.js (mature, Apache 2.0, good clustering)
+   - React Flow (reactflow.dev) — modern, React-native
+   - Sigma.js (WebGL, designed for large graphs)
+   - D3 + dagre or D3 + ELK layout engine
+   - Any library surfaced by the research prompt runs that looks
+     credible
+
+   Decision criteria: render performance at target graph size, UX
+   quality on first touch, license compatibility (Apache 2.0 or
+   permissive equivalent), active maintenance, integration effort
+   with React 18, ability to customize aesthetics to match the
+   existing dashboard. Document the evaluation, the choice, and the
+   reasons the others were rejected in `docs/PHASE5_DECISIONS.md`.
+
+2. **Graph storage pattern evaluation.** Initial implementation uses
+   a composed view over the existing SystemModel and SemanticFact
+   stores — no new graph database dependency — because volume
+   doesn't require it yet. But the architecture must not paint us
+   into a corner: when a future customer has 10,000+ nodes, we need
+   a clean migration path to a real graph store (Neo4j, Memgraph,
+   SQLite with recursive CTE + graph schema, or Postgres with
+   Apache AGE). Research deliverables:
+   - A documented interface (`SystemGraphQuery` ABC or similar) that
+     all graph consumers use. The composed-view implementation is
+     one backing. A real graph-DB backing can slot in without UI
+     changes.
+   - A decision memo in `docs/PHASE5_DECISIONS.md` describing
+     candidate graph stores, when we'd switch, and rough cost of
+     the migration. This doesn't commit us to a choice — it just
+     makes sure we know the choice is there.
+
+3. **Cross-layer edge extraction research.** Today, `SemanticFact`
+   entries that map code to tables are the foundation. We also need
+   stable ways to infer:
+   - Code-to-service edges (a function calls a service via HTTP, a
+     worker reads a queue)
+   - Service-to-service edges (inter-service RPC, message bus)
+   - File-to-file dependencies within a repo (imports, calls)
+   The research deliverable is a list of which edge types we can
+   extract reliably from Phase 4 data alone, which need additional
+   inference, and which need new sources of truth (e.g., OpenAPI
+   specs, Kubernetes ServiceMonitors). Documented in
+   `docs/PHASE5_DECISIONS.md`.
+
+4. **Prior-art survey.** Read and summarize how comparable tools
+   handle this — Backstage's Software Catalog, Port, Kubernetes
+   topology viewers (Kiali, Weave Scope), OpenTelemetry's service
+   maps. What works about their approaches, what doesn't, what
+   should we borrow, what should we avoid.
+
+**Implementation deliverables (after research closes):**
+- `SystemGraphQuery` interface + composed-view implementation
+- Graph extraction: nodes and typed edges from SystemModel,
+  SemanticFact, code intelligence index, and connector snapshots
+- `/api/graph/*` REST surface (returns nodes, edges, optional filters
+  by repo / service / subgraph)
+- New top-level tab: "System Architecture" (tentative name — product
+  voice may land on something sharper)
+- Frontend graph component using the library chosen by research
+  deliverable #1
+- Repo clustering, collapse/expand, zoom, pan, search, node focus
+- Legend explaining node types and edge types
+- Empty / partial state handling (e.g., no code extracted yet, one
+  connector unavailable)
+
+**Exit Criteria:**
+1. **Architecture view tab is live** and accessible to authenticated
+   users alongside the existing three zones.
+2. **Multi-repo rendering works.** The TaskGator test deployment's
+   two repos render as two clusters with cross-repo references
+   visible.
+3. **Cross-layer edges are visible.** Code-to-table edges from
+   SemanticFacts render correctly on at least one representative
+   flow. Service-to-service edges render where discoverable.
+4. **Large-graph performance is acceptable.** Pan / zoom / expand
+   interactions on a 500-node graph feel smooth on a mid-range
+   laptop.
+5. **Research decisions are documented** in
+   `docs/PHASE5_DECISIONS.md` — library choice, graph storage
+   pattern, edge extraction strategy, prior-art lessons.
+6. **Graph API is backing-store agnostic.** The
+   `SystemGraphQuery` interface has at least two backing-store
+   implementations (the composed-view production one plus a test
+   fixture) to prove the abstraction is real.
 
 ---
 
-## Phase 6: Generalization & Community (Future)
+## Phase 6: Ecosystem Expansion — Connectors
 
-This is where Observibot becomes a product for the target audience of indie
-developers, not just a tool for a single stack. All prior phases must maintain
-flexibility for this transition — implementation decisions should not lock in
-platform-specific assumptions.
+This is the first of the two phases where the platform thesis plays out.
+Up to this point, Observibot has been validated against GitHub + Supabase +
+Railway, which is enough to prove the SRE agent works but not enough to
+serve the broader audience the platform is built for. Phase 6 broadens the
+connector surface so the platform starts being genuinely useful to teams
+beyond the PaaS-only wedge.
+
+**The core team will ship enough connectors to prove the pattern is real
+before community contribution opens broadly.** The goal is to reach a
+point where writing a new connector is a well-defined exercise a
+contributor can complete in a week, not a research project.
 
 ### Deliverables
-- Additional database connectors (Neon, Fly.io, Render, Vercel, PlanetScale)
-- Generic Prometheus/OpenTelemetry connectors
-- GitLab and Bitbucket source code connectors (via SourceCodeConnector ABC)
-- Multi-project support with isolated discovery, metrics, and business context
-- Plugin system via entry points
-- Optional hosted tier / Railway template marketplace
-- Agent abstraction layer: `BaseAgent` ABC defining the contract for
-  specialized agents (tool set, analysis loop, prompts, severity taxonomy)
-- Agent registry allowing multiple agents to run concurrently against the
-  same system (e.g., SRE + Security + Cost agents sharing connectors and store)
-- Discovery Feed agent filtering (view insights from all agents or one specific agent)
-- Dynamic chat tool registration (agents register their own tools into the
-  System Intelligence Chat rather than hard-coding tool definitions)
+
+**Database connectors (priority order, subject to revision based on
+research):**
+- Generic Postgres already exists; expand to cover the common managed
+  variants: Neon, Amazon RDS Postgres, Google Cloud SQL Postgres
+- MySQL family: Generic MySQL, PlanetScale (Vitess), Amazon RDS MySQL
+- Click-through targets based on usage data: DynamoDB, MongoDB, Redis
+
+**Deployment / infrastructure connectors:**
+- Fly.io, Render, Vercel (nearest neighbors to current Railway coverage)
+- AWS (EC2, ECS, Lambda, CloudWatch metrics)
+- GCP (Cloud Run, GCE, GKE, Cloud Monitoring)
+- Azure (App Service, AKS, Azure Monitor)
+
+**Source-code connectors:**
+- GitLab (self-hosted and SaaS)
+- Bitbucket
+
+**Generic observability connectors:**
+- Prometheus scrape
+- OpenTelemetry (metrics + traces)
+
+**Platform:**
+- `SourceCodeConnector` ABC (generalizes GitHub connector)
+- `CloudConnector` ABC (generalizes Railway connector to cover cloud providers)
+- Multi-project support with isolated discovery, metrics, and business
+  context per project
+- Plugin system via Python entry points — connectors can be installed as
+  third-party packages without modifying core code
+- Each new connector's output flows into the System Architecture View
+  (Phase 5B) automatically — no per-connector graph integration work
+
+**Community contribution infrastructure:**
+- `docs/contributing/CONNECTORS.md` promoted from stub to full guide with
+  test harness, reference implementation walkthrough, and PR review rubric
+- Connector certification process (what core-team review looks like)
+- Connector manifest / capability declaration
+- Community registry or index for third-party connectors
 
 ### Exit Criteria
-1. **At least one additional database connector** beyond Supabase/PostgreSQL,
-   proving the connector abstraction generalizes.
-2. **At least one additional source code platform** beyond GitHub, proving the
-   SourceCodeConnector ABC works.
-3. **Multi-project support:** A single instance monitors multiple applications
-   with isolated data and business context per project.
-4. **Plugin system:** Third-party connectors can be installed without modifying
-   core code.
-5. **Agent abstraction:** At least one additional agent (e.g., Security Agent)
-   runs alongside the SRE agent, contributing insights to the same Discovery
-   Feed with agent-source filtering, and registering its own chat tools.
+1. **Connector breadth:** At least five database connectors, three
+   deployment platforms, and two source-code hosts are supported in core.
+2. **One major cloud:** AWS, GCP, or Azure is supported end-to-end
+   (discovery, metrics, changes).
+3. **Plugin system:** A third-party connector can be installed from a
+   separate package without modifying core code, and it appears in the
+   Discovery Feed like any core connector.
+4. **Multi-project:** A single Observibot instance monitors two distinct
+   applications with no data crossing between them.
+5. **Contribution readiness:** A new developer can build and submit a
+   connector PR following only the contribution docs, without consulting
+   the core team.
+
+---
+
+## Phase 7: Ecosystem Expansion — Agents & Architecture View Overlays
+
+The second platform-thesis phase. Observibot demonstrates that the system
+model is genuinely useful for reasoners beyond the SRE agent, and that
+the architecture view (shipped static in Phase 5) becomes a genuinely
+powerful tool when agents project live state and analysis results onto
+it.
+
+### Deliverables
+
+**Second core agent — Security Threat Modeling:**
+- Traces auth flows across source code, database permissions, API routes,
+  and infrastructure config to find cross-layer vulnerabilities
+- Models threat surfaces: what could a compromised service reach? which
+  RLS policies gate which data? what secrets are exposed where?
+- Continuous threat posture tracking as the system evolves
+- Severity taxonomy appropriate to security (vulnerability, not anomaly)
+- Its own chat tools registered into System Intelligence Chat
+
+**Agent platform:**
+- `BaseAgent` ABC — the contract every agent implements
+- Agent lifecycle: registration, analysis loop scheduling, tool
+  registration, configuration
+- Discovery Feed agent source filtering — see insights from all agents
+  or one specific agent
+- Dynamic chat tool registration — agents register their own tools
+  instead of tools being hard-coded
+- Agent-scoped severity taxonomies
+
+**Architecture View Overlays (extends the Phase 5B static view):**
+- **Live state overlay.** SRE agent paints node states onto the graph
+  (healthy / warning / critical) based on the current Discovery Feed.
+  A failing worker, a degraded service, a saturated database all
+  render as colored nodes on the architecture diagram.
+- **Click-through navigation.** Every insight in the Discovery Feed
+  has a "Show on map" action that switches to the architecture view
+  with the relevant node(s) highlighted. Uses the typed entity IDs
+  shipped in Phase 4.5 Step 7.
+- **Blast-radius highlighting.** When an agent identifies a
+  concerning node, it can compute a reachable subgraph (what does
+  this touch?) and return it as a visual overlay. Primary use: the
+  security agent highlights a vulnerable code path and the
+  downstream data, services, and tables it can reach. The SRE
+  agent can do the same — a failing database's blast radius is every
+  service reading from it.
+- **Agent-specific overlay modes.** Users toggle between overlay
+  modes via a dropdown: SRE (performance state), Security (threat
+  exposure), and future agents. Each agent registers an overlay
+  renderer that colors or annotates nodes and edges according to
+  its own taxonomy.
+
+**Community/private agent infrastructure:**
+- `docs/contributing/AGENTS.md` promoted from stub to full guide
+- Private agent installation path (load agent from local package without
+  modifying core)
+- Agent manifest / capability declaration
+- Architecture decision on agent distribution model (separate process vs
+  plugin class vs config-only) — deferred to this phase based on
+  learnings from Phase 6
+- Overlay registration API stable enough that community agents can
+  contribute overlays without core changes
+
+### Exit Criteria
+1. **Second agent working:** The security threat modeling agent runs
+   alongside the SRE agent, contributes insights to the same Discovery
+   Feed with agent-source filtering, and registers its own chat tools.
+2. **Three-mode support:** Core agents, community-contributed agents,
+   and private agents can all run in the same deployment.
+3. **Agent API stability:** The `BaseAgent` contract is versioned and
+   documented. Existing agents do not need to change when new core
+   capabilities are added.
+4. **Live architecture overlay works.** An SRE-detected failing
+   component renders as red on the architecture view within one
+   monitoring cycle.
+5. **Click-through from insight to architecture works.** Every insight
+   with typed entity IDs has a working "Show on map" action.
+6. **Blast-radius visualization works.** The security agent produces
+   at least one insight with a computed reachable subgraph that
+   renders correctly as a highlighted overlay.
+7. **Contribution readiness:** A new developer can build and submit
+   an agent PR (including an overlay) following only the contribution
+   docs.
+
+---
+
+## Phase 8+: Beyond
+
+The phases past this point are intentionally not defined in detail. At
+current pace the platform thesis plays out over 12-24 months. What comes
+after depends heavily on what we learn from the first community
+contributions, the second agent, and real-world usage at scale.
+
+### Candidate directions
+
+- Cost agent (resource utilization, waste identification, spend
+  correlation with business value)
+- Compliance agent (audit trail generation, regulatory posture, evidence
+  collection)
+- On-call agent (incident response, runbook execution, handoff summaries)
+- Hosted tier infrastructure (multi-tenant deployment, isolation,
+  billing)
+- Agent registry / marketplace
+- Additional reasoning primitives beyond LLM calls (traditional ML for
+  pattern detection, time-series forecasting, causal inference)
+
+### Known architectural decision points deferred to this phase
+
+These are decisions we've explicitly flagged but deliberately not made
+yet, because making them before the relevant use cases exist would be
+guessing. They're tracked here so they don't get lost.
+
+- **Graph storage migration.** The System Architecture View ships in
+  Phase 5 using a composed view over existing stores. When graph scale
+  or query complexity outgrows that (10,000+ nodes, complex reachability
+  queries, multi-hop path traversals at interactive speed), we migrate
+  the `SystemGraphQuery` backing to a real graph store. The Phase 5
+  research deliverable documented candidates (Neo4j, Memgraph, Postgres
+  with Apache AGE, SQLite with graph-shaped schema + recursive CTEs)
+  and rough migration cost. The decision to migrate — and to which
+  backing — belongs in this phase.
+- **Agent distribution model.** Plugin classes loaded at runtime vs
+  separate processes with a stable API vs config-only agents. The
+  Phase 7 decision was provisional; revisiting based on what real
+  community and private agents need.
+- **Multi-tenant data isolation.** Up through Phase 7, an Observibot
+  deployment monitors one logical set of systems (even if multi-
+  project from Phase 6). A hosted tier where many independent
+  customers share infrastructure requires real isolation — at the
+  DB row level, at the LLM context level, at the Discovery Feed
+  level. Hard-to-retrofit, so likely becomes a clean architectural
+  work stream when a hosted tier is committed to.
+
+The principle that holds: whatever ships next must strengthen the
+connector layer, the system model, or the agent ecosystem. Features
+that serve only the first wedge or lock us into narrow scope are
+off-mission.
 
 ---
 
 ## Tech Stack
-Backend: Python 3.12, FastAPI, SQLAlchemy 2.x + Alembic, asyncpg, aiosqlite, httpx, APScheduler, Anthropic/OpenAI SDKs, sqlglot, pydantic, scipy, numpy, deepdiff, python-jose, bcrypt
-Frontend: React 18 + TypeScript, Vite, Tailwind CSS, ECharts (echarts-for-react), Vega-Lite + vega-embed, gridstack.js (installed)
-Infra: Docker (multi-stage), Railway templates, GitHub Actions CI
+
+**Backend:** Python 3.12, FastAPI, SQLAlchemy 2.x + Alembic, asyncpg,
+aiosqlite, httpx, APScheduler, Anthropic/OpenAI SDKs, sqlglot, pydantic,
+scipy, numpy, deepdiff, python-jose, bcrypt
+
+**Frontend:** React 18 + TypeScript, Vite, Tailwind CSS, ECharts
+(echarts-for-react), Vega-Lite + vega-embed, gridstack.js. Graph
+rendering library TBD in Phase 5 research — candidates include
+Cytoscape.js, React Flow, Sigma.js, and D3 + ELK/dagre.
+
+**Infrastructure:** Docker (multi-stage), Railway templates, GitHub
+Actions CI

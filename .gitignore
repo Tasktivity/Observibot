@@ -43,8 +43,24 @@ docs/AGENTIC_DECISIONS.md
 docs/PHASE45_DECISIONS.md
 docs/REVIEW_SYNTHESIS.md
 docs/REVIEW_SYNTHESIS_PART2.md
-CLAUDE.md
-AGENTS.md
+/CLAUDE.md
+/AGENTS.md
+
+# Strategy notes and internal AI workflow artifacts — same category as the
+# decision docs above. STRATEGY_NOTES captures the reasoning behind
+# architectural choices (including what was rejected and why);
+# STRATEGY_CHAT_SEED is the prompt used to ground new internal strategy
+# conversations. Both are useful to maintain across sessions but contain
+# internal meta-commentary that doesn't belong in the public repo.
+docs/STRATEGY_NOTES.md
+docs/STRATEGY_CHAT_SEED.md
+
+# Backlog tracked locally until items migrate to GitHub Issues. The
+# current BACKLOG.md contains pre-issue planning notes, phase-specific
+# follow-ups, and implementation details that will eventually be split
+# into proper Issues with labels, milestones, and assignees. Keeping it
+# private during this transition avoids exposing half-formed items.
+docs/BACKLOG.md
 
 # Deployment-specific verification scripts — these run Observibot against
 # a live monitored system and produce deployment-specific output, so they
