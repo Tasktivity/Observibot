@@ -227,6 +227,130 @@ async def test_insight_evidence_roundtrips_through_store(tmp_store) -> None:
     )
 
 
+async def test_insight_evidence_roundtrips_extended_fields(tmp_store) -> None:
+    """Stage 2: the ``evidence`` column now also carries EvidenceError
+    entries, FactCitation lists on diagnostics, and code_freshness.
+    All three must survive save/fetch.
+    """
+    from datetime import UTC, datetime
+
+    from observibot.core.evidence import (
+        DiagnosticEvidence,
+        EvidenceBundle,
+        EvidenceError,
+        FactCitation,
+    )
+
+    bundle = EvidenceBundle(
+        errors=[
+            EvidenceError(
+                stage="fact_retrieval",
+                reason="stale index",
+                occurred_at=datetime(2026, 4, 17, 12, 0, tzinfo=UTC),
+                subject="order_count",
+            ),
+        ],
+        diagnostics=[
+            DiagnosticEvidence(
+                hypothesis="hypothesis",
+                sql="SELECT 1 LIMIT 1",
+                row_count=1,
+                rows=[{"n": 1}],
+                executed_at=datetime(2026, 4, 17, 12, 0, tzinfo=UTC),
+                fact_citations=[
+                    FactCitation(
+                        fact_id="f1",
+                        concept="order",
+                        claim="order placed when status='paid'",
+                        source="code_extraction",
+                        confidence=0.75,
+                        path="backend/orders.py",
+                        lines="10-20",
+                    ),
+                ],
+                code_freshness="stale",
+            ),
+        ],
+    )
+    ins = Insight(
+        title="extended evidence",
+        summary="s",
+        severity="warning",
+        anomaly_signature="sigextended1234",
+        evidence=bundle.to_dict(),
+    )
+    ins.fingerprint = ins.compute_fingerprint()
+    assert await tmp_store.save_insight(ins) is True
+
+    fetched = await tmp_store.get_recent_insights(limit=5)
+    assert len(fetched) == 1
+    restored = EvidenceBundle.from_dict(fetched[0].evidence)
+    assert len(restored.errors) == 1
+    assert restored.errors[0].subject == "order_count"
+    assert restored.diagnostics[0].code_freshness == "stale"
+    assert len(restored.diagnostics[0].fact_citations) == 1
+    cite = restored.diagnostics[0].fact_citations[0]
+    assert cite.concept == "order"
+    assert cite.path == "backend/orders.py"
+
+
+async def test_insight_evidence_roundtrips_legacy_payload(tmp_store) -> None:
+    """Stage 2 backcompat: a pre-Step-4 evidence payload saved by an
+    older version must still deserialize after the column grew new
+    fields. Written through the same storage path — no new fields on
+    the input — then fetched and run through ``EvidenceBundle.from_dict``.
+    """
+    from datetime import UTC, datetime
+
+    legacy_evidence = {
+        "recurrence": {
+            "x": {
+                "count": 2,
+                "first_seen": "2026-04-10T00:00:00+00:00",
+                "last_seen": "2026-04-15T00:00:00+00:00",
+                "common_hours": [8],
+            },
+        },
+        "correlations": [],
+        "diagnostics": [
+            {
+                "hypothesis": "h",
+                "sql": "SELECT 1",
+                "row_count": 0,
+                "rows": [],
+                "explanation": "",
+                "executed_at": "2026-04-16T12:00:00+00:00",
+                "error": None,
+            }
+        ],
+    }
+    ins = Insight(
+        title="legacy evidence",
+        summary="s",
+        severity="info",
+        anomaly_signature="siglegacy0000",
+        evidence=legacy_evidence,
+    )
+    ins.fingerprint = ins.compute_fingerprint()
+    assert await tmp_store.save_insight(ins) is True
+
+    from observibot.core.evidence import EvidenceBundle
+
+    fetched = await tmp_store.get_recent_insights(limit=5)
+    assert len(fetched) == 1
+    restored = EvidenceBundle.from_dict(fetched[0].evidence)
+    # Legacy fields intact.
+    assert restored.recurrence["x"].count == 2
+    # New fields default cleanly.
+    assert restored.errors == []
+    assert restored.diagnostics[0].fact_citations == []
+    assert restored.diagnostics[0].code_freshness is None
+    # And datetime hasn't been fabricated (S0.1).
+    assert restored.diagnostics[0].executed_at == datetime(
+        2026, 4, 16, 12, tzinfo=UTC
+    )
+
+
 async def test_insight_without_signature_falls_back_to_legacy_fingerprint(
     tmp_store,
 ) -> None:

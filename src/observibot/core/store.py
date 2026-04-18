@@ -264,6 +264,23 @@ insight_feedback = Table(
     Column("created_at", String, nullable=False),
 )
 
+# Phase 4.5 Step 4 Stage 5: diagnostic cooldown cache.
+# Replaces the in-memory ``MonitorLoop._diagnostic_cache`` dict. Keyed
+# by ``anomaly_signature`` so consecutive firings of the same bucket
+# share a single row; ``cached_at`` drives the freshness check and
+# retention eviction. ``evidence_json`` holds the serialized
+# ``list[DiagnosticEvidence]`` (via ``DiagnosticEvidence.to_dict``) so
+# restarted processes re-use the cached result without re-querying the
+# app DB.
+diagnostic_cooldown = Table(
+    "diagnostic_cooldown",
+    metadata,
+    Column("anomaly_signature", String, primary_key=True),
+    Column("cached_at", String, nullable=False),
+    Column("evidence_json", Text, nullable=False),
+)
+sa.Index("idx_diag_cooldown_cached", diagnostic_cooldown.c.cached_at)
+
 # Phase 4.5 Step 1: Events envelope
 events_table = Table(
     "events",
@@ -819,6 +836,104 @@ class Store:
             "cost_usd": float(row[2]) if row else 0.0,
             "since": since.isoformat(),
         }
+
+    # ---------- diagnostic cooldown cache ----------
+
+    async def get_diagnostic_cooldown_entry(
+        self,
+        anomaly_signature: str,
+        within_seconds: int,
+    ) -> list[Any] | None:
+        """Return cached diagnostic evidence for ``anomaly_signature``.
+
+        Returns None when no entry exists OR when the cached entry is
+        older than ``within_seconds``. Stage 5 replaces the in-memory
+        ``MonitorLoop._diagnostic_cache`` so restarted processes reuse
+        prior diagnostic results and horizontal workers share cooldown
+        state.
+        """
+        # Local import avoids a cyclic dependency; evidence imports
+        # store at module level only indirectly.
+        from observibot.core.evidence import DiagnosticEvidence
+
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=within_seconds)
+        ).isoformat()
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                sa.select(
+                    diagnostic_cooldown.c.cached_at,
+                    diagnostic_cooldown.c.evidence_json,
+                )
+                .where(
+                    diagnostic_cooldown.c.anomaly_signature
+                    == anomaly_signature
+                )
+                .limit(1)
+            )
+            row = result.fetchone()
+        if row is None:
+            return None
+        cached_at, evidence_json = row[0], row[1]
+        if cached_at < cutoff:
+            return None
+        try:
+            payload = json.loads(evidence_json) if evidence_json else []
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, list):
+            return None
+        return [DiagnosticEvidence.from_dict(e) for e in payload]
+
+    async def set_diagnostic_cooldown_entry(
+        self,
+        anomaly_signature: str,
+        evidence: list[Any],
+    ) -> None:
+        """Upsert a cooldown entry. Overwrites any prior row for the
+        same ``anomaly_signature``.
+
+        ``evidence`` is ``list[DiagnosticEvidence]``; each entry is
+        serialized via its ``to_dict`` method into the stored JSON
+        blob.
+        """
+        now = _utcnow_iso()
+        payload = json.dumps(
+            [e.to_dict() for e in evidence], default=str,
+        )
+        async with self.engine.begin() as conn:
+            stmt = (
+                _dialect_insert(diagnostic_cooldown, self.engine)
+                .values(
+                    anomaly_signature=anomaly_signature,
+                    cached_at=now,
+                    evidence_json=payload,
+                )
+                .on_conflict_do_update(
+                    index_elements=["anomaly_signature"],
+                    set_=dict(cached_at=now, evidence_json=payload),
+                )
+            )
+            await conn.execute(stmt)
+
+    async def evict_diagnostic_cooldown(
+        self,
+        older_than_seconds: int,
+    ) -> int:
+        """Delete cooldown rows older than the cutoff. Returns the
+        number of rows removed. Called inline at the end of each
+        ``_maybe_run_diagnostics`` invocation AND from retention.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+        ).isoformat()
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                diagnostic_cooldown.delete().where(
+                    diagnostic_cooldown.c.cached_at < cutoff
+                )
+            )
+        return int(result.rowcount or 0)
 
     # ---------- monitor runs ----------
 
@@ -1596,7 +1711,24 @@ class Store:
         ]
 
     async def search_semantic_facts(self, query: str, limit: int = 5) -> list[dict]:
-        """Search semantic facts using FTS5 (SQLite) or ILIKE fallback."""
+        """Search semantic facts with rank-signal parity across backends.
+
+        SQLite: FTS5 virtual table with BM25-like ``rank`` ordering. This
+        path is byte-identical to its pre-Stage-3 form.
+
+        Postgres: tsvector + GIN (migration ``b8c9d0e1f2a3``). Uses
+        ``plainto_tsquery('english', ...)`` for query parsing (safe
+        against raw user input — no FTS operator-injection risk) and
+        orders by ``ts_rank_cd`` descending so the downstream
+        source-priority re-ranker in ``CodeKnowledgeService`` sees the
+        same kind of relevance signal it has always seen on SQLite.
+
+        The ``search_tsv`` column is Postgres-generated and not in the
+        Python ORM table definition — queries reference it via
+        ``sa.literal_column`` so the SQLite-side
+        ``metadata.create_all()`` never tries to create a tsvector
+        column on a non-Postgres backend.
+        """
         from observibot.core.code_intelligence.retrieval import build_fts5_query
 
         if "sqlite" in str(self.engine.url):
@@ -1604,7 +1736,8 @@ class Store:
             sql = sa.text(
                 "SELECT s.id, s.fact_type, s.concept, s.claim, "
                 "s.tables_json, s.columns_json, s.sql_condition, "
-                "s.source, s.confidence, s.is_active "
+                "s.source, s.confidence, s.is_active, "
+                "s.evidence_path, s.evidence_lines, s.evidence_commit "
                 "FROM semantic_facts s "
                 "JOIN semantic_facts_fts f ON s.rowid = f.rowid "
                 "WHERE semantic_facts_fts MATCH :query "
@@ -1615,7 +1748,9 @@ class Store:
                 result = await conn.execute(sql, {"query": fts_query, "limit": limit})
                 rows = result.fetchall()
         else:
-            pattern = f"%{query}%"
+            # PostgreSQL tsvector + GIN path (Stage 3 parity).
+            tsq = sa.func.plainto_tsquery("english", query)
+            search_tsv = sa.literal_column("search_tsv")
             stmt = (
                 sa.select(
                     semantic_facts.c.id,
@@ -1628,15 +1763,14 @@ class Store:
                     semantic_facts.c.source,
                     semantic_facts.c.confidence,
                     semantic_facts.c.is_active,
+                    semantic_facts.c.evidence_path,
+                    semantic_facts.c.evidence_lines,
+                    semantic_facts.c.evidence_commit,
+                    sa.func.ts_rank_cd(search_tsv, tsq).label("_rank"),
                 )
+                .where(search_tsv.op("@@")(tsq))
                 .where(semantic_facts.c.is_active == True)  # noqa: E712
-                .where(
-                    sa.or_(
-                        semantic_facts.c.concept.ilike(pattern),
-                        semantic_facts.c.claim.ilike(pattern),
-                    )
-                )
-                .order_by(semantic_facts.c.confidence.desc())
+                .order_by(sa.literal_column("_rank").desc())
                 .limit(limit)
             )
             async with self.engine.begin() as conn:
@@ -1650,6 +1784,8 @@ class Store:
                 "columns": json.loads(r[5]) if r[5] else [],
                 "sql_condition": r[6], "source": r[7],
                 "confidence": r[8], "is_active": r[9],
+                "evidence_path": r[10], "evidence_lines": r[11],
+                "evidence_commit": r[12],
             }
             for r in rows
         ]
@@ -1812,8 +1948,12 @@ class Store:
             )
             if result.rowcount == 0:
                 return None
-            # Refresh FTS row if claim changed on SQLite
-            if claim is not None and "sqlite" in str(self.engine.url):
+            # Always resync the FTS5 row on any touch. The previous
+            # conditional (only on claim change) left stale FTS rows
+            # whenever concept, tables_json, or columns_json moved —
+            # every one of which is an indexed FTS column. Cost is one
+            # INSERT OR REPLACE per update; cheap.
+            if "sqlite" in str(self.engine.url):
                 await conn.execute(sa.text(
                     "INSERT OR REPLACE INTO semantic_facts_fts"
                     "(rowid, concept, claim, tables_json, columns_json) "
@@ -2045,5 +2185,17 @@ class Store:
                 )
             )
             results["observation_events"] = r.rowcount or 0
+
+            # Stage 5: evict stale diagnostic_cooldown rows. Matches the
+            # events retention window — a cooldown entry that's weeks
+            # old is always past its useful life, and letting the table
+            # grow unbounded would defeat the point of having a TTL.
+            r = await conn.execute(
+                diagnostic_cooldown.delete().where(
+                    diagnostic_cooldown.c.cached_at
+                    < (now - timedelta(days=events_days)).isoformat()
+                )
+            )
+            results["diagnostic_cooldown"] = r.rowcount or 0
 
         return results

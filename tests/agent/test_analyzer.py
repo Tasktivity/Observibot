@@ -67,41 +67,52 @@ async def test_analyze_anomalies_fallback_on_soft_error(
 async def test_analyze_anomalies_hard_error_propagates(
     tmp_store, sample_system_model: SystemModel
 ) -> None:
-    """A hard (auth/quota) failure should raise so the circuit breaker can
-    switch to long-backoff mode — but the fallback insight must still be
-    persisted first.
+    """S0.5 — a hard (auth/quota) failure propagates so the monitor's
+    circuit breaker can switch to long-backoff mode. The fallback
+    insight rides along on ``exc.fallback_insights``; persistence is the
+    monitor's responsibility.
     """
     class HardFailingProvider(MockProvider):
         async def _call(self, system_prompt, user_prompt):
             raise LLMHardError("401 unauthorized: bad api key")
 
     analyzer = Analyzer(provider=HardFailingProvider(), store=tmp_store)
-    with pytest.raises(LLMHardError):
+    with pytest.raises(LLMHardError) as exc_info:
         await analyzer.analyze_anomalies(
             anomalies=[_anomaly()],
             system_model=sample_system_model,
         )
+    fallback = getattr(exc_info.value, "fallback_insights", None)
+    assert fallback is not None
+    assert any(i.source == "anomaly" for i in fallback)
+    # The analyzer does NOT persist on the failure path (S0.5).
     stored = await tmp_store.get_recent_insights()
-    assert any(i.source == "anomaly" for i in stored)
+    assert not any(i.source == "anomaly" for i in stored)
 
 
 @pytest.mark.asyncio
-async def test_analyze_anomalies_invalid_schema_uses_fallback(
+async def test_analyze_anomalies_invalid_schema_attaches_fallback_no_persist(
     tmp_store, sample_system_model: SystemModel
 ) -> None:
-    """If the LLM returns JSON that doesn't match our Pydantic schema, we
-    must fall back to a raw alert, persist it, and raise a soft error so
-    the circuit breaker counts it.
+    """S0.5 — validation failure raises LLMSoftError with the fallback
+    attached as ``.fallback_insights``. The analyzer never persists; the
+    monitor enriches+saves+dispatches so the circuit breaker still counts
+    the failure toward its threshold.
     """
+    from unittest.mock import AsyncMock
+
     bad = MockProvider(canned={"insights": [{"severity": "bogus"}]})
-    analyzer = Analyzer(provider=bad, store=tmp_store)
-    with pytest.raises(LLMSoftError):
+    spy_store = AsyncMock(wraps=tmp_store)
+    analyzer = Analyzer(provider=bad, store=spy_store)
+    with pytest.raises(LLMSoftError) as exc_info:
         await analyzer.analyze_anomalies(
             anomalies=[_anomaly()],
             system_model=sample_system_model,
         )
-    stored = await tmp_store.get_recent_insights()
-    assert any(i.source == "anomaly" for i in stored)
+    fallback = getattr(exc_info.value, "fallback_insights", None)
+    assert fallback is not None
+    assert any(i.source == "anomaly" for i in fallback)
+    spy_store.save_insight.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -156,24 +167,30 @@ async def test_analyze_anomalies_returns_unsaved_insights(
 
 
 @pytest.mark.asyncio
-async def test_analyze_anomalies_hard_failure_still_persists_fallback(
+async def test_analyze_anomalies_hard_failure_attaches_fallback_does_not_persist(
     tmp_store, sample_system_model: SystemModel
 ) -> None:
-    """Hard failure: fallback insight must be persisted before re-raising,
-    because the caller's except block doesn't run the enrichment path."""
+    """S0.5 — the analyzer never persists. On hard failure, it attaches
+    the fallback to the exception and re-raises; the monitor is the
+    single persistence+enrichment+dispatch site.
+    """
+    from unittest.mock import AsyncMock
 
     class HardFailingProvider(MockProvider):
         async def _call(self, system_prompt, user_prompt):
             raise LLMHardError("401 unauthorized")
 
-    analyzer = Analyzer(provider=HardFailingProvider(), store=tmp_store)
-    with pytest.raises(LLMHardError):
+    spy_store = AsyncMock(wraps=tmp_store)
+    analyzer = Analyzer(provider=HardFailingProvider(), store=spy_store)
+    with pytest.raises(LLMHardError) as exc_info:
         await analyzer.analyze_anomalies(
             anomalies=[_anomaly()],
             system_model=sample_system_model,
         )
-    stored = await tmp_store.get_recent_insights()
-    assert any(i.source == "anomaly" for i in stored)
+    fallback = getattr(exc_info.value, "fallback_insights", None)
+    assert fallback is not None
+    assert any(i.source == "anomaly" for i in fallback)
+    spy_store.save_insight.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -285,6 +302,126 @@ def test_summarize_evidence_renders_recurrence_entries() -> None:
     assert "payouts: seen 12 times" in out
     assert "hours [9, 10]" in out
     assert "last seen 2026-04-15" in out
+
+
+def test_summarize_evidence_renders_citations() -> None:
+    """Stage 2: fact citations render in the evidence block with
+    concept + truncated claim. Path/lines/commit are NOT in the prompt
+    text — those go to the UI only so the LLM can't quote a stale
+    code reference.
+    """
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import (
+        DiagnosticEvidence,
+        EvidenceBundle,
+        FactCitation,
+    )
+
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    diag = DiagnosticEvidence(
+        hypothesis="admissions dropped after deploy",
+        sql="SELECT 1 LIMIT 10",
+        row_count=0,
+        executed_at=_dt(2026, 4, 17, 12, 0, tzinfo=_UTC),
+        fact_citations=[
+            FactCitation(
+                fact_id="c1",
+                concept="encounter_type",
+                claim="distinguishes inpatient vs outpatient admissions",
+                source="code_extraction",
+                confidence=0.8,
+                path="src/ehr/encounter.py",
+                lines="42-55",
+                commit="deadbeef",
+            ),
+        ],
+    )
+    bundle = EvidenceBundle(diagnostics=[diag])
+    out = summarize_evidence(bundle)
+    assert "code context cited" in out
+    assert "encounter_type" in out
+    assert "distinguishes inpatient" in out
+    # Path/lines/commit must NOT appear in the LLM-facing text.
+    assert "src/ehr/encounter.py" not in out
+    assert "42-55" not in out
+    assert "deadbeef" not in out
+
+
+def test_summarize_evidence_renders_freshness_when_not_current() -> None:
+    """Stage 2: non-current code freshness is rendered as a tag on the
+    diagnostic; ``current`` is silent."""
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import DiagnosticEvidence, EvidenceBundle
+
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    stale = DiagnosticEvidence(
+        hypothesis="h",
+        sql="SELECT 1",
+        row_count=0,
+        executed_at=_dt(2026, 4, 17, 12, 0, tzinfo=_UTC),
+        code_freshness="stale",
+    )
+    current = DiagnosticEvidence(
+        hypothesis="h2",
+        sql="SELECT 1",
+        row_count=0,
+        executed_at=_dt(2026, 4, 17, 12, 0, tzinfo=_UTC),
+        code_freshness="current",
+    )
+    out_stale = summarize_evidence(EvidenceBundle(diagnostics=[stale]))
+    assert "code context: stale" in out_stale
+
+    out_current = summarize_evidence(EvidenceBundle(diagnostics=[current]))
+    assert "code context:" not in out_current
+
+
+def test_summarize_evidence_renders_errors_section_when_non_empty() -> None:
+    """Stage 2: degraded-state entries render as a Degraded signals
+    section so the LLM can see Observibot's uncertainty."""
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import EvidenceBundle, EvidenceError
+
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    bundle = EvidenceBundle(
+        errors=[
+            EvidenceError(
+                stage="fact_retrieval",
+                reason="index unavailable",
+                occurred_at=_dt(2026, 4, 17, 12, 0, tzinfo=_UTC),
+                subject="encounter_count",
+            ),
+            EvidenceError(
+                stage="correlation",
+                reason="circuit breaker open",
+                occurred_at=_dt(2026, 4, 17, 12, 1, tzinfo=_UTC),
+            ),
+        ],
+    )
+    out = summarize_evidence(bundle)
+    assert "Degraded signals:" in out
+    assert "fact_retrieval" in out
+    assert "index unavailable" in out
+    assert "[encounter_count]" in out
+    assert "correlation" in out
+    assert "circuit breaker open" in out
+
+
+def test_summarize_evidence_silent_when_clean() -> None:
+    """Stage 2: with clean recurrence/no citations/current freshness/
+    no errors, the Degraded signals section must NOT render at all."""
+    from observibot.agent.analyzer import summarize_evidence
+    from observibot.core.evidence import EvidenceBundle
+
+    out = summarize_evidence(EvidenceBundle())
+    assert "Degraded signals:" not in out
+    assert "code context:" not in out
+    assert "code context cited" not in out
 
 
 def test_summarize_evidence_renders_correlations() -> None:

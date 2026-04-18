@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -95,6 +97,75 @@ def log_prompt_size(
 _TIME_COLUMN_SUFFIXES = (
     "_at", "_date", "_time", "_ts", "day", "hour", "bucket", "month",
 )
+
+
+# Stage 8: unicode control-category codes that never belong in a
+# prompt. ``Cc``=control, ``Cf``=format, ``Cs``=surrogate, ``Co``=
+# private-use, ``Cn``=unassigned. ``\n`` and ``\t`` are Cc but
+# deliberately allowed (preserves readable multi-line commit
+# messages) — handled by the explicit carve-out below.
+_UNICODE_CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
+# Collapse runs of inline whitespace to a single space but keep
+# newlines intact. ``[^\\S\\n]+`` matches non-newline whitespace.
+_INLINE_WHITESPACE_RE = re.compile(r"[^\S\n]+")
+
+
+def sanitize_untrusted_text(
+    text: str | None,
+    max_length: int = 500,
+) -> str:
+    """Strip control characters and cap length on text from external sources.
+
+    Used for change-event summaries / details (GitHub commit messages,
+    Railway deploy notes, etc.) before they enter any LLM prompt.
+    Sanitization is about *shape* (encoding, length) — not semantics.
+    The LLM-level guardrail in the hypothesis prompt is what tells the
+    model to treat change text as data rather than instruction.
+
+    Rules:
+
+    - ``None`` input returns ``""``.
+    - ASCII control characters except ``\\n`` (newline) and ``\\t``
+      (tab) are removed — carriage returns, bells, form feeds, etc.
+    - Unicode characters in the Cc/Cf/Cs/Co/Cn categories are removed
+      (bidi overrides, zero-width joiners, private-use codepoints).
+    - Runs of inline whitespace collapse to a single space; newlines
+      are preserved so paragraph structure survives.
+    - Truncates to ``max_length`` with a trailing ``"..."`` when the
+      limit is exceeded. The ellipsis counts against the budget so
+      the returned string is never longer than ``max_length``.
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    for ch in str(text):
+        if ch in ("\n", "\t"):
+            out.append(ch)
+            continue
+        # Strip ASCII control chars outside \n/\t.
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            continue
+        # Strip Unicode control-category codepoints.
+        if unicodedata.category(ch) in _UNICODE_CONTROL_CATEGORIES:
+            continue
+        out.append(ch)
+    cleaned = "".join(out)
+    cleaned = _INLINE_WHITESPACE_RE.sub(" ", cleaned)
+    cleaned = cleaned.strip()
+    if max_length <= 0:
+        return ""
+    # Hotfix item 4: below 3 the ellipsis itself breaks the length
+    # contract ("..." is 3 chars). Prefer a straight slice so the
+    # return value is never longer than ``max_length``. Production
+    # callers use 200+; this edge case exists so the contract holds
+    # end-to-end rather than "almost always."
+    if max_length < 3:
+        return cleaned[:max_length]
+    if len(cleaned) > max_length:
+        cut = max(0, max_length - 3)
+        cleaned = cleaned[:cut] + "..."
+    return cleaned
 
 
 def sample_rows(rows: list[dict], max_rows: int = 50) -> tuple[list[dict], str]:

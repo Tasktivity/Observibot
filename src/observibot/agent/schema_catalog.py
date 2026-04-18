@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 from observibot.core.models import SystemModel, TableInfo
-
-SENSITIVE_COLUMN_PATTERNS = {
-    "api_key", "api_token", "secret", "password", "hash",
-    "token", "credential", "private_key", "embedding",
-    "openai_api_key", "service_role_key",
-}
+from observibot.core.redaction import (
+    SENSITIVE_COLUMN_PATTERNS,
+    is_sensitive_column,
+)
 
 # Kept in sync with schema_analyzer._SOFT_DELETE_COLUMN_NAMES so both the
 # planning prompt and the retrieval-time semantic facts flag the same set.
@@ -17,9 +15,25 @@ _SOFT_DELETE_COLUMN_NAMES = frozenset({
 })
 
 
+# Backward-compat alias. The canonical name is
+# :func:`observibot.core.redaction.is_sensitive_column`. Callers that
+# imported the leading-underscore name from this module continue to
+# work; new callers should import from ``core.redaction`` directly.
 def _is_sensitive_column(col_name: str) -> bool:
-    name_lower = col_name.lower()
-    return any(pat in name_lower for pat in SENSITIVE_COLUMN_PATTERNS)
+    return is_sensitive_column(col_name)
+
+
+__all__ = [
+    "SENSITIVE_COLUMN_PATTERNS",
+    "_is_sensitive_column",
+    "_SOFT_DELETE_COLUMN_NAMES",
+    "build_app_schema_description",
+    "build_observability_schema_description",
+    "get_app_table_names",
+    "get_monitoring_view_names",
+    "is_sensitive_column",
+    "retrieve_relevant_tables",
+]
 
 
 def _col_desc(c: dict) -> str:
@@ -151,6 +165,40 @@ def get_app_table_names(model: SystemModel | None) -> set[str]:
     if model is None:
         return set()
     return {t.name for t in model.tables}
+
+
+# S0.4: read-only PostgreSQL monitoring views that the diagnostic
+# prompt recommends. These ship with every Postgres 12+ deployment
+# Observibot supports, are bounded in row count, and are authorized by
+# the ``pg_monitor`` role that the reader credential already has. Listed
+# here so the sandbox allowlist and the prompt's recommended targets
+# stay in lockstep.
+#
+# pg_stat_statements is included but only useful when the extension is
+# loaded; a query referencing it will fail at execution time on
+# deployments that don't have it, which surfaces as a benign
+# DiagnosticEvidence.error rather than a silent drop.
+_MONITORING_VIEW_NAMES: frozenset[str] = frozenset({
+    "pg_stat_database",
+    "pg_stat_activity",
+    "pg_stat_user_tables",
+    "pg_stat_user_indexes",
+    "pg_stat_bgwriter",
+    "pg_locks",
+    "pg_stat_statements",
+})
+
+
+def get_monitoring_view_names() -> frozenset[str]:
+    """Return the fixed set of read-only Postgres monitoring views
+    permitted in the autonomous diagnostic allowlist.
+
+    This is platform-wide, not per-customer: the set is the same on
+    every deployment because every Postgres exposes the same
+    ``pg_stat_*`` views under ``pg_catalog``. Scale-invariant by
+    construction.
+    """
+    return _MONITORING_VIEW_NAMES
 
 
 def retrieve_relevant_tables(

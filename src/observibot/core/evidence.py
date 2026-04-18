@@ -23,12 +23,20 @@ from typing import Any
 
 
 def _parse_iso(value: Any) -> datetime:
+    """Parse an ISO-8601 timestamp into a timezone-aware UTC datetime.
+
+    Raises ``ValueError`` on ``None`` input. Silent timestamp fabrication
+    (returning ``datetime.now(UTC)`` for missing fields) is a trap that
+    made a persisted evidence record indistinguishable from a freshly-
+    executed one. Callers must pass a real timestamp or explicitly
+    handle the malformed case via :meth:`DiagnosticEvidence.from_dict`.
+    """
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
     if value is None:
-        return datetime.now(UTC)
+        raise ValueError("timestamp is required")
     dt = datetime.fromisoformat(str(value))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
@@ -110,6 +118,98 @@ class CorrelationEvidence:
 
 
 @dataclass
+class EvidenceError:
+    """A degraded-state note attached to the bundle.
+
+    Phase 4.5 Step 4 adds several enrichment stages (correlation
+    detection, fact retrieval, diagnostic SQL, freshness lookup) that
+    can each fail independently. Instead of masking failures by
+    dropping the affected section silently, the monitor appends an
+    :class:`EvidenceError` to the bundle so the operator can always
+    answer "what did Observibot try, and what failed?" — the insight
+    card renders a visible strip per entry. See O3 in
+    ``PROMPTS/STEP4_SEMANTIC_GROUNDING.md``.
+    """
+
+    stage: str
+    reason: str
+    occurred_at: datetime
+    subject: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "reason": self.reason,
+            "occurred_at": self.occurred_at.isoformat(),
+            "subject": self.subject,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EvidenceError:
+        raw_ts = data.get("occurred_at")
+        try:
+            occurred_at = _parse_iso(raw_ts)
+        except (ValueError, TypeError):
+            occurred_at = datetime.now(UTC)
+        return cls(
+            stage=str(data.get("stage", "")),
+            reason=str(data.get("reason", "")),
+            occurred_at=occurred_at,
+            subject=data.get("subject"),
+        )
+
+
+@dataclass
+class FactCitation:
+    """A semantic fact that informed a diagnostic hypothesis.
+
+    Stored on :class:`DiagnosticEvidence` so the operator can navigate
+    from an insight back to the code that shaped its reasoning.
+    ``path``/``lines``/``commit`` are rendered by the UI; the LLM is
+    forbidden from quoting them in its narrative text (they may be
+    stale — see the prompt's anti-hallucination guardrail).
+    """
+
+    fact_id: str
+    concept: str
+    claim: str
+    source: str
+    confidence: float
+    path: str | None = None
+    lines: str | None = None
+    commit: str | None = None
+    # Reserved for Phase 4.5 Step 7 multi-repo support; ``None`` today.
+    repo: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "concept": self.concept,
+            "claim": self.claim,
+            "source": self.source,
+            "confidence": float(self.confidence),
+            "path": self.path,
+            "lines": self.lines,
+            "commit": self.commit,
+            "repo": self.repo,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FactCitation:
+        return cls(
+            fact_id=str(data.get("fact_id", "")),
+            concept=str(data.get("concept", "")),
+            claim=str(data.get("claim", "")),
+            source=str(data.get("source", "")),
+            confidence=float(data.get("confidence", 0.0)),
+            path=data.get("path"),
+            lines=data.get("lines"),
+            commit=data.get("commit"),
+            repo=data.get("repo"),
+        )
+
+
+@dataclass
 class DiagnosticEvidence:
     """Reserved for Step 3.4. Structured result of a sandboxed SQL
     diagnostic query run against the application database.
@@ -131,6 +231,15 @@ class DiagnosticEvidence:
     explanation: str = ""
     executed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None
+    # Stage 2: fact citations that informed this hypothesis. Populated
+    # by Stage 6 (semantic facts into diagnostic hypothesis). Legacy
+    # records without this field deserialize with an empty list.
+    fact_citations: list[FactCitation] = field(default_factory=list)
+    # Stage 2: freshness state for the code-intelligence context this
+    # diagnostic was grounded in. One of
+    # ``"current" | "stale" | "unavailable" | "error"``. ``None`` in
+    # legacy records or when the analyzer ran without a code service.
+    code_freshness: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,18 +250,33 @@ class DiagnosticEvidence:
             "explanation": self.explanation,
             "executed_at": self.executed_at.isoformat(),
             "error": self.error,
+            "fact_citations": [c.to_dict() for c in self.fact_citations],
+            "code_freshness": self.code_freshness,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DiagnosticEvidence:
+        raw_ts = data.get("executed_at")
+        error = data.get("error")
+        try:
+            executed_at = _parse_iso(raw_ts)
+        except (ValueError, TypeError):
+            executed_at = datetime.now(UTC)
+            malformed_note = "malformed evidence record: missing executed_at"
+            error = f"{error}; {malformed_note}" if error else malformed_note
         return cls(
             hypothesis=data.get("hypothesis", ""),
             sql=data.get("sql", ""),
             row_count=int(data.get("row_count", 0)),
             rows=[dict(r) for r in data.get("rows") or []],
             explanation=data.get("explanation", "") or "",
-            executed_at=_parse_iso(data.get("executed_at")),
-            error=data.get("error"),
+            executed_at=executed_at,
+            error=error,
+            fact_citations=[
+                FactCitation.from_dict(c)
+                for c in (data.get("fact_citations") or [])
+            ],
+            code_freshness=data.get("code_freshness"),
         )
 
 
@@ -168,9 +292,20 @@ class EvidenceBundle:
     recurrence: dict[str, RecurrenceEvidence] = field(default_factory=dict)
     correlations: list[CorrelationEvidence] = field(default_factory=list)
     diagnostics: list[DiagnosticEvidence] = field(default_factory=list)
+    # Stage 2: degraded-state notes. When an enrichment stage fails
+    # (fact retrieval unavailable, correlation pass errored, freshness
+    # lookup raised), the monitor appends an :class:`EvidenceError`
+    # here. The insight card renders them as a visible warning strip
+    # so failures are fail-visible, not fail-silent.
+    errors: list[EvidenceError] = field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.recurrence or self.correlations or self.diagnostics)
+        return not (
+            self.recurrence
+            or self.correlations
+            or self.diagnostics
+            or self.errors
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +314,7 @@ class EvidenceBundle:
             },
             "correlations": [c.to_dict() for c in self.correlations],
             "diagnostics": [d.to_dict() for d in self.diagnostics],
+            "errors": [e.to_dict() for e in self.errors],
         }
 
     @classmethod
@@ -201,6 +337,10 @@ class EvidenceBundle:
             diagnostics=[
                 DiagnosticEvidence.from_dict(d)
                 for d in data.get("diagnostics") or []
+            ],
+            errors=[
+                EvidenceError.from_dict(e)
+                for e in data.get("errors") or []
             ],
         )
 

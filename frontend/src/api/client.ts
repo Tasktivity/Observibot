@@ -42,6 +42,18 @@ export interface RecurrenceContext {
   common_hours: number[];
 }
 
+export interface FactCitation {
+  fact_id: string;
+  concept: string;
+  claim: string;
+  source: string;
+  confidence: number;
+  path?: string | null;
+  lines?: string | null;
+  commit?: string | null;
+  repo?: string | null;
+}
+
 export interface DiagnosticEvidence {
   hypothesis: string;
   sql: string;
@@ -50,6 +62,8 @@ export interface DiagnosticEvidence {
   explanation: string;
   executed_at: string;
   error: string | null;
+  fact_citations?: FactCitation[];
+  code_freshness?: 'current' | 'stale' | 'unavailable' | 'error' | null;
 }
 
 export interface CorrelationEvidence {
@@ -61,10 +75,18 @@ export interface CorrelationEvidence {
   severity_score: number;
 }
 
+export interface EvidenceError {
+  stage: string;
+  reason: string;
+  occurred_at: string;
+  subject?: string | null;
+}
+
 export interface EvidenceBundle {
   recurrence?: Record<string, RecurrenceContext & { metric_name?: string }>;
   correlations?: CorrelationEvidence[];
   diagnostics?: DiagnosticEvidence[];
+  errors?: EvidenceError[];
 }
 
 export interface DiagnosticActivity {

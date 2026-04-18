@@ -31,6 +31,13 @@ class LLMConfig:
     max_tokens_per_cycle: int = 4000
     temperature: float = 0.2
     daily_token_budget: int = 200_000
+    # Stage 4: hard gate on daily_token_budget. When True (the
+    # production default) LLMProvider.analyze queries cumulative
+    # llm_usage for the current UTC day and raises LLMHardError if
+    # the upcoming call would push past the budget. Set False in
+    # test fixtures that don't want to thread usage-write through
+    # every construction path.
+    daily_token_budget_enabled: bool = True
 
 
 @dataclass
@@ -179,6 +186,21 @@ class DiagnosticsConfig:
     # are in seconds; Tier 0 scale-invariant (time, not rows/tables).
     hypothesis_timeout_s: float = 10.0
     execution_timeout_s: float = 10.0
+    # Stage 7 — CorrelationDetector deterministic wiring. Time-based:
+    # how long after a change event an anomaly can still be plausibly
+    # attributed to it. 30 min is a conservative default for platform
+    # deploys; operators can widen or narrow per deployment without
+    # changing any scale-sensitive math.
+    correlation_proximity_minutes: float = 30.0
+    # Prompt-budget cap: the diagnostic hypothesis prompt sees at most
+    # this many correlations as ``recent_changes``. 5 is generous —
+    # most anomalies have zero or one deploy in the window. Caps what
+    # the LLM ever sees, not what we collect.
+    correlation_top_n_for_hypothesis: int = 5
+    # Prompt-budget cap for what renders on the insight card. 10
+    # accommodates bundle insights that span multiple metrics, each
+    # with its own correlation.
+    correlation_top_n_for_evidence: int = 10
 
 
 @dataclass
@@ -354,6 +376,9 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
         max_tokens_per_cycle=int(llm_raw.get("max_tokens_per_cycle", 4000)),
         temperature=float(llm_raw.get("temperature", 0.2)),
         daily_token_budget=int(llm_raw.get("daily_token_budget", 200_000)),
+        daily_token_budget_enabled=bool(
+            llm_raw.get("daily_token_budget_enabled", True)
+        ),
     )
 
     connectors: list[ConnectorConfig] = []
@@ -399,6 +424,15 @@ def _build_config(data: dict[str, Any]) -> ObservibotConfig:
             diag_raw.get("hypothesis_timeout_s", 10.0)
         ),
         execution_timeout_s=float(diag_raw.get("execution_timeout_s", 10.0)),
+        correlation_proximity_minutes=float(
+            diag_raw.get("correlation_proximity_minutes", 30.0)
+        ),
+        correlation_top_n_for_hypothesis=int(
+            diag_raw.get("correlation_top_n_for_hypothesis", 5)
+        ),
+        correlation_top_n_for_evidence=int(
+            diag_raw.get("correlation_top_n_for_evidence", 10)
+        ),
     )
     monitor = MonitorConfig(
         collection_interval_seconds=int(mon_raw.get("collection_interval_seconds", 300)),

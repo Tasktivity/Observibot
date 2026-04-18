@@ -364,7 +364,10 @@ def onboard(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
                     max_tokens_per_cycle=cfg.llm.max_tokens_per_cycle,
                     temperature=cfg.llm.temperature,
                     daily_token_budget=cfg.llm.daily_token_budget,
+                    daily_token_budget_enabled=cfg.llm.daily_token_budget_enabled,
                 )
+                # Stage 4: wire the store for daily-token-budget accounting.
+                provider.attach_store(store)
             except LLMError as exc:
                 console.print(f"[red]LLM provider error:[/red] {exc}")
                 return
@@ -414,7 +417,10 @@ def run(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
                     max_tokens_per_cycle=cfg.llm.max_tokens_per_cycle,
                     temperature=cfg.llm.temperature,
                     daily_token_budget=cfg.llm.daily_token_budget,
+                    daily_token_budget_enabled=cfg.llm.daily_token_budget_enabled,
                 )
+                # Stage 4: wire the store for daily-token-budget accounting.
+                provider.attach_store(store)
             except LLMError as exc:
                 console.print(f"[red]LLM provider error:[/red] {exc}")
                 return
@@ -610,7 +616,10 @@ def ask(
                     max_tokens_per_cycle=cfg.llm.max_tokens_per_cycle,
                     temperature=cfg.llm.temperature,
                     daily_token_budget=cfg.llm.daily_token_budget,
+                    daily_token_budget_enabled=cfg.llm.daily_token_budget_enabled,
                 )
+                # Stage 4: wire the store for daily-token-budget accounting.
+                provider.attach_store(store)
             except LLMError as exc:
                 console.print(f"[red]LLM provider error:[/red] {exc}")
                 return
@@ -699,7 +708,10 @@ def analyze(config: Path | None = typer.Option(None, "--config", "-c")) -> None:
                     max_tokens_per_cycle=cfg.llm.max_tokens_per_cycle,
                     temperature=cfg.llm.temperature,
                     daily_token_budget=cfg.llm.daily_token_budget,
+                    daily_token_budget_enabled=cfg.llm.daily_token_budget_enabled,
                 )
+                # Stage 4: wire the store for daily-token-budget accounting.
+                provider.attach_store(store)
             except LLMError as exc:
                 console.print(f"[red]LLM provider error:[/red] {exc}")
                 raise typer.Exit(code=2) from exc

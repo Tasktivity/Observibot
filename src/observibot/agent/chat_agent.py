@@ -28,7 +28,6 @@ from observibot.agent.prompt_utils import (
     sample_rows as _sample_rows,
 )
 from observibot.agent.schema_catalog import (
-    _is_sensitive_column,
     build_app_schema_description,
     build_observability_schema_description,
     get_app_table_names,
@@ -36,6 +35,7 @@ from observibot.agent.schema_catalog import (
 from observibot.core.app_db import AppDatabasePool
 from observibot.core.code_intelligence.service import CodeKnowledgeService
 from observibot.core.models import SystemModel
+from observibot.core.redaction import is_sensitive_column as _is_sensitive_column
 from observibot.core.sql_sandbox import (
     DEFAULT_EXPLAIN_COST_THRESHOLD,
     QueryValidationError,

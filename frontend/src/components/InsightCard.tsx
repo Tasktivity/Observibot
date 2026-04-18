@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import type { Insight } from '../api/client';
+import type { EvidenceError, Insight } from '../api/client';
 import { api } from '../api/client';
 import { formatTimestamp } from '../utils/format';
+import { CorrelationEvidencePanel } from './CorrelationEvidencePanel';
 import { DiagnosticEvidencePanel } from './DiagnosticEvidencePanel';
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -23,6 +24,42 @@ const BADGE_COLORS: Record<string, string> = {
 function formatLocalHour(utcHour: number): string {
   const d = new Date(Date.UTC(1970, 0, 1, utcHour, 0, 0));
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function EvidenceErrorsStrip({ errors }: { errors: EvidenceError[] }) {
+  const [expanded, setExpanded] = useState(errors.length <= 2);
+  const shown = expanded ? errors : errors.slice(0, 1);
+  return (
+    <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-200">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium">
+          Observibot ran into issues while gathering evidence:
+        </span>
+        {errors.length > 1 && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="text-[10px] text-amber-300 hover:text-amber-100"
+          >
+            {expanded ? 'hide' : `show ${errors.length - 1} more`}
+          </button>
+        )}
+      </div>
+      <ul className="mt-1 list-disc pl-4 space-y-0.5">
+        {shown.map((err, i) => (
+          <li key={i}>
+            <span className="font-mono text-[10px] text-amber-300">
+              {err.stage}
+            </span>
+            {err.subject ? (
+              <span className="text-amber-400"> [{err.subject}]</span>
+            ) : null}
+            : <span className="text-amber-100">{err.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 const FEEDBACK_OPTIONS = [
@@ -83,6 +120,12 @@ export function InsightCard({
         </div>
       </div>
       <p className="text-sm text-slate-300">{insight.summary}</p>
+      {/* Stage 9: degraded-evidence warning strip. Renders when any
+          enrichment stage (fact retrieval, correlation, freshness,
+          diagnostic) failed this cycle. Fail-visible, not fail-silent. */}
+      {insight.evidence?.errors && insight.evidence.errors.length > 0 && (
+        <EvidenceErrorsStrip errors={insight.evidence.errors} />
+      )}
       {/* Recurrence annotation */}
       {insight.recurrence_context && insight.recurrence_context.count > 1 && (
         <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
@@ -95,6 +138,11 @@ export function InsightCard({
           </span>
         </div>
       )}
+      {/* Stage 7 / 9: correlated change events deemed temporally near
+          the anomaly. Panel hides itself when no correlations. */}
+      <CorrelationEvidencePanel
+        correlations={insight.evidence?.correlations}
+      />
       {/* Diagnostic evidence — queries the agent ran to back this insight */}
       {insight.evidence?.diagnostics && insight.evidence.diagnostics.length > 0 && (
         <DiagnosticEvidencePanel diagnostics={insight.evidence.diagnostics} />

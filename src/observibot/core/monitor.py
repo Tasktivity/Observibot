@@ -13,11 +13,13 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from observibot.agent.analyzer import Analyzer
-from observibot.agent.llm_provider import LLMHardError
+from observibot.agent.analyzer import Analyzer, CorrelationDetector
+from observibot.agent.llm_provider import LLMHardError, LLMSoftError
+from observibot.agent.prompt_utils import sanitize_untrusted_text
 from observibot.alerting.base import AlertManager
 from observibot.connectors.base import BaseConnector, Capability
 from observibot.core.anomaly import (
@@ -26,9 +28,14 @@ from observibot.core.anomaly import (
     compute_anomaly_signature,
 )
 from observibot.core.code_intelligence.schema_analyzer import analyze_schema_for_facts
+from observibot.core.code_intelligence.service import CodeKnowledgeService
 from observibot.core.config import ObservibotConfig
 from observibot.core.discovery import DiscoveryEngine, diff_models
-from observibot.core.evidence import DiagnosticEvidence, EvidenceBundle
+from observibot.core.evidence import (
+    CorrelationEvidence,
+    EvidenceBundle,
+    EvidenceError,
+)
 from observibot.core.models import Insight, SystemModel
 from observibot.core.seasonal import compute_seasonal_updates, hour_of_week
 from observibot.core.store import Store
@@ -172,6 +179,11 @@ class MonitorLoop:
         self.alert_manager = alert_manager
         self.discovery_engine = DiscoveryEngine(connectors)
         self.detector = build_detector_from_config(config.monitor)
+        # Stage 6: one CodeKnowledgeService per MonitorLoop, sharing the
+        # same store reference. Constructed inline (not injected) —
+        # mirrors the existing `Analyzer(provider, store)` pattern and
+        # keeps the service lifetime bounded by the loop's.
+        self.code_service = CodeKnowledgeService(store)
         self.scheduler: AsyncIOScheduler | None = None
         self.circuit_breaker = CircuitBreaker()
         self._stop_event = asyncio.Event()
@@ -186,14 +198,12 @@ class MonitorLoop:
         self._health_port = health_port
         self._health_task: asyncio.Task[None] | None = None
         self._app_db: object | None = None
-        # Diagnostic hypothesis-test cooldown cache. Key = anomaly
-        # signature (stable fingerprint of metric+labels+direction per
-        # Step 3.2); value = (cached_at, evidence_list). Prevents a
-        # sustained incident from firing the LLM + sandbox on every
-        # analysis cycle.
-        self._diagnostic_cache: dict[
-            str, tuple[datetime, list[DiagnosticEvidence]]
-        ] = {}
+        # Stage 5: diagnostic hypothesis-test cooldown cache is now
+        # persisted via :meth:`Store.get_diagnostic_cooldown_entry` /
+        # ``set_diagnostic_cooldown_entry`` / ``evict_diagnostic_cooldown``.
+        # The prior in-memory dict didn't survive process restart and
+        # didn't share across horizontal workers; the store-backed
+        # table fixes both (O9 restart survival).
 
     # ---------- event emission ----------
 
@@ -420,10 +430,14 @@ class MonitorLoop:
             except Exception as exc:
                 log.exception("Collection cycle failed: %s", exc)
 
-    async def _safe_analyze(self) -> list[Insight]:
+    async def _safe_analyze(
+        self, parent_run_id: str | None = None,
+    ) -> list[Insight]:
         async with self._analysis_lock:
             try:
-                return await self.run_analysis_cycle()
+                return await self.run_analysis_cycle(
+                    parent_run_id=parent_run_id,
+                )
             except Exception as exc:
                 log.exception("Analysis cycle failed: %s", exc)
                 return []
@@ -763,7 +777,9 @@ class MonitorLoop:
                     )
                 self._pending_anomalies.extend(anomalies)
                 llm_used = True  # Analysis attempted (input), not output
-                analysis_results = await self._safe_analyze()
+                analysis_results = await self._safe_analyze(
+                    parent_run_id=run_id,
+                )
                 insight_count = len(analysis_results)
 
             log.info(
@@ -810,7 +826,9 @@ class MonitorLoop:
                 log.debug("Failed to record monitor run failure: %s", store_exc)
             raise
 
-    async def run_analysis_cycle(self) -> list[Insight]:
+    async def run_analysis_cycle(
+        self, parent_run_id: str | None = None,
+    ) -> list[Insight]:
         if self.circuit_breaker.is_open():
             log.info("Circuit breaker open; skipping analysis")
             return []
@@ -818,6 +836,38 @@ class MonitorLoop:
         self._pending_anomalies = []
         if not anomalies:
             return []
+        # Hotfix item 2: events emitted below reference
+        # ``ref_table="monitor_runs"``. When the collection cycle
+        # drove us, its run_id already has a ``monitor_runs`` row; we
+        # reuse it so (ref_table, ref_id) is a real join. When
+        # ``trigger_analysis`` called us directly (no parent), there's
+        # no such row yet — create one here so the referential-integrity
+        # claim isn't a phantom.
+        if parent_run_id is None:
+            run_id = uuid.uuid4().hex[:12]
+            try:
+                await self.store.create_monitor_run(
+                    run_id, datetime.now(UTC),
+                )
+            except Exception as exc:
+                log.debug(
+                    "Failed to create monitor_runs row for "
+                    "standalone analysis cycle: %s", exc,
+                )
+        else:
+            run_id = parent_run_id
+        # S0.6: snapshot the cached model at the top of the analysis
+        # cycle so a concurrent discovery cycle cannot mutate
+        # ``self._cached_model`` mid-flight. The snapshot is a
+        # reference copy (cheap); structural. Downstream analyzer,
+        # diagnostic, and fact-retrieval calls all consume this
+        # snapshot — not ``self._cached_model`` — ensuring every
+        # schema lookup in this cycle resolves against the same view.
+        # Tradeoff: fact retrieval (Stage 6) operates against FTS5,
+        # which doesn't natively support an ``updated_at <= cutoff``
+        # filter cleanly; we accept that facts inserted mid-cycle may
+        # appear, but schema references resolve against the snapshot.
+        snapshotted_model = self._cached_model
         recent_changes = await self.store.get_recent_change_events(
             since=datetime.now(UTC) - timedelta(hours=2)
         )
@@ -841,15 +891,73 @@ class MonitorLoop:
         # carries recurrence only; Step 3.4 populates diagnostics via the
         # hypothesis-test loop below.
         pending_bundle = EvidenceBundle.from_recurrence_map(recurrence_map)
-        # TODO(future-step): invoke CorrelationDetector here and extend
-        # pending_bundle.correlations before the analyzer call.
 
-        await self._maybe_run_diagnostics(anomalies, pending_bundle)
+        # Stage 7: deterministic correlation pass. No LLM call per
+        # correlation (escalation_threshold=1e9 disables that path
+        # inside ``CorrelationDetector.analyze_correlation``, which we
+        # never invoke in Step 4 anyway). The main analyzer LLM call
+        # sees the correlations via the evidence bundle and decides
+        # what to do with them.
+        diag_cfg = self.config.monitor.diagnostics
+        correlator = CorrelationDetector(
+            provider=self.analyzer.provider,
+            store=self.store,
+            proximity_window_minutes=diag_cfg.correlation_proximity_minutes,
+            escalation_threshold=1e9,
+        )
+        correlations = correlator.top_correlations(
+            anomalies=anomalies,
+            recent_changes=recent_changes,
+            max=diag_cfg.correlation_top_n_for_evidence,
+        )
+        pending_bundle.correlations = [
+            CorrelationEvidence(
+                metric_name=c.anomaly.metric_name,
+                change_event_id=c.change_event.id,
+                change_type=c.change_event.event_type,
+                change_summary=sanitize_untrusted_text(
+                    c.change_event.summary, 200,
+                ),
+                time_delta_seconds=c.time_delta_seconds,
+                severity_score=c.severity_score,
+            )
+            for c in correlations
+        ]
+        # Emit even when the detector found zero correlations — the
+        # operator needs "Observibot checked and found nothing"
+        # distinct from "Observibot didn't check at all."
+        # Hotfix item 2: ref_id must name a real monitor_runs row;
+        # reuse the parent run_id rather than minting a fresh UUID
+        # that never existed in the table.
+        await self._emit(
+            "correlation_run", "analysis_cycle",
+            "monitor_runs", run_id,
+            severity="info",
+            summary=(
+                f"correlation pass: {len(correlations)} correlation(s)"
+            ),
+            run_id=run_id,
+        )
 
+        await self._maybe_run_diagnostics(
+            anomalies,
+            pending_bundle,
+            snapshotted_model,
+            correlations=correlations,
+            run_id=run_id,
+        )
+
+        # S0.5: the analyzer NEVER persists. On hard/soft failure it
+        # attaches a fallback list to the exception; the monitor is the
+        # single persistence + dispatch site for all insights — success
+        # and fallback alike — so enrichment and alerting never get
+        # skipped on the failure paths.
+        insights: list[Insight] = []
         try:
             insights = await self.analyzer.analyze_anomalies(
                 anomalies=anomalies,
-                system_model=self._cached_model,
+                # S0.6: use the snapshotted model, not self._cached_model.
+                system_model=snapshotted_model,
                 recent_changes=recent_changes,
                 business_context=business_context,
                 recurrence_context=recurrence_map,
@@ -859,10 +967,17 @@ class MonitorLoop:
         except LLMHardError as exc:
             log.warning("LLM hard failure: %s", exc)
             self.circuit_breaker.record_hard_failure()
-            return []
+            insights = list(getattr(exc, "fallback_insights", []) or [])
+        except LLMSoftError as exc:
+            log.warning("Analyzer soft failure: %s", exc)
+            self.circuit_breaker.record_soft_failure()
+            insights = list(getattr(exc, "fallback_insights", []) or [])
         except Exception as exc:
             log.warning("Analyzer soft failure: %s", exc)
             self.circuit_breaker.record_soft_failure()
+            insights = list(getattr(exc, "fallback_insights", []) or [])
+
+        if not insights:
             return []
 
         bundle_dict = pending_bundle.to_dict() if not pending_bundle.is_empty() else None
@@ -900,6 +1015,9 @@ class MonitorLoop:
         self,
         anomalies: list[Anomaly],
         pending_bundle: EvidenceBundle,
+        snapshotted_model: SystemModel | None = None,
+        correlations: list[Any] | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Hypothesis-test loop: generate SQL queries against the app DB
         and attach evidence to ``pending_bundle.diagnostics`` when it's
@@ -908,13 +1026,21 @@ class MonitorLoop:
         The whole phase degrades to "no diagnostics" on any failure —
         never raises. Hard ceilings bound wall-clock; cooldown cache
         suppresses repeat firings of the same anomaly signature.
+
+        S0.6: ``snapshotted_model`` is taken at the top of
+        ``run_analysis_cycle``. Concurrent discovery cycles may mutate
+        ``self._cached_model`` mid-flight; we consume the snapshot so
+        every downstream schema reference resolves against the same
+        view. Falls back to the live cache for callers (pre-S0.6 code
+        paths) that don't pass the snapshot.
         """
         diag_cfg = self.config.monitor.diagnostics
         if not diag_cfg.enabled:
             return
         if self._app_db is None or not getattr(self._app_db, "is_connected", False):
             return
-        if self._cached_model is None or not anomalies:
+        model = snapshotted_model if snapshotted_model is not None else self._cached_model
+        if model is None or not anomalies:
             return
 
         # Gate 1 (Gemini-4.2 / ChatGPT-6): skip cold-start rolling
@@ -933,13 +1059,37 @@ class MonitorLoop:
             return
 
         sig = compute_anomaly_signature(diag_candidates)
-        now = datetime.now(UTC)
-        cooldown = timedelta(minutes=diag_cfg.cooldown_minutes)
-        run_id = uuid.uuid4().hex[:12]
+        cooldown_seconds = int(diag_cfg.cooldown_minutes * 60)
+        # Hotfix item 2: use the analysis-cycle run_id so the
+        # ``ref_table="monitor_runs"`` claim on every emitted event
+        # resolves to a real row. Legacy callers that invoke this
+        # method directly (pre-hotfix test suites) still get a fresh
+        # UUID + a monitor_runs row so the contract holds even there.
+        if run_id is None:
+            run_id = uuid.uuid4().hex[:12]
+            try:
+                await self.store.create_monitor_run(
+                    run_id, datetime.now(UTC),
+                )
+            except Exception as exc:
+                log.debug(
+                    "Failed to create monitor_runs row for "
+                    "standalone diagnostic run: %s", exc,
+                )
 
-        cached = self._diagnostic_cache.get(sig)
-        if cached and (now - cached[0]) < cooldown:
-            pending_bundle.diagnostics = list(cached[1])
+        # Stage 5: cache read via store. Restart-survival (O9): a
+        # cooldown entry written before the process restarted still
+        # suppresses a duplicate diagnostic run on the next cycle.
+        try:
+            cached_evidence = await self.store.get_diagnostic_cooldown_entry(
+                sig, within_seconds=cooldown_seconds,
+            )
+        except Exception as exc:
+            log.debug("Cooldown lookup failed (non-fatal): %s", exc)
+            cached_evidence = None
+
+        if cached_evidence is not None:
+            pending_bundle.diagnostics = list(cached_evidence)
             await self._emit(
                 "diagnostic_skipped", "analysis_cycle",
                 "monitor_runs", run_id,
@@ -948,39 +1098,115 @@ class MonitorLoop:
                 run_id=run_id,
             )
         else:
+            # Stage 8: pass only the Stage 7 correlated subset into
+            # the diagnostic hypothesis prompt. Previously we passed
+            # ``recent_changes=None`` so the LLM saw no change context
+            # at all. The cap honors the operator-tunable
+            # ``correlation_top_n_for_hypothesis`` prompt-budget knob.
+            correlated_changes = [
+                c.change_event
+                for c in (correlations or [])[
+                    : diag_cfg.correlation_top_n_for_hypothesis
+                ]
+            ]
             try:
-                diag_queries = await asyncio.wait_for(
+                diag_result = await asyncio.wait_for(
                     self.analyzer.generate_diagnostic_queries(
                         anomalies=diag_candidates,
-                        system_model=self._cached_model,
-                        recent_changes=None,
+                        system_model=model,
+                        recent_changes=correlated_changes,
                         recurrence=pending_bundle.recurrence,
+                        cfg=diag_cfg,
+                        code_service=self.code_service,
                     ),
                     timeout=diag_cfg.hypothesis_timeout_s,
                 )
-                evidence_list = await asyncio.wait_for(
-                    self.analyzer.execute_diagnostics(
-                        queries=diag_queries,
-                        app_db=self._app_db,
-                        system_model=self._cached_model,
-                        cfg=diag_cfg,
-                    ),
-                    timeout=diag_cfg.execution_timeout_s,
+                # Stage 6: if fact retrieval surfaced a failure state
+                # (unavailable / error), append one visible
+                # EvidenceError to the bundle so the operator sees
+                # "Observibot tried but the index was down" instead
+                # of silence. Fail-visible. ``getattr`` keeps the
+                # older contract alive for tests that mock
+                # ``generate_diagnostic_queries`` as a plain list.
+                error_reason = getattr(diag_result, "error_reason", None)
+                generation_error = getattr(
+                    diag_result, "generation_error", None,
                 )
-                pending_bundle.diagnostics = evidence_list
-                self._diagnostic_cache[sig] = (now, evidence_list)
-                ok = sum(1 for e in evidence_list if not e.error)
-                rej = sum(1 for e in evidence_list if e.error)
-                await self._emit(
-                    "diagnostic_run", "analysis_cycle",
-                    "monitor_runs", run_id,
-                    severity="info",
-                    summary=(
-                        f"{len(evidence_list)} diagnostic(s): "
-                        f"{ok} succeeded, {rej} rejected/errored"
-                    ),
-                    run_id=run_id,
-                )
+                facts = getattr(diag_result, "facts", None)
+                freshness = getattr(diag_result, "freshness", None)
+                if error_reason:
+                    pending_bundle.errors.append(
+                        EvidenceError(
+                            stage="fact_retrieval",
+                            reason=error_reason,
+                            occurred_at=datetime.now(UTC),
+                            subject=None,
+                        )
+                    )
+                if generation_error:
+                    # Hotfix item 1: a post-fact-retrieval failure
+                    # (LLM hard/soft/unexpected/validation) must
+                    # surface as its own degraded-state note AND
+                    # MUST NOT poison the cooldown cache with an
+                    # empty evidence list — otherwise subsequent
+                    # cycles skip diagnostics for the full cooldown
+                    # window while the operator sees "0 diagnostic(s)"
+                    # that's indistinguishable from a legitimate
+                    # no-queries outcome.
+                    pending_bundle.errors.append(
+                        EvidenceError(
+                            stage="diagnostic_generation",
+                            reason=generation_error,
+                            occurred_at=datetime.now(UTC),
+                            subject=None,
+                        )
+                    )
+                    await self._emit(
+                        "diagnostic_run", "analysis_cycle",
+                        "monitor_runs", run_id,
+                        severity="warning",
+                        summary=(
+                            f"diagnostic generation failed: "
+                            f"{generation_error}"
+                        ),
+                        run_id=run_id,
+                    )
+                else:
+                    evidence_list = await asyncio.wait_for(
+                        self.analyzer.execute_diagnostics(
+                            queries=list(diag_result),
+                            app_db=self._app_db,
+                            system_model=model,
+                            cfg=diag_cfg,
+                            facts=facts,
+                            freshness=freshness,
+                        ),
+                        timeout=diag_cfg.execution_timeout_s,
+                    )
+                    pending_bundle.diagnostics = evidence_list
+                    # Stage 5: persist the result so a process
+                    # restart (or a sibling horizontal worker) reuses
+                    # this cycle's evidence within the cooldown
+                    # window. Skipped above when generation failed —
+                    # empty-list caching is the silent-failure trap.
+                    try:
+                        await self.store.set_diagnostic_cooldown_entry(
+                            sig, evidence_list,
+                        )
+                    except Exception as exc:
+                        log.debug("Cooldown upsert failed (non-fatal): %s", exc)
+                    ok = sum(1 for e in evidence_list if not e.error)
+                    rej = sum(1 for e in evidence_list if e.error)
+                    await self._emit(
+                        "diagnostic_run", "analysis_cycle",
+                        "monitor_runs", run_id,
+                        severity="info",
+                        summary=(
+                            f"{len(evidence_list)} diagnostic(s): "
+                            f"{ok} succeeded, {rej} rejected/errored"
+                        ),
+                        run_id=run_id,
+                    )
             except TimeoutError:
                 log.warning(
                     "Diagnostic phase exceeded hard ceiling; proceeding "
@@ -998,12 +1224,16 @@ class MonitorLoop:
                     "Diagnostic phase failed: %s — proceeding without", exc
                 )
 
-        # Evict entries older than the current cooldown so the cache
-        # stays bounded without a separate timer task.
-        self._diagnostic_cache = {
-            k: v for k, v in self._diagnostic_cache.items()
-            if (now - v[0]) < cooldown
-        }
+        # Stage 5: inline eviction keeps the table bounded between
+        # retention runs. Matches the prior in-memory dict-comprehension
+        # eviction behavior — rows older than the current cooldown
+        # can never fire again anyway.
+        try:
+            await self.store.evict_diagnostic_cooldown(
+                older_than_seconds=cooldown_seconds,
+            )
+        except Exception as exc:
+            log.debug("Cooldown eviction failed (non-fatal): %s", exc)
 
     async def trigger_analysis(self, anomalies: list[Anomaly]) -> list[Insight]:
         """Force an analysis pass with the supplied anomalies."""

@@ -453,7 +453,16 @@ async def test_execute_diagnostics_sensitive_column_redacted(
         cfg=_default_cfg(),
     )
     assert len(evidence) == 1
-    assert evidence[0].rows[0]["api_token"] == "[REDACTED]"
+    # Stage 1: the redaction rendering now carries the matching
+    # pattern in an audit tag so the operator can see why a column
+    # was dropped without grepping the pattern list.
+    redacted_value = evidence[0].rows[0]["api_token"]
+    assert redacted_value.startswith("[REDACTED: matches '")
+    assert redacted_value.endswith("']")
+    # One of the matching patterns — api_token (exact) OR token (substring).
+    assert any(
+        pat in redacted_value for pat in ("api_token", "token")
+    )
     assert evidence[0].rows[0]["id"] == "x"
 
 
@@ -614,6 +623,162 @@ async def test_execute_diagnostics_non_primitive_values_stringified(
     assert str(row_id) in serialized
     assert "2026-04-16" in serialized
     assert evidence[0].rows[0]["n"] == 7  # primitive ints preserved
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_allowlist_accepts_pg_stat_views(tmp_store) -> None:
+    """S0.4 — the diagnostic allowlist must accept the fixed set of
+    read-only Postgres monitoring views the prompt recommends. Prior
+    behavior rejected every ``pg_stat_*`` query silently because the
+    sandbox allowlist only carried app table names.
+    """
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+    conn = _FakeConn(rows=[{"numbackends": 3}])
+    db = _FakeAppDb(conn)
+    queries = [
+        DiagnosticQuery(
+            hypothesis="connection count",
+            sql=(
+                "SELECT datname, numbackends FROM pg_catalog.pg_stat_database "
+                "LIMIT 20"
+            ),
+        ),
+        DiagnosticQuery(
+            hypothesis="bare-qualified pg_stat view",
+            sql="SELECT datname FROM pg_stat_database LIMIT 10",
+        ),
+    ]
+    evidence = await analyzer.execute_diagnostics(
+        queries=queries, app_db=db,
+        system_model=ecommerce_schema(),
+        cfg=_default_cfg(),
+    )
+    assert evidence[0].error is None, evidence[0].error
+    assert evidence[1].error is None, evidence[1].error
+    assert len(conn.fetch_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_allowlist_rejects_non_monitoring_pg_catalog_tables(
+    tmp_store,
+) -> None:
+    """S0.4 — loosening the schema gate must NOT open pg_catalog wide.
+    ``pg_authid`` is not in the monitoring allowlist; referencing it
+    must still be rejected.
+    """
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+    conn = _FakeConn()
+    db = _FakeAppDb(conn)
+    queries = [
+        DiagnosticQuery(
+            hypothesis="leak attempt",
+            sql="SELECT * FROM pg_catalog.pg_authid LIMIT 5",
+        ),
+    ]
+    evidence = await analyzer.execute_diagnostics(
+        queries=queries, app_db=db,
+        system_model=ecommerce_schema(),
+        cfg=_default_cfg(),
+    )
+    assert evidence[0].error and "sandbox rejected" in evidence[0].error
+    assert conn.fetch_calls == []
+
+
+def test_diagnostic_prompt_matches_sandbox_behavior() -> None:
+    """S0.4 — the text of DIAGNOSTIC_HYPOTHESIS_PROMPT must describe the
+    same allowlist the sandbox actually enforces. A drift here silently
+    produces rejected queries the operator would never see.
+    """
+    from observibot.agent.prompts import DIAGNOSTIC_HYPOTHESIS_PROMPT
+    from observibot.agent.schema_catalog import get_monitoring_view_names
+
+    for view in get_monitoring_view_names():
+        assert view in DIAGNOSTIC_HYPOTHESIS_PROMPT, (
+            f"{view} missing from diagnostic prompt"
+        )
+    assert "pg_catalog." in DIAGNOSTIC_HYPOTHESIS_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_max_queries_per_cycle_respects_config(tmp_store) -> None:
+    """S0.3 — DiagnosticsConfig.max_queries_per_cycle caps fan-out at
+    runtime. Pydantic's max_length=3 is a ceiling; config is the knob.
+    """
+    canned_queries = [
+        {
+            "hypothesis": f"h{i}",
+            "sql": f"SELECT 1 AS c FROM orders LIMIT {i + 1}",
+            "explanation": "",
+        }
+        for i in range(3)
+    ]
+    provider = MockProvider(canned={"queries": canned_queries})
+    analyzer = Analyzer(provider=provider, store=tmp_store)
+    cfg = _default_cfg(max_queries_per_cycle=2)
+    result = await analyzer.generate_diagnostic_queries(
+        anomalies=[ecommerce_anomaly()],
+        system_model=ecommerce_schema(),
+        cfg=cfg,
+    )
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_on_explain_error_true(tmp_store) -> None:
+    """S0.3 — default fail_closed=True preserves the fail-closed
+    behavior: EXPLAIN raising suppresses execution.
+    """
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+
+    async def _boom(_sql: str) -> Any:
+        raise RuntimeError("planner exploded")
+
+    conn = _FakeConn(fetchrow_impl=_boom)
+    db = _FakeAppDb(conn)
+    queries = [
+        DiagnosticQuery(
+            hypothesis="x",
+            sql="SELECT count(*) FROM orders LIMIT 10",
+        )
+    ]
+    cfg = _default_cfg(fail_closed_on_explain_error=True)
+    evidence = await analyzer.execute_diagnostics(
+        queries=queries, app_db=db,
+        system_model=ecommerce_schema(), cfg=cfg,
+    )
+    assert evidence[0].error and "EXPLAIN rejected" in evidence[0].error
+    assert conn.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_on_explain_error_false_falls_through(
+    tmp_store,
+) -> None:
+    """S0.3 — ``fail_closed_on_explain_error=False`` documents the
+    off-mode: EXPLAIN failure no longer blocks execution. Only for
+    controlled test scenarios; never the production default.
+    """
+    analyzer = Analyzer(provider=MockProvider(), store=tmp_store)
+
+    async def _boom(_sql: str) -> Any:
+        raise RuntimeError("planner exploded")
+
+    conn = _FakeConn(fetchrow_impl=_boom, rows=[{"n": 5}])
+    db = _FakeAppDb(conn)
+    queries = [
+        DiagnosticQuery(
+            hypothesis="x",
+            sql="SELECT count(*) AS n FROM orders LIMIT 10",
+        )
+    ]
+    cfg = _default_cfg(fail_closed_on_explain_error=False)
+    evidence = await analyzer.execute_diagnostics(
+        queries=queries, app_db=db,
+        system_model=ecommerce_schema(), cfg=cfg,
+    )
+    assert evidence[0].error is None
+    assert evidence[0].row_count == 1
+    assert len(conn.fetch_calls) == 1
 
 
 @pytest.mark.asyncio

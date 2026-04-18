@@ -66,11 +66,14 @@ _FUNC_KEY_TO_NAME = {
     "generateseries": "generate_series",
 }
 
-# Only this schema qualifier is allowed on table references. Supabase exposes
-# password hashes and tokens in ``auth.users``; PostgreSQL internals live in
-# ``pg_catalog`` and ``information_schema`` — all of which would be an
-# LLM-driven privacy disaster if reachable through the chat agent.
-_ALLOWED_SCHEMAS = frozenset({"", "public"})
+# Schema qualifiers allowed on table references. Supabase's ``auth.users``
+# exposes password hashes and tokens; ``information_schema`` leaks connector
+# credential metadata. Only ``public`` (application tables) and ``pg_catalog``
+# (read-only monitoring views like ``pg_stat_database``) pass the schema gate.
+# The table-name allowlist remains the real gate: chat callers never include
+# ``pg_stat_*`` views, so an LLM asking for ``pg_catalog.pg_authid`` fails
+# because the *name* isn't in the allowlist, not because the schema was.
+_ALLOWED_SCHEMAS = frozenset({"", "public", "pg_catalog"})
 
 
 def validate_query(

@@ -435,5 +435,288 @@ async def test_run_analysis_cycle_dedup_skips_emit_and_alert(
         insights = await loop.run_analysis_cycle()
 
     assert insights == []
-    mock_emit.assert_not_called()
+    # Stage 7 emits a ``correlation_run`` event every cycle (including
+    # when the detector found nothing) — separate from the per-insight
+    # emissions. The dedup-skip invariant is about insight-specific
+    # emissions + alert dispatch, neither of which should fire when
+    # save_insight returned False.
+    insight_emit_calls = [
+        call for call in mock_emit.call_args_list
+        if call.args and call.args[0] == "insight"
+    ]
+    assert insight_emit_calls == []
     mock_dispatch.assert_not_called()
+
+
+async def test_hard_error_fallback_is_enriched_and_dispatched(
+    tmp_store, mock_supabase_connector, mock_llm_provider
+) -> None:
+    """S0.5 — when the analyzer raises LLMHardError with a fallback
+    attached, the monitor enriches the fallback with the evidence
+    bundle, persists it, and dispatches to alerting. Previously the
+    analyzer called _persist internally and enrichment + dispatch
+    never ran on the failure path.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.agent.llm_provider import LLMHardError, MockProvider
+    from observibot.core.anomaly import Anomaly
+
+    class HardFailingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise LLMHardError("401 unauthorized")
+
+    anomaly = Anomaly(
+        metric_name="table_inserts",
+        connector_name="mock-supabase",
+        labels={"table": "tasks"},
+        value=500.0,
+        median=10.0,
+        mad=2.0,
+        modified_z=245.0,
+        absolute_diff=490.0,
+        severity="critical",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+    analyzer = Analyzer(provider=HardFailingProvider(), store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+    with patch.object(
+        loop.store, "get_event_recurrence_summaries",
+        new_callable=AsyncMock,
+        return_value={"table_inserts": {"count": 3, "common_hours": [10]}},
+    ), patch.object(
+        loop.alert_manager, "dispatch", new_callable=AsyncMock
+    ) as mock_dispatch:
+        insights = await loop.run_analysis_cycle()
+
+    assert len(insights) == 1
+    # Enrichment: evidence bundle must be attached on the persisted row.
+    assert insights[0].evidence is not None
+    assert insights[0].evidence.get("recurrence")
+    # Alerting: fallback must be dispatched.
+    mock_dispatch.assert_awaited()
+    # Circuit breaker: hard failure recorded.
+    assert loop.circuit_breaker.is_open()
+
+
+async def test_validation_error_fallback_is_enriched_and_dispatched(
+    tmp_store, mock_supabase_connector
+) -> None:
+    """S0.5 — when the analyzer raises LLMSoftError on Pydantic validation
+    failure with a fallback attached, the monitor still enriches +
+    persists + dispatches.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.agent.llm_provider import MockProvider
+    from observibot.core.anomaly import Anomaly
+
+    bad_provider = MockProvider(canned={"insights": [{"severity": "bogus"}]})
+    analyzer = Analyzer(provider=bad_provider, store=tmp_store)
+    anomaly = Anomaly(
+        metric_name="cache_misses",
+        connector_name="mock-supabase",
+        labels={"table": "sessions"},
+        value=900.0,
+        median=50.0,
+        mad=5.0,
+        modified_z=40.0,
+        absolute_diff=850.0,
+        severity="warning",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+    with patch.object(
+        loop.alert_manager, "dispatch", new_callable=AsyncMock
+    ) as mock_dispatch:
+        insights = await loop.run_analysis_cycle()
+
+    assert len(insights) == 1
+    assert insights[0].source == "anomaly"  # fallback marker
+    mock_dispatch.assert_awaited()
+
+
+async def test_analysis_uses_snapshotted_model_even_if_discovery_mutates(
+    tmp_store, mock_supabase_connector, mock_llm_provider
+) -> None:
+    """S0.6 — run_analysis_cycle snapshots ``self._cached_model`` at the
+    top of the cycle so a concurrent discovery mutation cannot alter
+    the model that analyzer/diagnostic code sees mid-flight.
+    """
+    import asyncio as _asyncio
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.core.anomaly import Anomaly
+    from observibot.core.models import Insight, SystemModel, TableInfo
+
+    pre_model = SystemModel(
+        tables=[
+            TableInfo(name="pre_model_table", schema="public", columns=[]),
+        ],
+    )
+    pre_model.compute_fingerprint()
+    post_model = SystemModel(
+        tables=[
+            TableInfo(name="post_model_table", schema="public", columns=[]),
+        ],
+    )
+    post_model.compute_fingerprint()
+
+    anomaly = Anomaly(
+        metric_name="x",
+        connector_name="mock-supabase",
+        labels={"table": "y"},
+        value=10.0, median=1.0, mad=0.5, modified_z=10.0,
+        absolute_diff=9.0, severity="warning", direction="spike",
+        consecutive_count=3, detected_at=datetime.now(UTC), sample_count=20,
+    )
+
+    analyzer = Analyzer(provider=mock_llm_provider, store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._cached_model = pre_model
+    loop._pending_anomalies = [anomaly]
+
+    captured_models: list[SystemModel | None] = []
+
+    async def spy_analyze(*args, **kwargs):
+        captured_models.append(kwargs.get("system_model"))
+        # Simulate discovery mutating the cache mid-analysis.
+        loop._cached_model = post_model
+        await _asyncio.sleep(0)
+        return [
+            Insight(
+                title="Snapshot test insight",
+                severity="info",
+                summary="s",
+                source="llm",
+                related_metrics=["x"],
+            )
+        ]
+
+    with patch.object(analyzer, "analyze_anomalies", side_effect=spy_analyze), \
+            patch.object(loop.alert_manager, "dispatch", new_callable=AsyncMock):
+        await loop.run_analysis_cycle()
+
+    assert len(captured_models) == 1
+    received = captured_models[0]
+    assert received is pre_model
+    # The real cache advanced because of the simulated concurrent
+    # discovery, but analysis saw the pre-mutation snapshot.
+    assert loop._cached_model is post_model
+
+
+async def test_hard_error_fallback_not_double_persisted(
+    tmp_store, mock_supabase_connector
+) -> None:
+    """S0.5 — the monitor persists fallback insights exactly once.
+    Regression: the analyzer used to call its own ``_persist`` on the
+    failure path, producing a double-save pair that could collide with
+    the dedup window.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from observibot.agent.llm_provider import LLMHardError, MockProvider
+    from observibot.core.anomaly import Anomaly
+
+    class HardFailingProvider(MockProvider):
+        async def _call(self, system_prompt, user_prompt):
+            raise LLMHardError("auth denied")
+
+    anomaly = Anomaly(
+        metric_name="cache_hits",
+        connector_name="mock-supabase",
+        labels={"table": "sessions"},
+        value=42.0,
+        median=10.0,
+        mad=2.0,
+        modified_z=10.0,
+        absolute_diff=32.0,
+        severity="warning",
+        direction="spike",
+        consecutive_count=3,
+        detected_at=datetime.now(UTC),
+        sample_count=20,
+    )
+    analyzer = Analyzer(provider=HardFailingProvider(), store=tmp_store)
+    alert_manager = AlertManager(channels=[])
+    cfg = ObservibotConfig()
+    cfg.monitor = MonitorConfig(
+        collection_interval_seconds=60,
+        analysis_interval_seconds=120,
+        discovery_interval_seconds=60,
+        min_samples_for_baseline=3,
+    )
+    loop = build_monitor_loop(
+        config=cfg,
+        connectors=[mock_supabase_connector],
+        store=tmp_store,
+        analyzer=analyzer,
+        alert_manager=alert_manager,
+    )
+    loop._pending_anomalies = [anomaly]
+    calls: list[str] = []
+    original_save = tmp_store.save_insight
+
+    async def counted_save(insight):
+        calls.append(insight.id)
+        return await original_save(insight)
+
+    with patch.object(tmp_store, "save_insight", side_effect=counted_save):
+        insights = await loop.run_analysis_cycle()
+
+    assert len(insights) == 1
+    assert len(calls) == 1

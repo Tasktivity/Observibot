@@ -85,8 +85,32 @@ def test_auth_schema_rejected():
 
 
 def test_pg_catalog_rejected():
-    with pytest.raises(QueryValidationError, match="Schema"):
+    """S0.4: ``pg_catalog`` is now a recognized schema qualifier so
+    autonomous diagnostics can target read-only monitoring views like
+    ``pg_stat_database``, but the TABLE-NAME allowlist remains the real
+    gate: ``pg_authid`` is not in a chat caller's allowlist and must be
+    rejected there.
+    """
+    with pytest.raises(QueryValidationError, match="not in the allowlist"):
         validate_query("SELECT * FROM pg_catalog.pg_authid", ALLOWED)
+
+
+def test_pg_catalog_monitoring_view_allowed_when_explicitly_listed():
+    """S0.4: when a caller (autonomous diagnostics) includes
+    ``pg_stat_database`` in the allowlist, the sandbox accepts it with
+    or without the ``pg_catalog.`` qualifier.
+    """
+    diag_allow = ALLOWED | {"pg_stat_database"}
+    out = validate_query(
+        "SELECT datname FROM pg_catalog.pg_stat_database LIMIT 10",
+        diag_allow,
+    )
+    assert "pg_stat_database" in out
+    out2 = validate_query(
+        "SELECT datname FROM pg_stat_database LIMIT 10",
+        diag_allow,
+    )
+    assert "pg_stat_database" in out2
 
 
 def test_information_schema_rejected():

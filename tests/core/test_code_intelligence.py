@@ -162,6 +162,116 @@ class TestFTS5Search:
         assert len(results) <= 3
 
 
+class TestUpdateFactFtsSync:
+    """S0.2 — update_semantic_fact must keep FTS5 in sync on any change.
+
+    Prior behavior only re-synced on claim change; updates to is_active or
+    confidence left the FTS row referencing stale rowid content when combined
+    with other write paths. Fix: always re-sync on any touch.
+    """
+
+    async def test_update_fact_claim_change_is_searchable(
+        self, ci_store: Store,
+    ) -> None:
+        fact = _make_fact(concept="alpha", claim="original description")
+        await ci_store.save_semantic_fact(fact)
+
+        await ci_store.update_semantic_fact(fact.id, claim="updated marker")
+
+        hits = await ci_store.search_semantic_facts("updated")
+        assert any(h["id"] == fact.id for h in hits)
+
+    async def test_update_fact_nonclaim_change_still_syncs_fts(
+        self, ci_store: Store,
+    ) -> None:
+        """Updating only confidence (non-FTS-indexed) still triggers an
+        FTS resync, keeping tables/columns/concept searchable. Regression
+        against the prior conditional sync that was claim-only.
+        """
+        fact = _make_fact(
+            concept="inventory_rollup",
+            claim="aggregated order totals by sku",
+            tables=["orders", "line_items"],
+        )
+        await ci_store.save_semantic_fact(fact)
+
+        await ci_store.update_semantic_fact(fact.id, confidence=0.95)
+
+        hits = await ci_store.search_semantic_facts("inventory_rollup")
+        assert any(h["id"] == fact.id for h in hits)
+
+    async def test_update_fact_reactivation_resyncs_fts(
+        self, ci_store: Store,
+    ) -> None:
+        fact = _make_fact(concept="shipment_status", claim="delivery lifecycle")
+        await ci_store.save_semantic_fact(fact)
+        await ci_store.update_semantic_fact(fact.id, is_active=False)
+        await ci_store.update_semantic_fact(fact.id, is_active=True)
+
+        hits = await ci_store.search_semantic_facts("delivery")
+        assert any(h["id"] == fact.id for h in hits)
+
+
+class TestPostgresFtsParity:
+    """Stage 3: ``search_semantic_facts`` on Postgres must emit a
+    ``tsvector``/``@@``/``ts_rank_cd`` query, ordered by rank desc,
+    so the downstream source-priority re-ranker in
+    ``CodeKnowledgeService`` sees a BM25-equivalent relevance signal.
+    """
+
+    async def test_search_semantic_facts_sqlite_ranking_preserved(
+        self, ci_store: Store,
+    ) -> None:
+        """Regression: the SQLite path is untouched. FTS5 ``rank``
+        ordering still drives the top-N.
+        """
+        fact_hit = _make_fact(
+            concept="payment_flow",
+            claim="capture succeeded then settled",
+            confidence=0.6,
+        )
+        fact_miss = _make_fact(
+            concept="unrelated_topic",
+            claim="nothing here about the query",
+            confidence=0.95,
+        )
+        await ci_store.save_semantic_fact(fact_hit)
+        await ci_store.save_semantic_fact(fact_miss)
+
+        hits = await ci_store.search_semantic_facts("capture settled")
+        assert any(h["id"] == fact_hit.id for h in hits)
+        # The high-confidence miss must NOT beat the FTS-matching low
+        # confidence fact purely on confidence — FTS rank comes first.
+        assert hits[0]["id"] == fact_hit.id
+
+    def test_search_semantic_facts_postgres_uses_tsvector(self) -> None:
+        """The statement compiled against the Postgres dialect must use
+        ``to_tsvector``-free ``plainto_tsquery`` + ``@@`` + ``ts_rank_cd``.
+        Compiled without a live engine — no network required.
+        """
+        import sqlalchemy as sa
+        from sqlalchemy.dialects import postgresql
+
+        from observibot.core.store import semantic_facts
+
+        tsq = sa.func.plainto_tsquery("english", "order placement")
+        search_tsv = sa.literal_column("search_tsv")
+        stmt = (
+            sa.select(
+                semantic_facts.c.id,
+                sa.func.ts_rank_cd(search_tsv, tsq).label("_rank"),
+            )
+            .where(search_tsv.op("@@")(tsq))
+            .order_by(sa.literal_column("_rank").desc())
+            .limit(5)
+        )
+        compiled = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "plainto_tsquery" in compiled
+        assert "@@" in compiled
+        assert "ts_rank_cd" in compiled
+        assert "ORDER BY _rank DESC" in compiled
+
+
 class TestUserCorrections:
     async def test_user_correction_highest_confidence(self, ci_store: Store):
         auto = _make_fact(

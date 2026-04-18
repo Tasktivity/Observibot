@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +19,12 @@ from observibot.agent.llm_provider import (
     LLMSoftError,
     estimate_cost_usd,
 )
-from observibot.agent.prompt_utils import enforce_budget, log_prompt_size, sample_rows
+from observibot.agent.prompt_utils import (
+    enforce_budget,
+    log_prompt_size,
+    sample_rows,
+    sanitize_untrusted_text,
+)
 from observibot.agent.prompts import (
     ANOMALY_ANALYSIS_PROMPT,
     DIAGNOSTIC_HYPOTHESIS_PROMPT,
@@ -27,9 +33,9 @@ from observibot.agent.prompts import (
     TEXT_TO_SQL_PROMPT,
 )
 from observibot.agent.schema_catalog import (
-    _is_sensitive_column,
     build_app_schema_description,
     get_app_table_names,
+    get_monitoring_view_names,
 )
 from observibot.agent.schemas import (
     DiagnosticHypothesisResponse,
@@ -40,13 +46,16 @@ from observibot.agent.schemas import (
 )
 from observibot.core.anomaly import Anomaly, compute_anomaly_signature
 from observibot.core.app_db import AppDatabasePool
+from observibot.core.code_intelligence.service import CodeKnowledgeService
 from observibot.core.config import DiagnosticsConfig
 from observibot.core.evidence import (
     DiagnosticEvidence,
     EvidenceBundle,
+    FactCitation,
     RecurrenceEvidence,
 )
 from observibot.core.models import ChangeEvent, Insight, MetricSnapshot, SystemModel
+from observibot.core.redaction import is_sensitive_column, redact_reason
 from observibot.core.sql_sandbox import (
     QueryValidationError,
     explain_check,
@@ -66,6 +75,12 @@ EVIDENCE_BUDGET_TOKENS = 6_000
 CHANGES_BUDGET_TOKENS = 2_000
 BUSINESS_CONTEXT_BUDGET_TOKENS = 2_000
 SYSTEM_SUMMARY_BUDGET_TOKENS = 4_000
+# Stage 6: token-budget cap on the semantic facts section of the
+# diagnostic hypothesis prompt. Scale-invariant — caps what the LLM
+# ever sees in this section regardless of how many facts the index
+# holds. Matches the ``max_tokens`` default on
+# ``get_context_for_anomalies``.
+SEMANTIC_FACTS_BUDGET_TOKENS = 1_500
 
 
 def summarize_system(model: SystemModel | None) -> str:
@@ -182,8 +197,45 @@ def summarize_evidence(bundle: EvidenceBundle | None) -> str:
             )
             if diag.explanation:
                 lines.append(f"    explanation: {diag.explanation}")
+            # Stage 2: fact citations that informed this hypothesis.
+            # Render top 3 by confidence, concept + truncated claim
+            # only — no path/lines/commit (those go to the UI, not the
+            # prompt; the LLM is forbidden from quoting them because
+            # they may be stale).
+            if diag.fact_citations:
+                top = sorted(
+                    diag.fact_citations,
+                    key=lambda c: -c.confidence,
+                )[:3]
+                lines.append("    code context cited:")
+                for cite in top:
+                    claim = (cite.claim or "")[:120]
+                    lines.append(
+                        f"      * {cite.concept}: {claim}"
+                    )
+            # Stage 2: freshness tag when the code index wasn't current
+            # at the time of retrieval. "current" is the normal case
+            # and renders nothing so the prompt stays quiet.
+            if diag.code_freshness and diag.code_freshness != "current":
+                lines.append(
+                    f"    code context: {diag.code_freshness}"
+                )
     else:
         lines.append("  (not run for this cycle)")
+
+    # Stage 2: degraded-state notes. Only render when non-empty so the
+    # normal case stays silent. The section is explicitly labeled as
+    # facts about Observibot's uncertainty, not data about the
+    # monitored system — the ANOMALY_ANALYSIS_PROMPT echoes this so
+    # the LLM doesn't treat a degraded-state entry as evidence.
+    if bundle.errors:
+        lines.append("")
+        lines.append("Degraded signals:")
+        for err in bundle.errors:
+            subject = f" [{err.subject}]" if err.subject else ""
+            lines.append(
+                f"  - {err.stage}{subject}: {err.reason}"
+            )
 
     return "\n".join(lines)
 
@@ -199,8 +251,18 @@ def summarize_recurrence(recurrence: dict[str, dict] | None) -> str:
 
 
 def summarize_changes(events: Iterable[ChangeEvent]) -> str:
+    """Render recent change events for the LLM.
+
+    Stage 8: every ``e.summary`` goes through
+    :func:`sanitize_untrusted_text` with a 300-char prompt budget so
+    commit messages and deploy notes arrive length-capped and
+    control-character-stripped. The LLM-level guardrail in the
+    diagnostic/anomaly prompts tells the model to treat these as
+    data, not instruction — sanitization handles the shape.
+    """
     rows = [
-        f"- {e.occurred_at.isoformat()} {e.connector_name} {e.event_type}: {e.summary}"
+        f"- {e.occurred_at.isoformat()} {e.connector_name} "
+        f"{e.event_type}: {sanitize_untrusted_text(e.summary, 300)}"
         for e in events
     ]
     return "\n".join(rows) if rows else "(none)"
@@ -236,20 +298,26 @@ class Analyzer:
     ) -> list[Insight]:
         """Produce unsaved :class:`Insight` objects for the given anomalies.
 
-        Returns unsaved Insight objects. The caller is responsible for enriching
-        (recurrence_context, diagnostic_evidence, etc.) and persisting via
-        store.save_insight(). This ordering is REQUIRED — save_insight has a
-        fingerprint-based dedup check that prevents re-saving an enriched
-        version of an already-persisted insight.
-
-        On soft LLM failure (bad JSON, timeout) the fallback insight is
-        returned unsaved — the caller enriches and persists it like any other.
+        Returns unsaved Insight objects on success and on soft failures
+        (bad JSON, transient provider errors). The monitor's
+        ``run_analysis_cycle`` is the single persistence + enrichment +
+        dispatch site: it attaches the evidence bundle, saves via
+        ``store.save_insight``, fires ``alert_manager.dispatch``, and
+        records circuit-breaker state. This ordering is REQUIRED because
+        ``save_insight`` has a fingerprint-based dedup window that would
+        otherwise reject the enriched version of an already-persisted
+        insight.
 
         Raises:
-            LLMHardError: propagated when the provider returned a hard failure,
-                so the monitor's circuit breaker can switch to long-backoff mode.
-                The fallback insight is still saved before re-raising (the
-                caller's except block doesn't run the enrichment path).
+            LLMHardError: provider returned a hard failure (auth, quota,
+                oversize prompt). The fallback insight is attached to
+                the exception as ``exc.fallback_insights`` so the
+                monitor can still enrich + persist + dispatch before
+                opening the circuit breaker. (S0.5 contract.)
+            LLMSoftError: the LLM response failed Pydantic validation.
+                Fallback attached identically so the monitor can count
+                the soft failure toward the circuit-breaker threshold
+                while still surfacing the insight.
         """
         if not anomalies:
             return []
@@ -295,12 +363,17 @@ class Analyzer:
         except LLMHardError as exc:
             log.warning("LLM hard failure during anomaly analysis: %s", exc)
             await self._record_failure("anomaly_analysis", "hard", str(exc))
+            # S0.5: NEVER persist from the analyzer. Attach the fallback to
+            # the raised exception so the monitor's LLMHardError handler can
+            # enrich + persist + dispatch the fallback alongside its
+            # circuit-breaker bookkeeping.
             fallback = [self._fallback_insight(anomalies, str(exc))]
-            await self._persist(fallback)
+            exc.fallback_insights = fallback  # type: ignore[attr-defined]
             raise
         except LLMError as exc:
             log.warning("LLM soft failure during anomaly analysis: %s", exc)
             await self._record_failure("anomaly_analysis", "soft", str(exc))
+            # Soft failure: return unsaved fallback. Caller enriches + persists.
             return [self._fallback_insight(anomalies, str(exc))]
 
         await self._record_usage(response, purpose="anomaly_analysis")
@@ -313,10 +386,12 @@ class Analyzer:
                 "anomaly_analysis", "soft", f"validation error: {exc}"
             )
             fallback = [self._fallback_insight(anomalies, f"invalid schema: {exc}")]
-            await self._persist(fallback)
-            # Soft failure — propagate so the monitor's circuit breaker can
-            # count it toward the retry threshold.
-            raise LLMSoftError(f"LLM response failed validation: {exc}") from exc
+            # S0.5: propagate validation failure so the circuit breaker
+            # counts it, AND attach the fallback so the monitor can still
+            # enrich + persist + dispatch. No in-analyzer persistence.
+            soft = LLMSoftError(f"LLM response failed validation: {exc}")
+            soft.fallback_insights = fallback  # type: ignore[attr-defined]
+            raise soft from exc
 
         # All LLM-synthesized insights for this cycle share the same
         # underlying anomaly set, so they share the same signature — this is
@@ -428,10 +503,24 @@ class Analyzer:
         recent_changes: list[ChangeEvent] | None = None,
         recurrence: dict[str, RecurrenceEvidence] | None = None,
         max_schema_tokens: int = 4_000,
-    ) -> list[DiagnosticQuery]:
+        cfg: DiagnosticsConfig | None = None,
+        code_service: CodeKnowledgeService | None = None,
+    ) -> DiagnosticGenerationResult:
         """Ask the LLM for up to 3 diagnostic SQL queries to investigate
-        ``anomalies``. Returns ``[]`` on any failure — the caller treats an
-        empty list as "no evidence available," not as an error.
+        ``anomalies``. Returns a :class:`DiagnosticGenerationResult`
+        that behaves like ``list[DiagnosticQuery]`` for backwards
+        compatibility (``len``, iteration, indexing, ``== []``) while
+        also carrying the Stage-6 semantic-fact context
+        (``.facts``, ``.freshness``) so the caller can populate
+        ``DiagnosticEvidence.fact_citations`` and ``.code_freshness``
+        on each resulting piece of evidence.
+
+        ``code_service`` is optional — when absent (or when the code
+        index is unavailable/errored) the prompt renders "Semantic
+        facts: not available (index unavailable/error).", no citations
+        are attached, and ``freshness`` on the result is set
+        accordingly. The hypothesis loop never fails on fact
+        retrieval alone.
 
         Uses anomaly-scoped schema retrieval (narrower than chat's 15
         tables, since diagnostics should target fewer tables). Validation
@@ -439,11 +528,23 @@ class Analyzer:
         :meth:`execute_diagnostics`.
         """
         if not anomalies:
-            return []
+            return DiagnosticGenerationResult()
         if system_model is None or not system_model.tables:
             # Without a schema the LLM would hallucinate table names, and
             # the sandbox would reject every query. Skip the call.
-            return []
+            return DiagnosticGenerationResult()
+
+        facts, freshness, fact_error = await _retrieve_facts_for_diagnostics(
+            code_service=code_service,
+            anomalies=anomalies,
+            system_model=system_model,
+        )
+
+        semantic_text = await _render_semantic_facts_section(
+            code_service=code_service,
+            facts=facts,
+            freshness=freshness,
+        )
 
         schema_text = build_app_schema_description(
             system_model,
@@ -467,6 +568,11 @@ class Analyzer:
                 EVIDENCE_BUDGET_TOKENS,
                 "diag_recurrence",
             ),
+            "semantic_facts": enforce_budget(
+                semantic_text,
+                SEMANTIC_FACTS_BUDGET_TOKENS,
+                "diag_semantic_facts",
+            ),
             "schema": enforce_budget(
                 schema_text, max_schema_tokens, "diag_schema",
             ),
@@ -482,17 +588,26 @@ class Analyzer:
         except LLMHardError as exc:
             log.warning("LLM hard failure during diagnostic hypothesis: %s", exc)
             await self._record_failure("diagnostic_hypothesis", "hard", str(exc))
-            return []
+            return DiagnosticGenerationResult(
+                facts=facts, freshness=freshness, error_reason=fact_error,
+                generation_error=f"LLM hard failure: {exc}",
+            )
         except LLMError as exc:
             log.warning("LLM soft failure during diagnostic hypothesis: %s", exc)
             await self._record_failure("diagnostic_hypothesis", "soft", str(exc))
-            return []
+            return DiagnosticGenerationResult(
+                facts=facts, freshness=freshness, error_reason=fact_error,
+                generation_error=f"LLM soft failure: {exc}",
+            )
         except Exception as exc:
             log.warning("Unexpected failure during diagnostic hypothesis: %s", exc)
             await self._record_failure(
                 "diagnostic_hypothesis", "soft", f"unexpected: {exc}",
             )
-            return []
+            return DiagnosticGenerationResult(
+                facts=facts, freshness=freshness, error_reason=fact_error,
+                generation_error=f"LLM call failed unexpectedly: {exc}",
+            )
 
         try:
             validated = DiagnosticHypothesisResponse.model_validate(response.data)
@@ -501,12 +616,37 @@ class Analyzer:
             await self._record_failure(
                 "diagnostic_hypothesis", "soft", f"validation error: {exc}",
             )
-            return []
+            return DiagnosticGenerationResult(
+                facts=facts, freshness=freshness, error_reason=fact_error,
+                generation_error=f"LLM response failed schema validation: {exc}",
+            )
 
         await self._record_usage(response, purpose="diagnostic_hypothesis")
-        # Defensive: Pydantic enforces max_length=3, but a future lib bump
-        # must not silently raise the fan-out.
-        return list(validated.queries[:3])
+        # S0.3: respect DiagnosticsConfig.max_queries_per_cycle at runtime.
+        # The Pydantic max_length=3 on DiagnosticHypothesisResponse is a
+        # hard ceiling; the config knob is the actual runtime cap so
+        # operators can tighten fan-out without a code change.
+        cap = max(0, int(cfg.max_queries_per_cycle)) if cfg is not None else 3
+        capped_queries = list(validated.queries[:cap])
+
+        # Stage 6: post-generation soft hallucination guard. Append a
+        # tag to any query whose hypothesis/explanation mentions a path
+        # or identifier we can't verify against retrieved facts. Never
+        # rejects — the operator sees the uncertainty in the UI.
+        for q in capped_queries:
+            tag = _validate_code_references(q, facts)
+            if tag:
+                q.explanation = (
+                    f"{q.explanation} {tag}".strip()
+                    if q.explanation else tag
+                )
+
+        return DiagnosticGenerationResult(
+            queries=capped_queries,
+            facts=facts,
+            freshness=freshness,
+            error_reason=fact_error,
+        )
 
     async def execute_diagnostics(
         self,
@@ -515,6 +655,8 @@ class Analyzer:
         system_model: SystemModel | None,
         *,
         cfg: DiagnosticsConfig,
+        facts: list[dict] | None = None,
+        freshness: str | None = None,
     ) -> list[DiagnosticEvidence]:
         """Run each query through the full 5-layer sandbox and return
         one :class:`DiagnosticEvidence` per input query.
@@ -531,6 +673,12 @@ class Analyzer:
         if not queries:
             return []
 
+        # Stage 6: build the FactCitation list once; every DiagnosticEvidence
+        # produced this cycle carries the same citations (each is a proxy
+        # for the operator to navigate from insight → code, and every
+        # query was informed by the same retrieved fact set).
+        citations = _build_fact_citations(facts or [])
+
         now = datetime.now(UTC)
         if (
             app_db is None
@@ -546,11 +694,19 @@ class Analyzer:
                     explanation=q.explanation,
                     executed_at=now,
                     error=reason,
+                    fact_citations=list(citations),
+                    code_freshness=freshness,
                 )
                 for q in queries
             ]
 
-        allowed = get_app_table_names(system_model)
+        # S0.4: combine app tables with the fixed read-only Postgres
+        # monitoring views. The prompt recommends these (pg_stat_*),
+        # so the sandbox allowlist must accept them or every such
+        # hypothesis gets rejected silently.
+        allowed = get_app_table_names(system_model) | set(
+            get_monitoring_view_names()
+        )
         results: list[DiagnosticEvidence] = []
         max_rows = cfg.max_rows_per_query
         per_query_timeout = cfg.statement_timeout_ms / 1000.0
@@ -563,6 +719,8 @@ class Analyzer:
                     row_count=0,
                     explanation=q.explanation,
                     executed_at=datetime.now(UTC),
+                    fact_citations=list(citations),
+                    code_freshness=freshness,
                 )
                 try:
                     validated = validate_query(
@@ -580,7 +738,12 @@ class Analyzer:
                 evidence.sql = validated
 
                 ok, cost, reason = await _explain_check_fail_closed(
-                    conn, validated, cfg.explain_cost_threshold,
+                    conn,
+                    validated,
+                    cfg.explain_cost_threshold,
+                    fail_closed=getattr(
+                        cfg, "fail_closed_on_explain_error", True,
+                    ),
                 )
                 if not ok:
                     evidence.error = f"EXPLAIN rejected: {reason} (cost={cost:.0f})"
@@ -747,7 +910,18 @@ class ChangePerformanceCorrelation:
 
 
 class CorrelationDetector:
-    """Cheap deterministic correlation detection with optional LLM escalation."""
+    """Cheap deterministic correlation detection.
+
+    Step 4 (Stage 7) runs the detector deterministic-only: every
+    analysis cycle builds the anomaly × recent-changes cross-product
+    within the proximity window, scores each pair, and surfaces the
+    top-N on the evidence bundle. The ``analyze_correlation`` LLM-
+    escalation path and ``CORRELATION_PROMPT`` are reserved for a
+    future step that will re-introduce LLM synthesis with proper
+    cooldown + fan-out controls; in Step 4 the monitor constructs the
+    detector with ``escalation_threshold=1e9`` so the score check in
+    that path can never fire.
+    """
 
     def __init__(
         self,
@@ -783,6 +957,27 @@ class CorrelationDetector:
 
         correlations.sort(key=lambda c: -c.severity_score)
         return correlations
+
+    def top_correlations(
+        self,
+        anomalies: list[Anomaly],
+        recent_changes: list[ChangeEvent],
+        max: int,
+    ) -> list[ChangePerformanceCorrelation]:
+        """Return the top-N deterministic correlations sorted by
+        ``severity_score`` descending.
+
+        Wraps :meth:`detect_correlations` with a slice so callers
+        that only need a bounded, ranked subset (the monitor, for
+        populating the evidence bundle and picking the correlated
+        subset fed into the diagnostic hypothesis prompt) don't need
+        to re-sort. ``max`` is a prompt-budget cap — caps what the
+        LLM / UI ever sees, not what gets computed.
+        """
+        ranked = self.detect_correlations(anomalies, recent_changes)
+        if max < 0:
+            return []
+        return ranked[:max]
 
     def _compute_severity_score(self, anomaly: Anomaly, delta_seconds: float) -> float:
         """Score: higher = more likely meaningful correlation."""
@@ -895,17 +1090,20 @@ def _redact_row(row: dict[str, Any]) -> dict[str, Any]:
     Two concerns in one pass so every row hits the sanitizer exactly once:
 
     - Sensitive columns (api keys, tokens, password hashes) are replaced
-      with ``[REDACTED]``. Shares the column-name pattern list with
-      chat's ``_exec_application`` so both surfaces converge on a
-      single redaction policy.
+      with ``[REDACTED: matches '<pattern>']`` so the operator can see
+      *why* a column was dropped without re-running the pattern list.
+      Shares the column-name pattern list with chat's
+      ``_exec_application`` via :mod:`observibot.core.redaction`.
     - Non-JSON-primitive values (UUID, datetime, Decimal, asyncpg
       Records, etc.) are coerced to ``str`` so the final evidence dict
       round-trips through :func:`json.dumps` when ``Insight.evidence``
       is persisted by :meth:`Store.save_insight`.
     """
     for key in list(row.keys()):
-        if _is_sensitive_column(str(key)):
-            row[key] = "[REDACTED]"
+        key_str = str(key)
+        if is_sensitive_column(key_str):
+            reason = redact_reason(key_str) or ""
+            row[key] = f"[REDACTED: matches '{reason}']"
             continue
         value = row[key]
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -915,14 +1113,22 @@ def _redact_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _explain_check_fail_closed(
-    conn: Any, sql: str, threshold: float,
+    conn: Any,
+    sql: str,
+    threshold: float,
+    *,
+    fail_closed: bool = True,
 ) -> tuple[bool, float, str]:
-    """Fail-closed EXPLAIN gate for autonomous diagnostics.
+    """EXPLAIN gate for autonomous diagnostics.
 
     The chat-path ``explain_check`` fails open (returns ``True, 0.0`` on
     EXPLAIN error) because a typed user is on the other end waiting for
-    feedback. Autonomous diagnostics have no such tiebreaker: if we can't
-    confirm the plan cost, we must suppress the query rather than run it.
+    feedback. Autonomous diagnostics default to fail-closed: if we can't
+    confirm the plan cost, suppress the query.
+
+    S0.3: ``fail_closed=False`` preserves the chat-style fail-open
+    behavior. This is the only supported way to relax the autonomous
+    default; not recommended outside controlled test scenarios.
     """
 
     async def _runner(sql_to_explain: str) -> Any:
@@ -932,16 +1138,20 @@ async def _explain_check_fail_closed(
     try:
         ok, cost = await explain_check(_runner, sql, threshold)
     except Exception as exc:
-        return False, 0.0, f"EXPLAIN raised: {exc}"
+        if fail_closed:
+            return False, 0.0, f"EXPLAIN raised: {exc}"
+        return True, 0.0, f"EXPLAIN raised: {exc} (fail-open)"
     if not ok:
         return False, cost, "cost above threshold"
     if cost <= 0.0:
-        # Autonomous diagnostics only ever run against the application DB
-        # (asyncpg/Postgres). A non-positive cost means either the
-        # planner didn't give us a number or EXPLAIN output parsing
-        # failed — either way we can't confirm the query is bounded, so
-        # suppress.
-        return False, 0.0, "cost unavailable"
+        if fail_closed:
+            # Autonomous diagnostics only ever run against the application DB
+            # (asyncpg/Postgres). A non-positive cost means either the
+            # planner didn't give us a number or EXPLAIN output parsing
+            # failed — either way we can't confirm the query is bounded, so
+            # suppress.
+            return False, 0.0, "cost unavailable"
+        return True, 0.0, "cost unavailable (fail-open)"
     return True, cost, "ok"
 
 
@@ -963,3 +1173,238 @@ def _describe_store_schema(allowed_tables: set[str]) -> str:
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 helpers
+# ---------------------------------------------------------------------------
+
+
+class DiagnosticGenerationResult(list):
+    """List of generated queries that also carries semantic-fact
+    context (``facts``, ``freshness``, ``error_reason``,
+    ``generation_error``).
+
+    Subclasses ``list`` so existing callers that wrote
+    ``len(result)`` / ``for q in result`` / ``result == []`` /
+    ``result[0]`` continue to work unchanged after Stage 6 extended
+    the return shape. The additional attributes are consumed by the
+    monitor to:
+
+    - attach :class:`FactCitation` entries to each
+      :class:`DiagnosticEvidence`
+    - set ``code_freshness`` on each :class:`DiagnosticEvidence`
+    - append one :class:`EvidenceError` per populated failure field
+
+    ``error_reason`` and ``generation_error`` are two distinct
+    failure modes kept separate so the operator can distinguish
+    "fact retrieval failed, generation skipped" from "fact retrieval
+    OK, generation failed" from both at once. Collapsing them into a
+    single field hides the fault boundary.
+    """
+
+    def __init__(
+        self,
+        queries: list[DiagnosticQuery] | None = None,
+        facts: list[dict] | None = None,
+        freshness: str | None = None,
+        error_reason: str | None = None,
+        generation_error: str | None = None,
+    ) -> None:
+        super().__init__(queries or [])
+        self.facts: list[dict] = list(facts or [])
+        self.freshness: str | None = freshness
+        self.error_reason: str | None = error_reason
+        self.generation_error: str | None = generation_error
+
+
+async def _retrieve_facts_for_diagnostics(
+    code_service: CodeKnowledgeService | None,
+    anomalies: list[Anomaly],
+    system_model: SystemModel | None,
+) -> tuple[list[dict], str | None, str | None]:
+    """Run fact retrieval for a diagnostic cycle.
+
+    Returns ``(facts, freshness_status, error_reason)`` where:
+
+    - ``facts`` is an empty list when no service is attached, the
+      index is unavailable/errored, or retrieval raised;
+    - ``freshness_status`` is one of ``"current"``, ``"stale"``,
+      ``"unavailable"``, ``"error"``, or ``None`` (no service);
+    - ``error_reason`` is a human-readable string when the caller
+      should append an :class:`EvidenceError`, otherwise ``None``.
+
+    Retrieval never raises — a transient store error downgrades to
+    ``unavailable`` with an error_reason so the cycle continues.
+    """
+    if code_service is None:
+        return [], None, None
+    try:
+        facts, status = await code_service.get_context_for_anomalies(
+            anomalies=anomalies, system_model=system_model,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Fact retrieval raised: %s", exc)
+        return [], "error", f"fact retrieval raised: {exc}"
+
+    if status == "unavailable":
+        return [], status, "code index unavailable (no extraction record)"
+    if status == "error":
+        try:
+            freshness = await code_service.get_freshness_status()
+            err_msg = str(
+                freshness.get("error_message") or "code index error",
+            )
+        except Exception:
+            err_msg = "code index error"
+        return [], status, err_msg
+    return facts, status, None
+
+
+async def _render_semantic_facts_section(
+    code_service: CodeKnowledgeService | None,
+    facts: list[dict],
+    freshness: str | None,
+) -> str:
+    """Render the ``{semantic_facts}`` section of the diagnostic
+    hypothesis prompt.
+
+    - ``current`` + facts → use ``format_context_for_prompt`` as-is
+      (it already omits evidence_path/lines/commit).
+    - ``stale`` + facts → prepend the exact stale-note text from
+      the Stage 6 spec, populated with ``last_indexed_commit`` and
+      hours since ``last_index_time`` (or the "from a previous
+      index" fallback when those are missing).
+    - ``unavailable`` / ``error`` / no service / empty facts → emit
+      a "not available" line so the LLM sees the absence
+      explicitly rather than treating silence as "the index is fine
+      but nothing matched."
+    """
+    if code_service is None:
+        return "Semantic facts: not available (no code service attached)."
+
+    if freshness in ("unavailable", "error") or not facts:
+        if freshness in ("unavailable", "error"):
+            return (
+                "Semantic facts: not available "
+                f"(index {freshness})."
+            )
+        return "Semantic facts: (no matching facts found)."
+
+    body = await code_service.format_context_for_prompt(facts)
+
+    if freshness == "stale":
+        commit = "from a previous index"
+        hours_text = "from a previous index"
+        try:
+            status = await code_service.get_freshness_status()
+        except Exception:  # pragma: no cover - defensive
+            status = {}
+        commit_val = status.get("last_indexed_commit")
+        if commit_val:
+            commit = str(commit_val)
+        last_time_str = status.get("last_index_time")
+        if last_time_str:
+            try:
+                last_time = datetime.fromisoformat(str(last_time_str))
+                if last_time.tzinfo is None:
+                    last_time = last_time.replace(tzinfo=UTC)
+                hours = int(
+                    (datetime.now(UTC) - last_time).total_seconds() // 3600,
+                )
+                hours_text = f"{hours} hours"
+            except (ValueError, TypeError):
+                pass
+        note = (
+            f"Note: Code context is from commit {commit}, indexed "
+            f"{hours_text} ago. Facts may not reflect current HEAD."
+        )
+        return f"{note}\n\n{body}"
+
+    return body
+
+
+def _build_fact_citations(facts: list[dict]) -> list[FactCitation]:
+    """Convert retrieved fact dicts into :class:`FactCitation`
+    entries for the operator-facing evidence panel. Truncates the
+    ``claim`` to 200 chars as required by Stage 2's carrier spec;
+    ``repo`` is reserved for Phase 4.5 Step 7 multi-repo and stays
+    ``None`` today.
+    """
+    out: list[FactCitation] = []
+    for f in facts:
+        claim = str(f.get("claim", "") or "")[:200]
+        out.append(
+            FactCitation(
+                fact_id=str(f.get("id", "") or ""),
+                concept=str(f.get("concept", "") or ""),
+                claim=claim,
+                source=str(f.get("source", "") or ""),
+                confidence=float(f.get("confidence", 0.0) or 0.0),
+                path=f.get("evidence_path") or f.get("path"),
+                lines=f.get("evidence_lines") or f.get("lines"),
+                commit=f.get("evidence_commit") or f.get("commit"),
+                repo=None,
+            )
+        )
+    return out
+
+
+_HALLUCINATION_TAG = (
+    "[Note: some references could not be verified against retrieved "
+    "code context]"
+)
+
+# Loose heuristic for tokens that look like file paths or
+# code identifiers the LLM might quote. Deliberately over-inclusive —
+# false positives here tag the query with a hint to the operator,
+# which is preferable to letting hallucinated paths slide through.
+_PATHY_TOKEN_RE = re.compile(
+    r"(?:(?:[./\w\-]+\.(?:py|ts|tsx|js|jsx|go|rs|sql))"
+    r"|(?:/[A-Za-z0-9_./\-]+)"
+    r"|(?:[A-Za-z_][A-Za-z0-9_]{3,}\.[A-Za-z_][A-Za-z0-9_]{3,})"
+    r"|(?:[a-z]+[A-Z][A-Za-z0-9]+))"
+)
+
+
+def _validate_code_references(
+    query: DiagnosticQuery,
+    facts: list[dict],
+) -> str | None:
+    """Soft check: if the query's hypothesis/explanation mentions a
+    token that looks like a file path or code identifier but doesn't
+    appear in any retrieved fact's ``concept`` or ``claim``, return
+    a hallucination-flag tag for the caller to APPEND (never
+    replace) to ``explanation``. Returns ``None`` when every
+    path-ish token is either legitimately matched or the text
+    contains no path-ish tokens at all.
+
+    **Soft-only.** The SQL still runs if it's valid; the operator
+    sees the uncertainty in the UI.
+    """
+    text = f"{query.hypothesis or ''} {query.explanation or ''}".strip()
+    if not text:
+        return None
+    candidates = {m.group(0) for m in _PATHY_TOKEN_RE.finditer(text)}
+    if not candidates:
+        return None
+
+    haystack_parts: list[str] = []
+    for f in facts or []:
+        for key in ("concept", "claim"):
+            val = f.get(key)
+            if val:
+                haystack_parts.append(str(val))
+    haystack = " ".join(haystack_parts).lower()
+
+    for token in candidates:
+        token_lower = token.lower()
+        if token_lower in haystack:
+            continue
+        # Accept when the token's dotted/camel tail is present
+        # (e.g. "billing.charge" vs "charge" in the claim).
+        tail = re.split(r"[./]", token_lower)[-1]
+        if tail and len(tail) > 2 and tail in haystack:
+            continue
+        return _HALLUCINATION_TAG
+    return None
