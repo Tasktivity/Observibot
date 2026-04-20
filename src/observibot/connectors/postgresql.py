@@ -22,6 +22,7 @@ from observibot.core.models import (
     SystemFragment,
     TableInfo,
 )
+from observibot.core.redaction import scrub_dsn
 
 log = logging.getLogger(__name__)
 
@@ -135,8 +136,12 @@ class PostgreSQLConnector(BaseConnector):
         try:
             pool = await self._ensure_pool()
         except Exception as exc:
-            log.warning("Connector %s could not connect: %s", self.name, exc)
-            fragment.errors.append(f"connect failed: {exc}")
+            log.warning(
+                "Connector %s could not connect: %s",
+                self.name,
+                scrub_dsn(str(exc)),
+            )
+            fragment.errors.append(f"connect failed: {scrub_dsn(str(exc))}")
             return fragment
 
         async with pool.acquire() as conn:
@@ -457,7 +462,11 @@ class PostgreSQLConnector(BaseConnector):
         try:
             pool = await self._ensure_pool()
         except Exception as exc:
-            log.warning("Connector %s metrics: connect failed: %s", self.name, exc)
+            log.warning(
+                "Connector %s metrics: connect failed: %s",
+                self.name,
+                scrub_dsn(str(exc)),
+            )
             return metrics
 
         now = datetime.now(UTC)

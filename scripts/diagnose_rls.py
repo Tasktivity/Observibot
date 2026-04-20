@@ -17,7 +17,7 @@ if not DSN:
 async def main():
     import asyncpg
 
-    print(f"Connecting to: {DSN[:40]}...")
+    print("Connecting to Supabase...")
     conn = await asyncpg.connect(DSN)
 
     # 1. Check current role

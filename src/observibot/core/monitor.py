@@ -37,6 +37,7 @@ from observibot.core.evidence import (
     EvidenceError,
 )
 from observibot.core.models import Insight, SystemModel
+from observibot.core.redaction import scrub_dsn
 from observibot.core.seasonal import compute_seasonal_updates, hour_of_week
 from observibot.core.store import Store
 
@@ -269,7 +270,9 @@ class MonitorLoop:
                 await connector.connect()
             except Exception as exc:
                 log.warning(
-                    "Connector %s failed to connect: %s", connector.name, exc
+                    "Connector %s failed to connect: %s",
+                    connector.name,
+                    scrub_dsn(str(exc)),
                 )
 
         # Initialize app database pool for chat queries (opt-in)
@@ -290,7 +293,9 @@ class MonitorLoop:
                     await self._app_db.connect()
                     log.info("App database pool connected for chat queries")
                 except Exception as exc:
-                    log.warning("Failed to connect app DB pool: %s", exc)
+                    log.warning(
+                        "Failed to connect app DB pool: %s", scrub_dsn(str(exc))
+                    )
                     self._app_db = None
             else:
                 log.warning(

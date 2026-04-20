@@ -18,6 +18,8 @@ caller.
 """
 from __future__ import annotations
 
+import re
+
 # Substring patterns (lowercased) that mark a column as holding
 # authentication or credential material. Matching is case-insensitive
 # substring; e.g. ``password_hash`` matches on both ``password`` and
@@ -85,8 +87,34 @@ def redact_reason(col_name: str) -> str | None:
     return None
 
 
+# Matches postgres/postgresql(+driver) URLs with an inline password.
+# Captures the scheme + userinfo up to (but not including) the ``:`` that
+# precedes the password, so the replacement can restore the user portion
+# verbatim and only mask the credential.
+_DSN_PASSWORD_RE = re.compile(
+    r"(postgres(?:ql)?(?:\+[a-zA-Z0-9_]+)?://[^:@/\s]+):[^@\s]+@"
+)
+
+
+def scrub_dsn(text: str) -> str:
+    """Replace inline passwords in any postgres DSN found in ``text``.
+
+    Intended for log messages and exception strings. asyncpg and the DSN
+    parser can echo the full connection string in error output when a
+    URL is malformed, which would leak the credential embedded in
+    ``SUPABASE_DB_URL`` into log aggregators. Callers that serialize
+    untrusted-looking text (including ``str(exc)``) should pipe it
+    through this helper first. The replacement preserves the user and
+    host portions so operators retain enough signal to diagnose.
+    """
+    if not text:
+        return text
+    return _DSN_PASSWORD_RE.sub(r"\1:***@", text)
+
+
 __all__ = [
     "SENSITIVE_COLUMN_PATTERNS",
     "is_sensitive_column",
     "redact_reason",
+    "scrub_dsn",
 ]

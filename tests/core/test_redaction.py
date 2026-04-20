@@ -15,6 +15,7 @@ from observibot.core.redaction import (
     SENSITIVE_COLUMN_PATTERNS,
     is_sensitive_column,
     redact_reason,
+    scrub_dsn,
 )
 
 
@@ -148,6 +149,57 @@ from tests.fixtures.synthetic_schemas import (  # noqa: E402
     event_stream_schema,
     medical_records_schema,
 )
+
+
+# -------------------------------------------------------------------
+# scrub_dsn — inline-password masking for postgres connection strings
+# -------------------------------------------------------------------
+
+
+_DSN_SCRUB_CASES: list[tuple[str, str]] = [
+    (
+        "postgresql://observibot_reader:hunter2@db.proj.supabase.co:5432/postgres",
+        "postgresql://observibot_reader:***@db.proj.supabase.co:5432/postgres",
+    ),
+    (
+        "postgres://user:p%40ss@host/db",
+        "postgres://user:***@host/db",
+    ),
+    (
+        "postgresql+asyncpg://u:s3cret@h:5432/d",
+        "postgresql+asyncpg://u:***@h:5432/d",
+    ),
+    (
+        # Embedded inside a larger exception message.
+        "invalid dsn: postgresql://u:pw@h/d — malformed",
+        "invalid dsn: postgresql://u:***@h/d — malformed",
+    ),
+    (
+        # Tenant-style user with a dot (Supabase pooler format).
+        "postgresql://observibot_reader.abcd1234:leaky@aws-0-x.pooler.supabase.com:5432/postgres",
+        "postgresql://observibot_reader.abcd1234:***@aws-0-x.pooler.supabase.com:5432/postgres",
+    ),
+]
+
+
+@pytest.mark.parametrize("raw,expected", _DSN_SCRUB_CASES)
+def test_scrub_dsn_masks_inline_password(raw: str, expected: str) -> None:
+    assert scrub_dsn(raw) == expected
+
+
+def test_scrub_dsn_noop_without_password() -> None:
+    # No ``:password@`` section — nothing to scrub.
+    assert scrub_dsn("postgresql://user@host/db") == "postgresql://user@host/db"
+
+
+def test_scrub_dsn_noop_for_unrelated_text() -> None:
+    text = "connector supabase_taskgator could not connect: timeout after 30s"
+    assert scrub_dsn(text) == text
+
+
+def test_scrub_dsn_handles_empty_and_none() -> None:
+    assert scrub_dsn("") == ""
+    assert scrub_dsn(None) is None  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
