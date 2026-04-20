@@ -23,6 +23,25 @@
 > deliverable lists document what was built; the exit criteria document
 > what must be true.
 
+## Revision history
+
+This roadmap is a living document. Significant revisions are noted so
+future readers understand what changed and why.
+
+- **2026-04-18** — Phase 4.5 reconciled after Step 4 shipped. What
+  originally scoped as "Step 3.4 — Hypothesis-Test Loop" expanded
+  during implementation to include evidence-carrier hardening,
+  semantic fact grounding, correlation wiring, store-backed cooldown
+  with restart survival, and fail-visible guarantees. All of that
+  shipped together as Step 4 (commit 3417cd8, 10-stage implementation
+  + post-external-review hotfix, 817 tests). Subsequent Phase 4.5
+  steps renumbered: Synthesis Agent is now Step 5 (was Step 4), Policy
+  Layer is Step 6 (was Step 5), Correction Detection is Step 7 (was
+  Step 6), Architecture View Foundations is Step 8 (was Step 7). The
+  overall sequence is unchanged; the numbers now match what shipped.
+  Rationale in [STRATEGY_NOTES.md](../STRATEGY_NOTES.md) under the
+  2026-04-18 entry.
+
 ---
 
 ## Phase 0: Foundation & Discovery ✅ COMPLETE
@@ -170,17 +189,20 @@ analysis) powering business-logic chat queries against the monitored app.
 
 ## Phase 4.5: Experiential Memory & Foundational Work (In Progress)
 
-Observibot currently has no memory across monitoring cycles — every 5-minute
-analysis is stateless. A senior SRE builds institutional knowledge over
-months: which alerts are noise, what patterns recur weekly, which deploys
-cause which symptoms. This phase gives the agent that capability.
+Observibot originally had no memory across monitoring cycles — every
+5-minute analysis was stateless. A senior SRE builds institutional
+knowledge over months: which alerts are noise, what patterns recur
+weekly, which deploys cause which symptoms. This phase gives the agent
+that capability.
 
 This phase also contains the **foundational work that unlocks Phase 5's
-architecture view**. Multi-repo awareness and typed entity IDs on insights
-are landing here rather than being retrofitted later, because changing the
-shape of semantic facts and insights after they've accumulated is painful.
+architecture view**. Multi-repo awareness and typed entity IDs on
+insights land here rather than being retrofitted later, because changing
+the shape of semantic facts and insights after they've accumulated is
+painful.
 
-Architecture reviewed by 3 external reviewers (Gemini, ChatGPT, Perplexity).
+Architecture reviewed by 3 external reviewers (Gemini, ChatGPT,
+Perplexity).
 
 ### Architecture Decisions (from 3-reviewer consensus)
 - **Three-tier experiential memory** — Observation Journal (episodic log),
@@ -199,91 +221,239 @@ Architecture reviewed by 3 external reviewers (Gemini, ChatGPT, Perplexity).
 - **Advisory-only before suppression** — synthesized patterns surface in UI
   as recommendations before any alert behavior changes
 
-### Step Summaries
+### Where Phase 4.5 stands right now
 
-**Step 0 (Prerequisites) ✅ COMPLETE** — April 13, 2026. monitor_runs
-anchoring, insight feedback buttons, chat session support, shared Prometheus
-parser, Supabase/Railway metrics enrichment.
+Four structural steps are shipped. Four remain. The current
+step-by-step state:
 
-**Step 1 (Events Envelope) ✅ COMPLETE** — April 13, 2026. Unified episodic
-timeline. Events table, FTS5 narrative search, 5 API endpoints, Discovery
-Feed recurrence annotations.
+| Step | Name | Status |
+|------|------|--------|
+| 0 | Prerequisites | ✅ Shipped |
+| 1 | Events Envelope | ✅ Shipped |
+| 2 | Session Memory | ✅ Shipped |
+| 3 | Deterministic Experiential Retrieval | ✅ Shipped (+ 3.1, 3.2, 3.3 substeps) |
+| 4 | Hypothesis-Test Loop + Evidence-Carrier Hardening | ✅ Shipped 2026-04-18 |
+| 5 | Synthesis Agent — Advisory Mode | **Next** (gated on external research) |
+| 6 | Policy Layer + Alert Suppression | Depends on Step 5 |
+| 7 | Correction Detection Upgrade | Follows Step 6 |
+| 8 | Architecture View Foundations | Unlocks Phase 5B |
 
-**Step 2 (Session Memory) ✅ COMPLETE** — April 14, 2026. EXPLAIN cost
-gating, multi-turn resolution, Agent Memory Inspector tab with 6 API
-endpoints, contract tests for Railway/Supabase.
+Step numbers past 4 were renumbered on 2026-04-18 to reflect what
+actually shipped. See "Revision history" at the top of this document.
 
-**Step 3 (Deterministic Experiential Retrieval) ✅ COMPLETE** — Seasonal MAD
-baselines with hour-of-week bucketing, recurrence annotations on insights.
+### Step Details
 
-**Step 3.1 (Insight Persistence Fix) ✅ COMPLETE** — Recurrence context now
-persisted correctly on live pipeline insights.
+#### Step 0 — Prerequisites ✅ COMPLETE
+April 13, 2026. monitor_runs anchoring, insight feedback buttons, chat
+session support, shared Prometheus parser, Supabase/Railway metrics
+enrichment.
 
-**Step 3.2 (Generic Detector/Insight Bugs) ✅ COMPLETE** — MAD=0 relative
-floor, stable anomaly_signature, direction-aware prompt.
+#### Step 1 — Events Envelope ✅ COMPLETE
+April 13, 2026. Unified episodic timeline. Events table, FTS5 narrative
+search, 5 API endpoints, Discovery Feed recurrence annotations.
 
-**Step 3.3 (Shared Evidence Infrastructure) ✅ COMPLETE** — EvidenceBundle
-dataclass, Insight.evidence field, DiagnosticsConfig stub, prompt_utils
-extraction, synthetic schema fixtures (first Tier 0 compliance).
+#### Step 2 — Session Memory ✅ COMPLETE
+April 14, 2026. EXPLAIN cost gating, multi-turn resolution, Agent
+Memory Inspector tab with 6 API endpoints, contract tests for
+Railway/Supabase.
 
-**Step 3.4 (Hypothesis-Test Loop)** — In progress. Autonomous diagnostic
-SQL against the application DB with fail-closed EXPLAIN, cooldown cache,
-diagnostic evidence rendered in the UI.
+#### Step 3 — Deterministic Experiential Retrieval ✅ COMPLETE
+Seasonal MAD baselines with hour-of-week bucketing, recurrence
+annotations on insights. Includes substeps:
 
-**Step 4 (Synthesis Agent — Advisory Mode)** — Deterministic pre-clustering
-of observations, LLM synthesis to label clusters, SynthesizedKnowledge with
-pattern_signature and Bayesian confidence, UI for viewing/confirming/
-rejecting learned patterns.
+- **3.1 — Insight Persistence Fix.** Recurrence context now persisted
+  correctly on live pipeline insights.
+- **3.2 — Generic Detector/Insight Bugs.** MAD=0 relative floor, stable
+  anomaly_signature, direction-aware prompt. First Tier 0 firewall
+  compliance round.
+- **3.3 — Shared Evidence Infrastructure.** `EvidenceBundle` dataclass,
+  `Insight.evidence` field, `DiagnosticsConfig` stub, `prompt_utils`
+  extraction, synthetic schema fixtures.
 
-**Step 5 (Policy Layer + Alert Suppression)** — Separate
-suppression_policies table, user-confirmed policies via one-click from UI,
-strict guardrails (never suppress > warning).
+#### Step 4 — Hypothesis-Test Loop + Evidence-Carrier Hardening ✅ COMPLETE
+Shipped April 18, 2026 (commit 3417cd8). 10-stage implementation across
+6 checkpoints, plus post-external-review hotfix addressing two blockers
+identified by reviewer Codex. 817 tests passing, Tier 0 firewall clean,
+frontend builds clean.
 
-**Step 6 (Correction Detection Upgrade)** — Teaching-intent detection in
-planning structured output, structured /api/feedback endpoint, retire
-hardcoded regex patterns.
+**Scope delivered:**
+- S0.1-S0.6 pre-work — six structural fixes blocking correct Step 4
+  behavior (analyzer persistence discipline, snapshot-based schema
+  consumption, diagnostics config, etc.)
+- Stage 1 — shared `core/redaction.py` with extended credential patterns
+- Stage 2 — evidence carrier hardening: `EvidenceError`, `FactCitation`,
+  `code_freshness`; renderer never leaks path/lines/commit to LLM
+- Stage 3 — Postgres FTS parity via dialect-guarded STORED GENERATED
+  tsvector + GIN migration
+- Stage 4 — store-backed daily token budget with pre-call gate and
+  circuit-breaker escalation
+- Stage 5 — store-backed diagnostic cooldown (restart-survival O9)
+- Stage 6 — semantic facts into diagnostic hypothesis prompt with
+  anomaly-scoped retrieval, four-state freshness handling, soft
+  hallucination guard, structural path/lines/commit isolation
+- Stage 7 — deterministic correlation wiring; `correlation_run` event
+  every cycle including the zero-correlation case
+- Stage 8 — correlated-subset changes into diagnostics,
+  `sanitize_untrusted_text` at the prompt boundary, guardrails above
+  all data slots in both prompts
+- Stage 9 — frontend surfaces: `CorrelationEvidencePanel`, fact-citation
+  rendering, errors strip, freshness badges
+- Stage 10 — Tier 3 live verification against TaskGator on
+  localhost:8080
 
-**Step 7 (Architecture View Foundations)** — Low-risk data additions that
-unlock the Phase 5 architecture view without committing to its UI yet.
-These land in Phase 4.5 rather than Phase 5 because retrofitting the
-shape of stored data later is painful.
+**Post-external-review hotfix:**
+- Blocker 1 (Codex): diagnostic-generation failures now surface as
+  `EvidenceError(stage="diagnostic_generation")`, don't poison the
+  cooldown cache with empty evidence, emit a distinguishable
+  `diagnostic_run` event.
+- Blocker 2 (Codex): new events (`correlation_run`, `diagnostic_run`,
+  `diagnostic_skipped`, `diagnostic_timeout`) use the real
+  `monitor_runs` run_id threaded from `run_collection_cycle`; direct
+  `trigger_analysis` path creates its own `monitor_runs` row for
+  referential integrity.
+- Plus: `ANOMALY_ANALYSIS_PROMPT` guardrail placement, sanitize length
+  contract, behavioral replacements for two weak tests, prompt
+  injection ordering assertion, Stage 9 screenshot recapture.
 
-- **Multi-repo GitHub connector.** Allow a list of repos on a single
-  `GithubConnector` config instance (not yet multi-platform — GitLab /
-  Bitbucket are Phase 6). Connector emits fragments tagged with repo
-  identity. `SemanticFact` gains a `repo` field. Existing single-repo
-  deployments keep working unchanged; multi-repo is opt-in.
+**How this reconciles with the earlier plan.** The roadmap before
+reconciliation described this step as "Step 3.4 — Hypothesis-Test Loop"
+with narrower scope. In practice, the external review round that
+preceded implementation surfaced structural issues (fact-retrieval
+freshness, evidence-error surfacing, token-budget persistence,
+correlation wiring) that would otherwise have shipped as technical
+debt. We chose to absorb that scope rather than defer it. The result
+is a Step 4 that's substantively larger than the originally planned
+Step 3.4 and covers work that would otherwise have landed across 3.4
+and parts of what used to be Step 4 (Synthesis Agent) prep. The
+shipped commit message on 3417cd8 is the authoritative scope record.
+
+#### Step 5 — Synthesis Agent (Advisory Mode) — NEXT
+**Gated on an external research pass before CC implementation
+begins.**
+
+Purpose: transition the agent from *observing individual anomalies*
+(which Step 4 delivered cleanly) to *learning patterns across
+anomalies*. This is the piece that makes Phase 4.5's "experiential
+memory" promise real — without it, the agent remembers individual
+cycles but never synthesizes them into usable knowledge.
+
+**Deliverables (scope provisional — research gates this):**
+
+- **Deterministic pre-clustering** of observations from the events
+  envelope, grouping by stable signatures (metric + time-of-day
+  bucket + deploy proximity + correlated change signature). Cheap —
+  runs every cycle without LLM.
+- **LLM synthesis to label clusters.** One LLM call per cluster
+  that crosses a promotion threshold, producing a human-readable
+  pattern description and related-entity references. Rate-limited
+  and budgeted like other LLM calls.
+- **SynthesizedKnowledge table.** Pattern signature, count,
+  first-seen/last-seen timestamps, labeled description, evidence
+  trail back to originating episodes, Bayesian confidence (Beta
+  distribution).
+- **User feedback loop.** Confirm / reject / edit a synthesized
+  pattern from the UI. Feedback updates the Bayesian posterior.
+- **Advisory-only surface.** Patterns appear in a new UI section
+  (exact placement TBD — likely inside Agent Memory Inspector or
+  adjacent to it). No behavior changes based on synthesized
+  patterns in this step. Suppression is Step 6.
+
+**Research gate — must complete before CC prompts.** Five
+load-bearing design questions to be reviewed externally
+(Gemini + Codex + ChatGPT/Perplexity per standing discipline):
+
+1. **What counts as a pattern worth synthesizing?** Promotion
+   threshold (episode count, time span, signature stability).
+   Obvious-but-true vs. useful distinction. How the system avoids
+   filling the UI with noise.
+2. **How does synthesis interact with seasonal MAD baselines
+   shipped in Step 3?** Seasonal baselines already suppress
+   "this happens every Tuesday at 3am" at detection time. The
+   synthesis layer needs to add distinct value, not overlap.
+3. **How is confidence presented to the operator?** Raw
+   probability, confidence bucket (low/medium/high), trend
+   indicator, or composite. Each has tradeoffs for trust and
+   decision-making.
+4. **How does the layer behave when feedback conflicts?**
+   Operator A confirms a pattern; operator B rejects it.
+   Single-user systems today, but the data model must not
+   preclude multi-user by construction.
+5. **What's the cost shape at scale?** Pre-clustering is cheap;
+   LLM synthesis scales with promotion rate. Worst-case cost
+   bound and degradation behavior when budget is exceeded.
+
+Research output lands as a new entry in
+`docs/PHASE45_DECISIONS.md` before any Step 5 CC prompts are
+drafted.
+
+**Why Step 5 and not Step 6 (Policy Layer).** Policy layer (alert
+suppression) requires synthesized patterns to suppress *against*.
+There's nothing to suppress based on yet, so sequencing is Step 5
+→ Step 6. The roadmap before reconciliation also ordered them this
+way, just with different numbers.
+
+#### Step 6 — Policy Layer + Alert Suppression
+Depends on Step 5. Separate `suppression_policies` table (kept
+distinct from `synthesized_knowledge` per the memory-vs-policy
+separation decision). User-confirmed policies via one-click from
+the UI. Strict guardrails — never auto-suppress above warning
+severity without explicit user confirmation per pattern.
+
+#### Step 7 — Correction Detection Upgrade
+Teaching-intent detection built into the planning structured
+output, replacing today's hardcoded regex patterns. Structured
+`/api/feedback` endpoint. Retire the regex layer once the
+structured path is proven.
+
+#### Step 8 — Architecture View Foundations
+Low-risk data additions that unlock the Phase 5B architecture view
+without committing to its UI yet. These land in Phase 4.5 rather
+than Phase 5 because retrofitting the shape of stored data later is
+painful.
+
+- **Multi-repo GitHub connector.** Allow a list of repos on a
+  single `GithubConnector` config instance (not yet multi-platform
+  — GitLab / Bitbucket are Phase 6). Connector emits fragments
+  tagged with repo identity. `SemanticFact` gains a `repo` field.
+  Existing single-repo deployments keep working unchanged;
+  multi-repo is opt-in.
 - **Typed entity IDs on insights.** Replace freeform
-  `related_entities` strings with structured references of the form
-  `{type: "table" | "service" | "file" | "function" | "repo", id: "..."}`.
-  The insight pipeline (anomaly detector, analyzer, chat) populates
-  these as it runs. One-release migration window for backwards
-  compatibility with the string form.
-- **Per-repo SystemFragment merging.** The discovery engine already
-  merges fragments from multiple connectors; this extends the merge
-  to keep repo identity distinct inside the resulting `SystemModel`.
+  `related_entities` strings with structured references of the
+  form `{type: "table" | "service" | "file" | "function" | "repo",
+  id: "..."}`. The insight pipeline (anomaly detector, analyzer,
+  chat) populates these as it runs. One-release migration window
+  for backwards compatibility with the string form.
+- **Per-repo SystemFragment merging.** The discovery engine
+  already merges fragments from multiple connectors; this extends
+  the merge to keep repo identity distinct inside the resulting
+  `SystemModel`.
 
-These additions are worth doing now specifically because our live test
-case already has two git repos, so we can exercise multi-repo end-to-end
-before it's committed to a UI feature.
+These additions are worth doing now specifically because our live
+test case already has two git repos, so we can exercise multi-repo
+end-to-end before it's committed to a UI feature.
 
 ### Exit Criteria
-1. **Monitoring cycles are anchored.**
-2. **User feedback is captured.**
-3. **Multi-turn chat works.**
-4. **Supabase metrics are comprehensive.**
-5. **Railway resource metrics are collected.**
-6. **Experiential retrieval works.**
-7. **Evidence-backed insights:** Critical anomalies produce insights with
-   attached diagnostic evidence — actual query results, viewable in the UI.
-8. **Synthesized patterns are surfaced.**
-9. **Alert suppression is safe.**
-10. **Seasonal baselines reduce false positives.**
-11. **Multi-repo support works end-to-end:** A single deployment monitors
-    two git repos; semantic facts, insights, and chat all correctly
-    attribute code-derived context to the right repo.
+1. **Monitoring cycles are anchored.** (Step 0)
+2. **User feedback is captured.** (Step 0)
+3. **Multi-turn chat works.** (Step 2)
+4. **Supabase metrics are comprehensive.** (Step 0)
+5. **Railway resource metrics are collected.** (Step 0)
+6. **Experiential retrieval works.** (Step 3)
+7. **Evidence-backed insights:** Critical anomalies produce insights
+   with attached diagnostic evidence — actual query results, viewable
+   in the UI. (Step 4)
+8. **Synthesized patterns are surfaced.** (Step 5)
+9. **Alert suppression is safe.** (Step 6)
+10. **Seasonal baselines reduce false positives.** (Step 3)
+11. **Multi-repo support works end-to-end:** A single deployment
+    monitors two git repos; semantic facts, insights, and chat all
+    correctly attribute code-derived context to the right repo.
+    (Step 8)
 12. **Insights carry typed entity IDs** resolvable to SystemModel
-    nodes, positioning Phase 5 to build the architecture view on top.
+    nodes, positioning Phase 5B to build the architecture view on
+    top. (Step 8)
+
+Exit criteria 1–7 and 10 are met. 8, 9, 11, 12 remain.
 
 ---
 
@@ -297,8 +467,8 @@ Phase 5 has two focus areas:
 
 2. **System Architecture View** — a new top-level dashboard tab that
    renders the entire monitored system end-to-end as an interactive,
-   zoomable diagram. This is new in the current roadmap revision and
-   becomes the visual anchor the Phase 7 agent overlays will extend.
+   zoomable diagram. The visual anchor the Phase 7 agent overlays will
+   extend.
 
 ### 5A — Analytics Maturity
 
@@ -560,7 +730,7 @@ it.
 - **Click-through navigation.** Every insight in the Discovery Feed
   has a "Show on map" action that switches to the architecture view
   with the relevant node(s) highlighted. Uses the typed entity IDs
-  shipped in Phase 4.5 Step 7.
+  shipped in Phase 4.5 Step 8.
 - **Blast-radius highlighting.** When an agent identifies a
   concerning node, it can compute a reachable subgraph (what does
   this touch?) and return it as a visual overlay. Primary use: the
@@ -654,6 +824,10 @@ guessing. They're tracked here so they don't get lost.
   DB row level, at the LLM context level, at the Discovery Feed
   level. Hard-to-retrofit, so likely becomes a clean architectural
   work stream when a hosted tier is committed to.
+- **Customer-identifier redaction.** Deferred 2026-04-18
+  ([STRATEGY_NOTES.md](../STRATEGY_NOTES.md)). Revisited when a
+  hosted tier, compliance regime, or opt-in privacy-forward operator
+  creates a trust model where it pays for itself.
 
 The principle that holds: whatever ships next must strengthen the
 connector layer, the system model, or the agent ecosystem. Features
